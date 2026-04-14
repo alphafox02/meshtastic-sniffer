@@ -1,0 +1,24 @@
+# Third-party reference material — not part of this project, never committed.
+references/
+
+# Build output
+build/
+build-*/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Generated
+*.o
+*.a
+*.so
+compile_commands.json
+
+# Test/IQ artifacts
+*.cf32
+*.sigmf-data
+*.sigmf-meta
