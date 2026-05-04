@@ -155,6 +155,15 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
     if (ev->rssi_db != 0.0f) jw_field_f32(j, "rssi_db", ev->rssi_db);
     if (ev->snr_db  != 0.0f) jw_field_f32(j, "snr_db",  ev->snr_db);
 
+    /* Radio-layer fields: which physical preset/SF/CR/BW the frame arrived on.
+     * Useful for operators bucketing traffic across multiple parallel demods. */
+    if (ev->sf > 0) {
+        jw_field_u32(j, "sf",    (uint32_t)ev->sf);
+        jw_field_u32(j, "cr",    (uint32_t)ev->cr);
+        jw_field_u32(j, "bw_hz", (uint32_t)ev->bw_hz);
+        if (ev->preset_name[0]) jw_field_str(j, "preset", ev->preset_name);
+    }
+
     if (ev->decrypted) {
         if (ev->channel_name[0]) jw_field_str(j, "channel_name", ev->channel_name);
         jw_field_u32(j, "portnum",     ev->portnum);

@@ -37,6 +37,14 @@ typedef struct mesh_event {
     float          rssi_db;
     float          snr_db;
 
+    /* Radio-layer parameters of the channel this frame arrived on. 0 when
+     * the source isn't a tuned LoRa decoder. preset_name is "" when (sf,
+     * cr, bw_hz) doesn't match any canonical Meshtastic preset. */
+    int            sf;
+    int            cr;             /* 5..8 = 4/5..4/8 */
+    int            bw_hz;
+    char           preset_name[24]; /* "LongFast" / "LongSlow" / ... or "" */
+
     /* Inner Data envelope (when decrypted == true) */
     uint32_t       portnum;
     const uint8_t *payload;
@@ -71,5 +79,14 @@ int mesh_packet_decode_with_meta(const uint8_t *frame, size_t frame_len,
                                  float rssi_db, float snr_db,
                                  const keyset_t *keys,
                                  mesh_event_cb_t cb, void *user);
+
+/* Same as _with_meta, but also threads the radio-layer parameters
+ * (sf/cr/bw_hz) so the JSON feed and CoT remarks can identify which
+ * Meshtastic preset the frame arrived on. Pass 0 for any unknown value. */
+int mesh_packet_decode_with_radio(const uint8_t *frame, size_t frame_len,
+                                  float rssi_db, float snr_db,
+                                  int sf, int cr, int bw_hz,
+                                  const keyset_t *keys,
+                                  mesh_event_cb_t cb, void *user);
 
 #endif

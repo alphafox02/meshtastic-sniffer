@@ -166,13 +166,24 @@ int mesh_packet_decode(const uint8_t *frame, size_t frame_len,
                        const keyset_t *keys,
                        mesh_event_cb_t cb, void *user)
 {
-    return mesh_packet_decode_with_meta(frame, frame_len, 0.0f, 0.0f, keys, cb, user);
+    return mesh_packet_decode_with_radio(frame, frame_len, 0.0f, 0.0f,
+                                         0, 0, 0, keys, cb, user);
 }
 
 int mesh_packet_decode_with_meta(const uint8_t *frame, size_t frame_len,
                                  float rssi_db, float snr_db,
                                  const keyset_t *keys,
                                  mesh_event_cb_t cb, void *user)
+{
+    return mesh_packet_decode_with_radio(frame, frame_len, rssi_db, snr_db,
+                                         0, 0, 0, keys, cb, user);
+}
+
+int mesh_packet_decode_with_radio(const uint8_t *frame, size_t frame_len,
+                                  float rssi_db, float snr_db,
+                                  int sf, int cr, int bw_hz,
+                                  const keyset_t *keys,
+                                  mesh_event_cb_t cb, void *user)
 {
     if (!frame || frame_len < MESH_HEADER_BYTES) return -1;
 
@@ -181,6 +192,22 @@ int mesh_packet_decode_with_meta(const uint8_t *frame, size_t frame_len,
     parse_header(frame, &ev);
     ev.rssi_db = rssi_db;
     ev.snr_db  = snr_db;
+    ev.sf      = sf;
+    ev.cr      = cr;
+    ev.bw_hz   = bw_hz;
+    /* Resolve preset name from (sf, cr, bw_hz) by exact match against the
+     * canonical Meshtastic preset table. Both narrow (sub-GHz) and wide
+     * (LORA_24) bandwidth columns are checked. */
+    if (sf > 0) {
+        for (int p = 0; p < MESH_PRESET_COUNT; ++p) {
+            const mesh_preset_def_t *d = &MESH_PRESETS[p];
+            if (d->spread_factor == sf && d->coding_rate == cr &&
+                (d->bw_hz_narrow == bw_hz || d->bw_hz_wide == bw_hz)) {
+                strncpy(ev.preset_name, d->channel_name, sizeof(ev.preset_name) - 1);
+                break;
+            }
+        }
+    }
 
     const uint8_t *cipher = frame + MESH_HEADER_BYTES;
     size_t         cipher_len = frame_len - MESH_HEADER_BYTES;

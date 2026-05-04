@@ -183,8 +183,11 @@ static void on_lora_frame(const uint8_t *payload, size_t payload_len,
     }
     float rssi = meta ? meta->rssi_db : 0.0f;
     float snr  = meta ? meta->snr_db  : 0.0f;
-    mesh_packet_decode_with_meta(payload, payload_len, rssi, snr,
-                                 g_keys, on_mesh_event, user);
+    int   sf   = meta ? meta->sf      : 0;
+    int   cr   = meta ? meta->cr      : 0;
+    int   bw   = meta ? meta->bw_hz   : 0;
+    mesh_packet_decode_with_radio(payload, payload_len, rssi, snr, sf, cr, bw,
+                                  g_keys, on_mesh_event, user);
 }
 
 /* Forward decl for the web SSE publisher (we don't include web.h here
