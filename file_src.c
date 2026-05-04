@@ -12,6 +12,7 @@
 #include "file_src.h"
 #include "options.h"
 #include "sdr.h"
+#include "channelizer.h"
 
 #include <err.h>
 #include <signal.h>
@@ -103,6 +104,10 @@ void *file_src_thread(void *arg)
     }
 
     fclose(f);
+    /* Flush any partial channelizer batch so a short frame's last few
+     * symbols actually reach the demod before we tear the process down. */
+    extern channelizer_t *g_channelizer;
+    if (g_channelizer) channelizer_flush(g_channelizer);
     running = 0;
     if (self_pid) kill(self_pid, SIGINT);
     return NULL;

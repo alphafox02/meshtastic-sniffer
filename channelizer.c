@@ -217,6 +217,19 @@ void channelizer_process_float(channelizer_t *c, const float complex *iq, size_t
     }
 }
 
+void channelizer_flush(channelizer_t *c)
+{
+    if (!c) return;
+    int n_ch = __atomic_load_n(&c->n_channels, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n_ch; ++i) {
+        chan_state_t *s = c->channels[i];
+        if (!s || s->outbuf_count == 0) continue;
+        if (s->cfg.on_baseband)
+            s->cfg.on_baseband(s->id, s->outbuf, (size_t)s->outbuf_count, s->cfg.user);
+        s->outbuf_count = 0;
+    }
+}
+
 void channelizer_destroy(channelizer_t *c)
 {
     if (!c) return;

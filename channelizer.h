@@ -52,6 +52,12 @@ int  channelizer_num_channels(const channelizer_t *c);
 void channelizer_process_int8 (channelizer_t *c, const int8_t *iq_pairs, size_t n_complex);
 void channelizer_process_float(channelizer_t *c, const float complex *iq, size_t n_complex);
 
+/* Flush partial output buffers downstream. Call at EOF on file replay so
+ * the demod sees the tail of the stream -- without this, up to
+ * (CHANNELIZER_OUTBUF_SAMPLES - 1) samples per channel are silently
+ * dropped, which can starve a short LoRa frame of its final symbols. */
+void channelizer_flush(channelizer_t *c);
+
 void channelizer_destroy(channelizer_t *c);
 
 #endif /* CHANNELIZER_H */

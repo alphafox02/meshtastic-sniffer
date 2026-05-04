@@ -77,7 +77,7 @@ static void on_signal(int sig)
 
 /* ---- Global pipeline state ---- */
 
-static channelizer_t *g_channelizer = NULL;
+channelizer_t *g_channelizer = NULL;
 static keyset_t      *g_keys = NULL;
 static lora_decoder_t *g_demods[CHANNELIZER_MAX_CHANNELS];
 static scanner_t     *g_scanner = NULL;
