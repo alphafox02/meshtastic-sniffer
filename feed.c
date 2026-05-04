@@ -370,7 +370,7 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                 if (mr.role)         jw_field_u32(j, "role", mr.role);
                 if (mr.hw_model)     jw_field_u32(j, "hw_model", mr.hw_model);
                 if (mr.region)       jw_field_u32(j, "region", mr.region);
-                if (mr.modem_preset) jw_field_u32(j, "preset", mr.modem_preset);
+                if (mr.modem_preset) jw_field_u32(j, "sender_preset", mr.modem_preset);
                 if (mr.have_lat)     jw_field_f64(j, "lat", mr.lat_deg);
                 if (mr.have_lon)     jw_field_f64(j, "lon", mr.lon_deg);
                 if (mr.altitude_m)   jw_field_i32(j, "alt_m", mr.altitude_m);
