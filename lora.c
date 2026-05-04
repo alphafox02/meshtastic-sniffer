@@ -732,7 +732,7 @@ static void state_tick(lora_decoder_t *d)
                     d->cfo_int = (down_val - d->N) / 2;
                 /* Now rebuild the downchirp reference with cfo_int + cfo_frac
                  * applied. Subsequent header + payload FFTs dechirp through
-                 * this corrected reference and the CFO is cancelled. */
+                 * this corrected reference and the carrier offset is gone. */
                 apply_cfo_correction(d);
                 if (trace_on)
                     fprintf(stderr, "[lora] cfo_int=%d cfo_frac=%.4f (down_val=%d)\n",
@@ -741,8 +741,17 @@ static void state_tick(lora_decoder_t *d)
             d->header_idx++;
             if (d->header_idx == 3) {
                 /* Just consumed sync2 + down1 + down2; queue the 0.25-symbol
-                 * quarter-downchirp skip before reading header. */
-                d->sto_skip_remaining += d->N / 4;
+                 * quarter-downchirp skip before reading header.
+                 *
+                 * Plus an integer sample correction of -cfo_int. The preamble
+                 * bin already absorbed cfo_int so the original (N - k_hat)
+                 * skip under-shot the true sample alignment by that amount;
+                 * down_val confirmed it carries 2*cfo_int (one from carrier
+                 * offset, one from sample misalignment). The carrier half is
+                 * cancelled by apply_cfo_correction; the sample half has to
+                 * be made up here, otherwise every subsequent FFT lands its
+                 * peak at v - cfo_int instead of v. */
+                d->sto_skip_remaining += d->N / 4 + d->cfo_int;
             }
             break;
         }

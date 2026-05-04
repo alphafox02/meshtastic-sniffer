@@ -127,8 +127,16 @@ int channelizer_add_channel(channelizer_t *c, const channel_cfg_t *cfg)
     memset(s->delay, 0, sizeof(float complex) * (size_t)s->ntaps);
 
     /* NCO rotates channel center to DC.  Note negative sign: we want to
-     * mix down by f_offset, so multiply input by exp(-j 2 pi f_off t). */
+     * mix down by f_offset, so multiply input by exp(-j 2 pi f_off t).
+     *
+     * Optional software PPM correction: when the SDR (or the captured file)
+     * is mistuned by N parts-per-million, the actual RF center sits at
+     * f_center * (1 + ppm*1e-6). Correct for it by shifting each channel's
+     * effective f_off by -f_center * ppm * 1e-6. Works for any backend,
+     * including --file replay where the hardware --ppm path can't help. */
+    extern double ppm_correction;
     double f_off = (double)((int64_t)cfg->f_hz - (int64_t)c->f_center);
+    f_off -= (double)c->f_center * ppm_correction * 1e-6;
     s->nco_phase     = 0.0;
     s->nco_phase_inc = -2.0 * M_PI * f_off / (double)c->samp_rate;
 
