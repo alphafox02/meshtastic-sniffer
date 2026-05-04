@@ -122,7 +122,10 @@ class TxFlowgraph(gr.top_block):
         self.header = lora_sdr.header(False, True, gr_cr)
         self.add_crc = lora_sdr.add_crc(True)
         self.hamming = lora_sdr.hamming_enc(gr_cr, sf)
-        self.interleaver = lora_sdr.interleaver(gr_cr, sf, 0, bw)
+        # ldro=2 (AUTO) lets gr-lora_sdr decide based on symbol_duration > 16ms.
+        # Hardcoding 0 produces invalid frames at SF12@125kHz which even
+        # gr-lora_sdr's own RX cannot decode.
+        self.interleaver = lora_sdr.interleaver(gr_cr, sf, 2, bw)
         self.gray = lora_sdr.gray_demap(sf)
         # Sync words list = [0x12] for Meshtastic.
         # inter_frame_padd: number of zero samples after the chirped frame.

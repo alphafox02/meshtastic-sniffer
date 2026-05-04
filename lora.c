@@ -239,6 +239,7 @@ struct lora_decoder {
     int          payload_len;
     int          payload_cr;
     bool         payload_has_crc;
+    bool         payload_ldro;            /* Low-Data-Rate Optimization on payload */
     /* Leftover payload nibbles from the header deinterleave block
      * (positions 5..sf_app-1; first 5 were the header). */
     uint8_t      hdr_leftover[16];
@@ -264,19 +265,16 @@ struct lora_decoder {
  * The downchirp for dechirping is the complex conjugate. */
 static void build_chirps(fftwf_complex *up, fftwf_complex *down, int N)
 {
-    /* Discrete-integral form of an upchirp going -BW/2 -> +BW/2 over N
-     * samples at sample-rate = BW:
-     *   instantaneous f[n] = -BW/2 + BW * n / N
-     *   phi[n]       = sum_{k=0..n-1} 2*pi * f[k] / BW
-     *                = 2*pi * (n*(n-1)/(2N) - n/2)
-     * Verified bit-exact against gr-lora_sdr's modulator output:
-     * a clean preamble produces FFT peak at bin 0 with this formula;
-     * the simpler `n*n/(2N)` form accumulates a half-bin-per-sample
-     * phase ramp that puts the peak at bin ~2017 over N=2048. */
+    /* Reference chirp formula matches gr-lora_sdr utilities.h
+     * `build_upchirp(chirp, 0, sf)`:
+     *     phi[n] = 2*pi * (n*n/(2N) - n/2)
+     * The earlier `n*(n-1)/(2N)` discrete-integral form differs by
+     * pi*n/N -- a 0.5-bin/sample frequency offset that lands payload
+     * peaks at v+0.5, where the argmax randomly picks bin v or v+1. */
     float complex *u = (float complex *)up;
     float complex *d = (float complex *)down;
     for (int n = 0; n < N; ++n) {
-        double phase = 2.0 * M_PI * ((double)(n * (n - 1)) / (2.0 * N) - (double)n * 0.5);
+        double phase = 2.0 * M_PI * ((double)n * (double)n / (2.0 * (double)N) - (double)n * 0.5);
         u[n] = (float)cos(phase) + I * (float)sin(phase);
         d[n] = conjf(u[n]);
     }
@@ -494,9 +492,30 @@ static void state_tick(lora_decoder_t *d)
             d->payload_has_crc = (n[2] & 0x01) != 0;
             int hdr_cr_app     = (n[2] >> 1) & 0x07;
             d->payload_cr      = (hdr_cr_app >= 1 && hdr_cr_app <= 4) ? (hdr_cr_app + 4) : 5;
+
+            /* Header checksum -- ported verbatim from gr-lora_sdr
+             * header_decoder_impl.cc:141-152. The 5-bit checksum c4..c0 is a
+             * fixed XOR pattern over n[0..2]; the received check is the low
+             * bit of n[3] (high) plus n[4] (low 4 bits). */
+            int header_chk = ((n[3] & 1) << 4) | (n[4] & 0x0f);
+            int c4 = ((n[0] >> 3) & 1) ^ ((n[0] >> 2) & 1) ^ ((n[0] >> 1) & 1) ^ (n[0] & 1);
+            int c3 = ((n[0] >> 3) & 1) ^ ((n[1] >> 3) & 1) ^ ((n[1] >> 2) & 1) ^ ((n[1] >> 1) & 1) ^ (n[2] & 1);
+            int c2 = ((n[0] >> 2) & 1) ^ ((n[1] >> 3) & 1) ^ (n[1] & 1) ^ ((n[2] >> 3) & 1) ^ ((n[2] >> 1) & 1);
+            int c1 = ((n[0] >> 1) & 1) ^ ((n[1] >> 2) & 1) ^ (n[1] & 1) ^ ((n[2] >> 2) & 1) ^ ((n[2] >> 1) & 1) ^ (n[2] & 1);
+            int c0 = (n[0] & 1) ^ ((n[1] >> 1) & 1) ^ ((n[2] >> 3) & 1) ^ ((n[2] >> 2) & 1) ^ ((n[2] >> 1) & 1) ^ (n[2] & 1);
+            int computed_chk = (c4 << 4) | (c3 << 3) | (c2 << 2) | (c1 << 1) | c0;
+
             d->meta.payload_len    = d->payload_len;
             d->meta.has_crc        = d->payload_has_crc;
-            d->meta.header_crc_ok  = true;   /* TODO: validate via c4..c0 XOR checks */
+            d->meta.header_crc_ok  = (computed_chk == header_chk) && d->payload_len > 0;
+            if (!d->meta.header_crc_ok) {
+                if (trace_on)
+                    fprintf(stderr, "[lora] header CRC fail: got 0x%02x want 0x%02x len=%d\n",
+                            header_chk, computed_chk, d->payload_len);
+                d->state = STATE_IDLE;
+                d->preamble_count = 0;
+                break;
+            }
             /* Stash leftover header-block nibbles (positions 5..sf_app-1)
              * -- these are the first nibbles of the actual payload. */
             d->hdr_leftover_count = 0;
@@ -508,12 +527,25 @@ static void state_tick(lora_decoder_t *d)
                         d->payload_len, d->payload_cr, d->payload_has_crc);
             }
 
-            /* Compute total payload symbol count. */
-            int crc_bytes = d->payload_has_crc ? 2 : 0;
-            int sf_payload = d->sf;          /* DE=0 for SF<11 by default */
-            int payload_symbol_count = (int)ceil(
-                (double)((d->payload_len + crc_bytes) * 2 - sf_payload + 7)
-                / (double)sf_payload) * d->payload_cr;
+            /* Low-Data-Rate Optimization (LDRO): per the LoRa spec, when the
+             * symbol duration exceeds ~16 ms the payload uses sf-2 application
+             * bits per symbol (same as the header) so each symbol covers more
+             * time and is robust to clock drift. Auto-detect via the canonical
+             * 16ms threshold (gr-lora_sdr lora_rx.py uses LDRO_MAX_DURATION_MS
+             * = 16). For SF12@125kHz this fires (32.8ms > 16ms); for
+             * SF11@250kHz it does not (8.2ms). */
+            d->payload_ldro = ((double)(1 << d->sf) * 1000.0 / (double)d->bw_hz) > 16.0;
+
+            /* Total payload symbol count (gr-lora_sdr frame_sync_impl.cc:419):
+             *   m_symb_numb = ceil((2*pay_len - sf + 2 + 5 + crc*4)
+             *                       / (sf - 2*ldro)) * (4 + cr)
+             * The numerator uses full sf regardless of ldro; the denominator
+             * uses sf-2 when ldro is on (matches gr-lora_sdr exactly). */
+            int crc_bits = d->payload_has_crc ? 4 : 0;
+            int denom = d->sf - (d->payload_ldro ? 2 : 0);
+            int numer = 2 * d->payload_len - d->sf + 2 + 5 + crc_bits;
+            if (numer < 0) numer = 0;
+            int payload_symbol_count = (int)ceil((double)numer / (double)denom) * d->payload_cr;
             if (payload_symbol_count < 0) payload_symbol_count = 0;
             if (payload_symbol_count > MAX_PAYLOAD_SYMBOLS) payload_symbol_count = MAX_PAYLOAD_SYMBOLS;
 
@@ -532,13 +564,13 @@ static void state_tick(lora_decoder_t *d)
         break;
     }
     case STATE_PAYLOAD: {
-        /* Per gr-lora_sdr fft_demod_impl.cc:313 the (bin - 1) mod N
-         * subtraction applies to ALL symbols (header + payload), with
-         * the /4 only for header/LDRO. For non-LDRO payload we
-         * subtract 1 then apply gray decode (no /4). */
+        /* In LDRO mode the payload uses sf-2 application bits per symbol, just
+         * like the header, so we divide the (raw - 1) value by 4 the same way
+         * fft_demod_impl.cc:313 does for header / LDRO. */
         int corr = ((int)sym - d->preamble_bin - 1) % d->N;
         if (corr < 0) corr += d->N;
-        uint16_t gray = lora_gray_decode((uint16_t)corr);
+        uint16_t demod_out = d->payload_ldro ? (uint16_t)(corr / 4) : (uint16_t)corr;
+        uint16_t gray = lora_gray_decode(demod_out);
         if (d->payload_sym_count < MAX_PAYLOAD_SYMBOLS)
             d->payload_syms[d->payload_sym_count++] = gray;
 
@@ -546,7 +578,7 @@ static void state_tick(lora_decoder_t *d)
             /* Decode the payload codewords block by block. */
             uint8_t bytes[MAX_PAYLOAD_BYTES];
             int byte_count = 0;
-            int sf_p = d->sf;
+            int sf_p = d->payload_ldro ? (d->sf - 2) : d->sf;
             int cr_p = d->payload_cr;
             /* Carry a pending half-byte across blocks: when sf_p is odd
              * (e.g. SF=11) each block produces an odd number of nibbles
