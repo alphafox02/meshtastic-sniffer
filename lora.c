@@ -208,6 +208,10 @@ typedef enum {
 #define PREAMBLE_MIN        5            /* match >= this many upchirps -> preamble */
 #define MAX_PAYLOAD_BYTES   256
 #define MAX_PAYLOAD_SYMBOLS 1024
+/* Soft-decoding LLR store: one row of sf_app floats per accumulated
+ * payload symbol. sf_app peaks at sf (=12 for SF12 non-LDRO). Pre-
+ * dimension to 12 for simplicity even when the active sf_app is smaller. */
+#define LLR_PER_SYMBOL      MAX_SF
 
 struct lora_decoder {
     int  sf;
@@ -262,10 +266,19 @@ struct lora_decoder {
      * (positions 5..sf_app-1; first 5 were the header). */
     uint8_t      hdr_leftover[16];
     int          hdr_leftover_count;
-    /* Payload accumulator. */
+    /* Payload accumulator (hard decode path). */
     uint16_t     payload_syms[MAX_PAYLOAD_SYMBOLS];
     int          payload_sym_count;
     int          payload_sym_target;   /* total payload symbols expected */
+
+    /* Soft-decision decoding accumulators (when MESHTASTIC_LORA_SOFT=1).
+     * Each row is sf_app floats, MSB-first; sign indicates the most-
+     * likely bit (positive=1, negative=0), magnitude is the confidence.
+     * Header stage stores 8 rows of header-block LLRs at sf_app=sf-2;
+     * payload stage stores up to MAX_PAYLOAD_SYMBOLS rows. */
+    bool         soft_decoding;
+    float        header_llrs[8][LLR_PER_SYMBOL];
+    float        payload_llrs[MAX_PAYLOAD_SYMBOLS][LLR_PER_SYMBOL];
 
     /* Per-frame metadata, updated as we go. */
     lora_frame_meta_t meta;
@@ -326,6 +339,13 @@ lora_decoder_t *lora_decoder_create(int sf, int cr, int bw_hz)
 
     d->state = STATE_IDLE;
     d->meta.sf = sf; d->meta.cr = cr; d->meta.bw_hz = bw_hz;
+    /* Optional soft-decision decoding. Off by default because it costs ~50KB
+     * extra LLR storage per decoder and only matters near the SNR floor;
+     * enable explicitly with MESHTASTIC_LORA_SOFT=1 in the env. */
+    {
+        const char *e = getenv("MESHTASTIC_LORA_SOFT");
+        d->soft_decoding = (e && *e == '1');
+    }
     return d;
 }
 
@@ -450,6 +470,131 @@ static void apply_cfo_correction(lora_decoder_t *d)
     }
 }
 
+/* ---- Soft-decision LLR computation ----
+ *
+ * Original work Copyright 2022 Tapparel Joachim @EPFL,TCL.
+ * Modifications Copyright 2026 CEMAXECUTER LLC.
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Ported from gr-lora_sdr fft_demod_impl.cc:get_LLRs (max-log
+ * approximation only; we skip the Bessel-function path because it
+ * matters only for very high SNR, which is also where hard-decode
+ * already wins). For each FFT bin n, treat |Y[n]|^2 as the bin
+ * likelihood. For each output bit i in [0, sf_app):
+ *     LLR[i] = max_{n where bit_i(symbol(n)) == 1} LL[n]
+ *            - max_{n where bit_i(symbol(n)) == 0} LL[n]
+ * where symbol(n) is the gray-mapped bin value the LoRa modulator
+ * would have emitted at FFT bin n -- i.e. apply the same
+ *     s = ((n - 1) mod 2^sf) / divider; s ^= (s >> 1)
+ * post-processing inline so the LLRs are over the *information* bits
+ * not the FFT bins. divider is 4 for header / LDRO, else 1.
+ *
+ * Output: sf_app LLRs in MSB..LSB order (LLR[0] is the high bit). */
+static void compute_symbol_llrs(lora_decoder_t *d,
+                                const float complex *s,
+                                int sf_app,
+                                bool divide_by_4,
+                                float *llr_out)
+{
+    float complex *fft_in_c  = (float complex *)d->fft_in;
+    float complex *fft_out_c = (float complex *)d->fft_out;
+    float complex *down_c    = (float complex *)d->downchirp;
+    for (int n = 0; n < d->N; ++n)
+        fft_in_c[n] = s[n] * down_c[n];
+    fftwf_execute(d->fft_plan);
+
+    /* Per-bin |Y|^2 as max-log likelihood. */
+    static float ll_buf[MAX_FFT];
+    for (int k = 0; k < d->N; ++k) {
+        float r = crealf(fft_out_c[k]), im = cimagf(fft_out_c[k]);
+        ll_buf[k] = r * r + im * im;
+    }
+
+    int sf_full = d->sf;
+    uint32_t mask_N = (uint32_t)(d->N - 1);
+    /* Per output-bit accumulators. sf_app values, indexed 0..sf_app-1
+     * where bit position i corresponds to bin's gray-mapped bit i. */
+    float max_x1[MAX_SF] = {0};
+    float max_x0[MAX_SF] = {0};
+    for (int n = 0; n < d->N; ++n) {
+        /* Symbol value derived from FFT bin: see fft_demod_impl.cc:218. */
+        uint32_t sym_v = ((uint32_t)n - 1u) & mask_N;
+        if (divide_by_4) sym_v >>= 2;
+        /* gray demap (s ^= s>>1) -- in LoRa, the FFT bin maps to the
+         * gray-encoded info value, so XORing in the shifted version
+         * reverses the encoding. */
+        sym_v = (sym_v ^ (sym_v >> 1u)) & ((1u << sf_app) - 1u);
+        float ll = ll_buf[n];
+        for (int i = 0; i < sf_app; ++i) {
+            if (sym_v & (1u << i)) { if (ll > max_x1[i]) max_x1[i] = ll; }
+            else                   { if (ll > max_x0[i]) max_x0[i] = ll; }
+        }
+    }
+    /* gr-lora_sdr stores LLRs in MSB..LSB order: LLRs[sf-1-i] = max_x1[i] - max_x0[i].
+     * We store the same way (llr_out[0] is the MSB bit). */
+    for (int i = 0; i < sf_app; ++i)
+        llr_out[sf_app - 1 - i] = max_x1[i] - max_x0[i];
+    (void)sf_full;
+}
+
+/* Diagonal soft-deinterleave. Same map as the hard version
+ *     (deinter_bin[(i - j - 1) mod sf_app][i] = inter_bin[i][j])
+ * but operating on per-bit LLRs instead of bits. Output: sf_app
+ * codewords each cw_len LLRs (MSB..LSB). */
+static void lora_deinterleave_soft(const float (*sym_llrs)[LLR_PER_SYMBOL],
+                                   int sf_app, int cr_use,
+                                   float cw_llrs[16][8])
+{
+    int cw_len = cr_use;
+    for (int i = 0; i < sf_app; ++i)
+        for (int j = 0; j < cw_len; ++j)
+            cw_llrs[i][j] = 0.0f;
+    for (int i = 0; i < cw_len; ++i) {
+        for (int j = 0; j < sf_app; ++j) {
+            int row = (i - j - 1) % sf_app;
+            if (row < 0) row += sf_app;
+            cw_llrs[row][i] = sym_llrs[i][j];
+        }
+    }
+}
+
+/* Soft Hamming decode for cr 1..4 (CR4/5..4/8). For each of the 16
+ * possible information nibbles, compute its codeword (CR4/5 has its
+ * own LUT; CR4/6..4/8 share one) and score against the received LLRs.
+ * Output: 4-bit nibble in low-LSB-first format matching the hard path. */
+static uint8_t lora_hamming_decode_soft(const float *cw_llrs, int cr, int *err)
+{
+    if (err) *err = 0;
+    int cr_app = cr - 4;
+    if (cr_app < 1) cr_app = 1;
+    if (cr_app > 4) cr_app = 4;
+    int cw_len = cr_app + 4;
+    static const uint8_t cw_LUT[16]     = {0, 23, 45, 58, 78, 89, 99, 116,
+                                          139, 156, 166, 177, 197, 210, 232, 255};
+    static const uint8_t cw_LUT_cr5[16] = {0, 24, 40, 48, 72, 80, 96, 120,
+                                          136, 144, 160, 184, 192, 216, 232, 240};
+    const uint8_t *lut = (cr_app == 1) ? cw_LUT_cr5 : cw_LUT;
+    int best = 0; float best_p = -1e30f;
+    for (int n = 0; n < 16; ++n) {
+        uint8_t code = lut[n] >> (8 - cw_len);
+        float p = 0.0f;
+        for (int j = 0; j < cw_len; ++j) {
+            bool bit = (code >> (cw_len - 1 - j)) & 1;
+            float l = cw_llrs[j];
+            float a = l < 0 ? -l : l;
+            if ((bit && l > 0) || (!bit && l < 0)) p += a;
+            else                                   p -= a;
+        }
+        if (p > best_p) { best_p = p; best = n; }
+    }
+    /* gr-lora_sdr returns the data-nibble bits LSB-first; match here. */
+    uint8_t data_msb_first = cw_LUT[best] >> 4;   /* always cw_LUT (16 nibbles) */
+    return (uint8_t)(((data_msb_first & 0x1) << 3) |
+                     ((data_msb_first & 0x2) << 1) |
+                     ((data_msb_first & 0x4) >> 1) |
+                     ((data_msb_first & 0x8) >> 3));
+}
+
 /* Run the state machine for one accumulated symbol. */
 static void state_tick(lora_decoder_t *d)
 {
@@ -471,7 +616,7 @@ static void state_tick(lora_decoder_t *d)
         trace_on = (e && *e == '1');
         trace_check = 1;
     }
-    if (trace_on && trace_count++ < 200) {
+    if (trace_on && trace_count++ < 2000) {
         fprintf(stderr, "[lora] state=%d sym=%u peak=%.2f snr=%.2f\n",
                 d->state, sym, peak, peak / (noise > 0 ? noise : 1));
     }
@@ -603,21 +748,26 @@ static void state_tick(lora_decoder_t *d)
         }
         int hi = d->header_idx - 3;
         if (hi < 8) {
-            /* gr-lora_sdr fft_demod_impl.cc:313 + gray_mapping_impl.cc:70:
-             *   raw       = (bin - 1) mod 2^sf
-             *   demod_out = raw / 4   (header / LDRO mode -- DE)
-             *   gray      = demod_out ^ (demod_out >> 1)
-             *
-             * In gr-lora_sdr the raw bin is the literal FFT bin; the -1 is
-             * because the TX gray_demap added +1 so symbol value 0 lands
-             * at bin 1. We CFO-compensate by subtracting preamble_bin
-             * (which already absorbs the +1 plus any channelizer delay /
-             * RF CFO), so we don't apply -1 again. */
-            int corr = ((int)sym - d->preamble_bin) % d->N;
-            if (corr < 0) corr += d->N;
-            uint16_t demod_out = (uint16_t)(corr / 4);
-            uint16_t gray = (uint16_t)(demod_out ^ (demod_out >> 1));
-            d->header_syms[hi] = gray;
+            int sf_app_h = d->sf - 2;
+            if (sf_app_h < 5) sf_app_h = 5;
+            if (d->soft_decoding) {
+                /* In soft mode we keep per-bit LLRs; the gray demap and
+                 * (raw-1) shift are folded into compute_symbol_llrs. */
+                compute_symbol_llrs(d, d->symbuf, sf_app_h, true,
+                                    d->header_llrs[hi]);
+            } else {
+                /* gr-lora_sdr fft_demod_impl.cc:313 + gray_mapping_impl.cc:70:
+                 *   raw       = (bin - 1) mod 2^sf
+                 *   demod_out = raw / 4   (header / LDRO mode -- DE)
+                 *   gray      = demod_out ^ (demod_out >> 1)
+                 * (preamble_bin is 0 after STO realignment / CFO compensation
+                 * has been applied to the downchirp reference.) */
+                int corr = ((int)sym - d->preamble_bin) % d->N;
+                if (corr < 0) corr += d->N;
+                uint16_t demod_out = (uint16_t)(corr / 4);
+                uint16_t gray = (uint16_t)(demod_out ^ (demod_out >> 1));
+                d->header_syms[hi] = gray;
+            }
             ++d->header_idx;
         }
         if (d->header_idx == 3 + 8) {
@@ -632,12 +782,21 @@ static void state_tick(lora_decoder_t *d)
             int sf_app = d->sf - 2;
             int cr_hdr = 8;
             if (sf_app < 5) sf_app = 5;
-            lora_deinterleave(d->header_syms, sf_app, cr_hdr, cw);
-
             uint8_t n[16];
-            for (int k = 0; k < sf_app; ++k) {
-                int err = 0;
-                n[k] = lora_hamming_decode(cw[k], cr_hdr, &err);
+            if (d->soft_decoding) {
+                float cw_llrs[16][8];
+                lora_deinterleave_soft((const float (*)[LLR_PER_SYMBOL])d->header_llrs,
+                                       sf_app, cr_hdr, cw_llrs);
+                for (int k = 0; k < sf_app; ++k) {
+                    int err = 0;
+                    n[k] = lora_hamming_decode_soft(cw_llrs[k], cr_hdr, &err);
+                }
+            } else {
+                lora_deinterleave(d->header_syms, sf_app, cr_hdr, cw);
+                for (int k = 0; k < sf_app; ++k) {
+                    int err = 0;
+                    n[k] = lora_hamming_decode(cw[k], cr_hdr, &err);
+                }
             }
 
             /* gr-lora_sdr header_decoder_impl.cc:133-145
@@ -728,12 +887,19 @@ static void state_tick(lora_decoder_t *d)
         /* In LDRO mode the payload uses sf-2 application bits per symbol, just
          * like the header, so we divide the (raw - 1) value by 4 the same way
          * fft_demod_impl.cc:313 does for header / LDRO. */
-        int corr = ((int)sym - d->preamble_bin - 1) % d->N;
-        if (corr < 0) corr += d->N;
-        uint16_t demod_out = d->payload_ldro ? (uint16_t)(corr / 4) : (uint16_t)corr;
-        uint16_t gray = lora_gray_decode(demod_out);
-        if (d->payload_sym_count < MAX_PAYLOAD_SYMBOLS)
-            d->payload_syms[d->payload_sym_count++] = gray;
+        int sf_p_active = d->payload_ldro ? (d->sf - 2) : d->sf;
+        if (d->soft_decoding) {
+            if (d->payload_sym_count < MAX_PAYLOAD_SYMBOLS)
+                compute_symbol_llrs(d, d->symbuf, sf_p_active, d->payload_ldro,
+                                    d->payload_llrs[d->payload_sym_count++]);
+        } else {
+            int corr = ((int)sym - d->preamble_bin - 1) % d->N;
+            if (corr < 0) corr += d->N;
+            uint16_t demod_out = d->payload_ldro ? (uint16_t)(corr / 4) : (uint16_t)corr;
+            uint16_t gray = lora_gray_decode(demod_out);
+            if (d->payload_sym_count < MAX_PAYLOAD_SYMBOLS)
+                d->payload_syms[d->payload_sym_count++] = gray;
+        }
 
         if (d->payload_sym_count >= d->payload_sym_target) {
             /* Decode the payload codewords block by block. */
@@ -752,11 +918,20 @@ static void state_tick(lora_decoder_t *d)
                 else { bytes[byte_count++] = (uint8_t)((nib << 4) | pending_lo); pending_lo = -1; }
             }
             for (int blk = 0; blk + cr_p <= d->payload_sym_count; blk += cr_p) {
-                uint8_t cw[16];
-                lora_deinterleave(&d->payload_syms[blk], sf_p, cr_p, cw);
+                uint8_t cw_hard[16];
+                float   cw_soft[16][8];
+                if (d->soft_decoding) {
+                    lora_deinterleave_soft(
+                        (const float (*)[LLR_PER_SYMBOL])&d->payload_llrs[blk],
+                        sf_p, cr_p, cw_soft);
+                } else {
+                    lora_deinterleave(&d->payload_syms[blk], sf_p, cr_p, cw_hard);
+                }
                 for (int r = 0; r < sf_p && byte_count < MAX_PAYLOAD_BYTES; ++r) {
                     int err;
-                    uint8_t nib = lora_hamming_decode(cw[r], cr_p, &err);
+                    uint8_t nib = d->soft_decoding
+                        ? lora_hamming_decode_soft(cw_soft[r], cr_p, &err)
+                        : lora_hamming_decode(cw_hard[r], cr_p, &err);
                     if (pending_lo < 0) {
                         pending_lo = nib;        /* save as low nibble of next byte */
                     } else {
