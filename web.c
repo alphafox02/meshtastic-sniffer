@@ -72,10 +72,13 @@ static const char DASHBOARD_HTML[] =
 ".log-item .ts{color:#666;font-size:10px;margin-right:6px;}\n"
 "#config{padding:18px;overflow:auto;width:100%;}\n"
 "#config h3{color:#9bf;margin:18px 0 6px 0;}\n"
-"#config textarea,#config input[type=text]{width:100%;background:#0d0d0d;color:#eee;border:1px solid #444;padding:6px;font-family:monospace;font-size:12px;}\n"
-"#config button{background:#225;color:#cef;border:1px solid #58c;padding:6px 14px;cursor:pointer;margin-top:6px;}\n"
-"#config .hint{color:#888;font-size:11px;margin-top:4px;}\n"
+"#config{padding:14px 18px;overflow:auto;max-width:780px;}\n"
+"#config h3{margin:14px 0 6px 0;font-size:14px;color:#9bf;border-bottom:1px solid #333;padding-bottom:3px;}\n"
+"#config textarea,#config input[type=text]{width:100%;box-sizing:border-box;background:#0d0d0d;color:#eee;border:1px solid #444;padding:6px;font-family:monospace;font-size:12px;}\n"
+"#config button{background:#225;color:#cef;border:1px solid #58c;padding:6px 14px;cursor:pointer;margin-top:6px;margin-right:8px;}\n"
+"#config .hint{color:#888;font-size:11px;margin-top:4px;display:block;}\n"
 "#config .row{margin-bottom:14px;}\n"
+"#config .row span{color:#888;font-size:11px;}\n"
 ".status-ok{color:#9f9;}.status-err{color:#f99;}\n"
 "</style></head><body>\n"
 "<div id=\"tabs\">\n"
@@ -128,6 +131,10 @@ static const char DASHBOARD_HTML[] =
 "</div>\n"
 "<script>\n"
 "function showTab(name){for(const t of ['live','spectrum','config']){document.getElementById(t).classList.toggle('active',t===name);document.getElementById('tab-'+t).classList.toggle('active',t===name);}if(name==='live')setTimeout(()=>map.invalidateSize(),60);if(name==='spectrum')resizeWaterfall();}\n"
+"// Hide the Spectrum tab unless the server has --web-spectrum enabled.\n"
+"// SSE 'SPECTRUM' events only flow when that flag is set; without it, the\n"
+"// tab would just show a blank black canvas.\n"
+"fetch('/api/info').then(r=>r.json()).then(info=>{if(!info.spectrum){const b=document.getElementById('tab-spectrum');if(b)b.style.display='none';}}).catch(()=>{});\n"
 "const map = L.map('map').setView([39.5, -98.0], 4);\n"
 "L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19, attribution:'&copy; OSM'}).addTo(map);\n"
 "const markers = {}, trails = {}, nodes = {}, edges = {}, channels = {};\n"
@@ -620,6 +627,13 @@ static void *web_thread(void *arg)
             strncmp(buf, "GET /\r",       6) == 0 ||
             strncmp(buf, "GET /index",   10) == 0) serve_index(fd);
         else if (strncmp(buf, "GET /events", 11) == 0) promote_to_sse(fd);
+        else if (strncmp(buf, "GET /api/info", 13) == 0) {
+            extern bool opt_web_spectrum;
+            char resp[128];
+            snprintf(resp, sizeof(resp), "{\"spectrum\":%s}",
+                     opt_web_spectrum ? "true" : "false");
+            send_response(fd, 200, resp);
+        }
         else if (strncmp(buf, "POST /api/keys", 14) == 0) {
             const char *body = find_body(buf);
             keyset_t *ks = app_get_keyset();

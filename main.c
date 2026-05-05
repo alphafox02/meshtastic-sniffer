@@ -184,8 +184,10 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
  * The (sf, bw) part of the key keeps DIFFERENT presets that happen to
  * share a packet_id (collision is rare but possible across mesh
  * neighbours) from each shadowing the other. */
-#define DEDUP_RING_SIZE   64
-#define DEDUP_WINDOW_US   500000   /* 500 ms */
+#define DEDUP_RING_SIZE   256       /* sized for ~30 PFB-leakage copies of
+                                     *   each of ~8 in-flight unique frames
+                                     *   inside one 500 ms window. */
+#define DEDUP_WINDOW_US   500000    /* 500 ms */
 typedef struct {
     uint32_t packet_id;
     int      sf;

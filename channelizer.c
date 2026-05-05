@@ -214,7 +214,11 @@ int channelizer_add_channel(channelizer_t *c, const channel_cfg_t *cfg)
         return -1;
     }
 
-    c->channels[slot] = s;
+    /* Publish the slot pointer with release semantics first, then bump
+     * the count. SDR thread reads count via __ATOMIC_ACQUIRE and
+     * dereferences c->channels[i] for i < count -- the ordering pair
+     * keeps it from seeing a NULL pointer post-bump. */
+    __atomic_store_n(&c->channels[slot], s, __ATOMIC_RELEASE);
     __atomic_store_n(&c->n_channels, slot + 1, __ATOMIC_RELEASE);
 
     if (verbose) {
