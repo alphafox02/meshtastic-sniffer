@@ -238,7 +238,15 @@ struct lora_decoder {
     /* State machine. */
     lora_state_t state;
     int          preamble_count;
-    int          preamble_bin;       /* bin we're tracking */
+    int          preamble_bin;       /* bin we're tracking; updated to mode on lock */
+    /* Recent preamble bins captured during PREAMBLE_OK, used to compute the
+     * mode at lock time (= gr-lora_sdr's `most_frequent(preamb_up_vals)`).
+     * The IDLE-entry bin can be off by ±1 due to the FFT peak landing on
+     * the noisier early sym; subsequent ticks settle to the true k_hat.
+     * Picking the most frequent value matches gr-lora's k_hat exactly,
+     * which keeps the (N - k_hat) STO skip aligned to the input sample. */
+    int          preamble_bin_hist[16];
+    int          preamble_bin_hist_count;
     int          sto_skip_remaining; /* gr-lora_sdr-style k_hat realignment after preamble lock */
     uint16_t     header_syms[8];
     int          header_idx;
@@ -655,6 +663,7 @@ static void reset_to_idle(lora_decoder_t *d)
     d->state              = STATE_IDLE;
     d->preamble_count     = 0;
     d->preamble_fft_count = 0;
+    d->preamble_bin_hist_count = 0;
     d->header_idx         = 0;
     d->sto_skip_remaining = 0;
     d->hdr_leftover_count = 0;
@@ -731,6 +740,8 @@ static void state_tick(lora_decoder_t *d)
         d->preamble_bin    = (int)sym;
         d->preamble_count  = 1;
         d->preamble_fft_count = 0;
+        d->preamble_bin_hist[0] = (int)sym;
+        d->preamble_bin_hist_count = 1;
         d->cfo_int         = 0;
         d->cfo_frac        = 0.0f;
         d->state           = STATE_PREAMBLE_OK;
@@ -753,6 +764,10 @@ static void state_tick(lora_decoder_t *d)
             int N_HIST = (int)(sizeof(d->preamble_fft_hist) / sizeof(d->preamble_fft_hist[0]));
             if (d->preamble_fft_count < N_HIST)
                 d->preamble_fft_hist[d->preamble_fft_count++] = preamble_bin_val;
+            /* Stash bin value for k_hat = mode computation at lock time. */
+            int B_HIST = (int)(sizeof(d->preamble_bin_hist) / sizeof(d->preamble_bin_hist[0]));
+            if (d->preamble_bin_hist_count < B_HIST)
+                d->preamble_bin_hist[d->preamble_bin_hist_count++] = (int)sym;
         } else if (d->preamble_count >= PREAMBLE_MIN) {
             /* Bin shifted significantly after we had a confirmed preamble:
              * this is the first sync-word symbol. Treat it as such -- skip
@@ -767,14 +782,43 @@ static void state_tick(lora_decoder_t *d)
              * because each window straddles two adjacent chirps. */
             d->header_idx = 0;
             d->state      = STATE_HEADER;
+            /* k_hat = mode of the captured preamble bins (gr-lora_sdr's
+             * `most_frequent(preamb_up_vals, n_up_req)` form, frame_sync_impl.cc:534).
+             * The IDLE-entry latch can be off by ±1 due to FFT peak landing
+             * on a noisier early sym; subsequent ticks settle to the true
+             * value. Picking the mode keeps (N - k_hat) skip aligned to the
+             * actual symbol grid -- a 1-bin error here = 4 input samples =
+             * 1 output sample shift on every payload symbol's FFT bin. */
             int k_hat = d->preamble_bin;
+            if (d->preamble_bin_hist_count >= 2) {
+                int best_bin = d->preamble_bin_hist[0];
+                int best_count = 1;
+                for (int i = 0; i < d->preamble_bin_hist_count; ++i) {
+                    int c = 0;
+                    for (int j = 0; j < d->preamble_bin_hist_count; ++j)
+                        if (d->preamble_bin_hist[j] == d->preamble_bin_hist[i]) c++;
+                    if (c > best_count) {
+                        best_count = c;
+                        best_bin   = d->preamble_bin_hist[i];
+                    }
+                }
+                k_hat = best_bin;
+            }
             if (k_hat < 0) k_hat = 0;
             if (k_hat >= d->N) k_hat = 0;
             /* sto_skip_remaining is consumed in lora_decoder_feed at the
              * INPUT rate (samp_rate = os_factor * bw_hz). preamble_bin is
              * an output-rate FFT bin; multiply by os_factor to convert
-             * to the matching input-sample skip count. */
-            d->sto_skip_remaining = ((d->N - k_hat) % d->N) * d->os_factor;
+             * to the matching input-sample skip count.
+             *
+             * Note: the just-consumed PREAMBLE_OK tick already advanced us
+             * one full symbol past the last preamble end (= start of
+             * NET_ID1 + k_hat samples). Adding (N - k_hat) lands us at
+             * start_of_DC1 -- skipping NET_ID2 entirely. (gr-lora_sdr's
+             * DETECT exit consumes only (N - k_hat), but we can't go
+             * backwards in a streaming pipeline.) STATE_HEADER then needs
+             * to read just 2 more ticks (DC1, DC2), NOT 3. */
+            d->sto_skip_remaining = (d->N - k_hat) * d->os_factor;
 
             /* CFO_frac estimate from the captured preamble FFT bin values:
              * gr-lora_sdr frame_sync_impl.cc:241-243 form -- accumulate
@@ -796,33 +840,30 @@ static void state_tick(lora_decoder_t *d)
                 d->cfo_frac = 0.0f;
             }
 
-            /* After realignment the symbol grid restarts at bin 0, so
-             * subsequent CFO compensation should subtract 0 not preamble_bin. */
+            /* Update preamble_bin to the mode-derived k_hat so subsequent
+             * sync-word checks use the corrected value, then zero it for
+             * post-realignment FFT bin interpretation. */
             d->preamble_bin = 0;
+            d->preamble_bin_hist_count = 0;
         } else {
             reset_to_idle(d);
         }
         break;
     }
     case STATE_HEADER: {
-        /* On entry: state=1 consumed the first sync-word symbol AND we did
-         * a (N - k_hat) STO skip. Now we drop the 2nd sync + 2 downchirps
-         * (3 ticks), then need ONE more time the 0.25-symbol "quarter
-         * downchirp" tail before header. We schedule a 512-sample skip
-         * after header_idx reaches 3 to absorb that quarter chirp. */
-        if (d->header_idx < 3) {
-            /* Tick 0 = sync2 (upchirp), tick 1 = down1, tick 2 = down2.
-             *
-             * Stash sync2's bin so we can verify it against the known
-             * Meshtastic sync words once cfo_int is in hand. The two
-             * legal values are 0x12 (legacy / sync2 bin 16) and 0x2B
-             * (mainland Meshtastic / sync2 bin 88). Anything else after
-             * cfo subtraction is almost certainly a false preamble lock
-             * on noise -- drop it before we waste payload symbols on
-             * garbage. */
-            if (d->header_idx == 0) {
-                d->sync2_bin = (int)sym;
-            }
+        /* On entry: PREAMBLE_OK consumed the NET_ID1 tick (one full symbol
+         * past the last preamble end) AND we just queued a (N - k_hat)
+         * skip. Combined, those land us at start_of_DC1 -- NET_ID2 is
+         * absorbed into the skip+overshoot. Now read 2 ticks (DC1, DC2),
+         * measure cfo_int on DC2, then queue the 0.25-symbol quarter-down
+         * tail trim before header[0]. Total post-preamble alignment:
+         *   1 sym (shifted NET_ID1) + (N - k_hat) skip + 2 sym (DC1+DC2)
+         *   + N/4 + cfo_int trim  =  4.25*N - k_hat + cfo_int  ✓ matches
+         *   gr-lora_sdr's frame_sync (NET_ID1+NET_ID2+DC1+DC2 + QUARTER_DOWN
+         *   trim of N/4 + cfo_int after a (N - k_hat) DETECT-exit consume). */
+        if (d->header_idx < 2) {
+            /* tick 0 = DC1 (downchirp, sym from upchirp dechirp is junk),
+             * tick 1 = DC2 (measure cfo_int from downchirp dechirp). */
             if (d->header_idx == 1) {
                 int down_val = demod_downchirp_argmax(d, sym_samples);
                 if ((uint32_t)down_val < (uint32_t)(d->N / 2))
@@ -836,56 +877,22 @@ static void state_tick(lora_decoder_t *d)
                 if (trace_on)
                     fprintf(stderr, "[lora] cfo_int=%d cfo_frac=%.4f (down_val=%d)\n",
                             d->cfo_int, (double)d->cfo_frac, down_val);
-
-                /* Sync-word check: Meshtastic uses 0x12 (sync2 = 16) or 0x2B
-                 * (sync2 = 88). The (N - preamble_bin) STO skip happens to
-                 * *cancel* the carrier-offset contribution to sync2's peak
-                 * position at the cost of injecting an equal-magnitude
-                 * sample shift; the net effect is that sync2's observed
-                 * bin equals the literal sync_word[1] value directly,
-                 * before any cfo subtraction. (Sounds odd but the math
-                 * works out because preamble_bin = -k_sample + cfo_int.)
-                 * Allow ±1 bin slop for residual fractional cfo. */
-                /* Soft-warn only on non-canonical sync2: at non-zero CFO
-                 * the observed bin shifts away from 16/88 by an amount
-                 * that depends on residual STO. The header checksum a
-                 * few ticks later is the real validator. Per the
-                 * crankylinuxuser reference flowgraph: hard sync-word
-                 * verification at this stage rejects too many real-radio
-                 * frames, so the working approach is to log and continue. */
-                int d12 = abs(d->sync2_bin - 16);  if (d12 > d->N / 2) d12 = d->N - d12;
-                int d2b = abs(d->sync2_bin - 88);  if (d2b > d->N / 2) d2b = d->N - d2b;
-                if (d12 > 1 && d2b > 1 && (trace_on || verbose >= 3)) {
-                    fprintf(stderr, "[lora] sync2 bin %d off canonical (cfo_int=%d)\n",
-                            d->sync2_bin, d->cfo_int);
-                }
             }
             d->header_idx++;
-            if (d->header_idx == 3) {
-                /* Just consumed sync2 + down1 + down2; queue the 0.25-symbol
-                 * quarter-downchirp skip before reading header.
-                 *
-                 * Plus an integer sample correction of -cfo_int. The preamble
-                 * bin already absorbed cfo_int so the original (N - k_hat)
-                 * skip under-shot the true sample alignment by that amount;
-                 * down_val confirmed it carries 2*cfo_int (one from carrier
-                 * offset, one from sample misalignment). The carrier half is
-                 * cancelled by apply_cfo_correction; the sample half has to
-                 * be made up here, otherwise every subsequent FFT lands its
-                 * peak at v - cfo_int instead of v. */
-                /* Clamp to non-negative: a sufficiently negative cfo_int
-                 * (>|N/4|) would otherwise leave sto_skip_remaining < 0,
-                 * which the > 0 check in lora_decoder_feed silently treats
-                 * as "no skip" and quietly drops the cfo correction. Real
-                 * radio CFO is well within ±N/4 so this is a safety belt. */
+            if (d->header_idx == 2) {
+                /* Just consumed DC1 + DC2; queue the 0.25-symbol
+                 * quarter-downchirp tail skip before reading header[0].
+                 * Plus an integer cfo_int sample correction (gr-lora_sdr
+                 * frame_sync_impl.cc:810 form). Clamp >= 0: streaming
+                 * skip can't go backwards, and cfo_int < -N/4 would only
+                 * happen on absurd carrier offsets we'd never lock anyway. */
                 int trim = d->N / 4 + d->cfo_int;
                 if (trim < 0) trim = 0;
-                /* Convert from output-rate samples to input-rate samples. */
                 d->sto_skip_remaining += trim * d->os_factor;
             }
             break;
         }
-        int hi = d->header_idx - 3;
+        int hi = d->header_idx - 2;
         if (hi < 8) {
             int sf_app_h = d->sf - 2;
             if (sf_app_h < 5) sf_app_h = 5;
@@ -912,7 +919,7 @@ static void state_tick(lora_decoder_t *d)
             }
             ++d->header_idx;
         }
-        if (d->header_idx == 3 + 8) {
+        if (d->header_idx == 2 + 8) {
             /* Decode header per gr-lora_sdr header_decoder_impl.cc:
              *   - sf_app = sf-2 (header always uses reduced-rate)
              *   - cr_hdr = 8 (header always 4/8)
