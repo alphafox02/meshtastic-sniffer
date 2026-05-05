@@ -760,7 +760,11 @@ static void state_tick(lora_decoder_t *d)
             int k_hat = d->preamble_bin;
             if (k_hat < 0) k_hat = 0;
             if (k_hat >= d->N) k_hat = 0;
-            d->sto_skip_remaining = (d->N - k_hat) % d->N;
+            /* sto_skip_remaining is consumed in lora_decoder_feed at the
+             * INPUT rate (samp_rate = os_factor * bw_hz). preamble_bin is
+             * an output-rate FFT bin; multiply by os_factor to convert
+             * to the matching input-sample skip count. */
+            d->sto_skip_remaining = ((d->N - k_hat) % d->N) * d->os_factor;
 
             /* CFO_frac estimate from the captured preamble FFT bin values:
              * gr-lora_sdr frame_sync_impl.cc:241-243 form -- accumulate
@@ -866,7 +870,8 @@ static void state_tick(lora_decoder_t *d)
                  * radio CFO is well within ±N/4 so this is a safety belt. */
                 int trim = d->N / 4 + d->cfo_int;
                 if (trim < 0) trim = 0;
-                d->sto_skip_remaining += trim;
+                /* Convert from output-rate samples to input-rate samples. */
+                d->sto_skip_remaining += trim * d->os_factor;
             }
             break;
         }
