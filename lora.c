@@ -239,6 +239,8 @@ struct lora_decoder {
     int          sto_skip_remaining; /* gr-lora_sdr-style k_hat realignment after preamble lock */
     uint16_t     header_syms[8];
     int          header_idx;
+    int          sync2_bin;          /* observed bin of sync2 -- per-decoder so
+                                      * parallel decoders don't stomp each other */
 
     /* Carrier frequency offset compensation (gr-lora_sdr frame_sync_impl.cc).
      * cfo_int  : integer-bin offset, derived from dechirped downchirp peak.
@@ -595,6 +597,26 @@ static uint8_t lora_hamming_decode_soft(const float *cw_llrs, int cr, int *err)
                      ((data_msb_first & 0x8) >> 3));
 }
 
+/* Drop back to STATE_IDLE and zero every per-frame field so a re-entry
+ * doesn't carry stale values from the failed/completed frame. Called from
+ * every code path that aborts a frame mid-flight (sync-word mismatch,
+ * header CRC fail, lost SNR), and after a successful DELIVER. */
+static void reset_to_idle(lora_decoder_t *d)
+{
+    d->state              = STATE_IDLE;
+    d->preamble_count     = 0;
+    d->preamble_fft_count = 0;
+    d->header_idx         = 0;
+    d->sto_skip_remaining = 0;
+    d->hdr_leftover_count = 0;
+    d->payload_sym_count  = 0;
+    d->payload_sym_target = 0;
+    d->payload_ldro       = false;
+    d->cfo_int            = 0;
+    d->cfo_frac           = 0.0f;
+    d->sync2_bin          = -1;
+}
+
 /* Run the state machine for one accumulated symbol. */
 static void state_tick(lora_decoder_t *d)
 {
@@ -648,8 +670,7 @@ static void state_tick(lora_decoder_t *d)
     case STATE_PREAMBLE_OK: {
         if (!above_floor) {
             /* Lost the signal -- back to hunting. */
-            d->state = STATE_IDLE;
-            d->preamble_count = 0;
+            reset_to_idle(d);
             d->preamble_fft_count = 0;
             break;
         }
@@ -706,8 +727,7 @@ static void state_tick(lora_decoder_t *d)
              * subsequent CFO compensation should subtract 0 not preamble_bin. */
             d->preamble_bin = 0;
         } else {
-            d->state = STATE_IDLE;
-            d->preamble_count = 0;
+            reset_to_idle(d);
         }
         break;
     }
@@ -727,9 +747,8 @@ static void state_tick(lora_decoder_t *d)
              * cfo subtraction is almost certainly a false preamble lock
              * on noise -- drop it before we waste payload symbols on
              * garbage. */
-            static int sync2_bin = -1;
             if (d->header_idx == 0) {
-                sync2_bin = (int)sym;
+                d->sync2_bin = (int)sym;
             }
             if (d->header_idx == 1) {
                 int down_val = demod_downchirp_argmax(d, d->symbuf);
@@ -754,15 +773,14 @@ static void state_tick(lora_decoder_t *d)
                  * before any cfo subtraction. (Sounds odd but the math
                  * works out because preamble_bin = -k_sample + cfo_int.)
                  * Allow ±1 bin slop for residual fractional cfo. */
-                int d12 = abs(sync2_bin - 16);  if (d12 > d->N / 2) d12 = d->N - d12;
-                int d2b = abs(sync2_bin - 88);  if (d2b > d->N / 2) d2b = d->N - d2b;
+                int d12 = abs(d->sync2_bin - 16);  if (d12 > d->N / 2) d12 = d->N - d12;
+                int d2b = abs(d->sync2_bin - 88);  if (d2b > d->N / 2) d2b = d->N - d2b;
                 if (d12 > 1 && d2b > 1) {
                     if (trace_on || verbose >= 2)
                         fprintf(stderr, "[lora] sync-word mismatch: sync2 bin %d, "
                                 "expected 16 (0x12) or 88 (0x2B) -- dropping frame\n",
-                                sync2_bin);
-                    d->state = STATE_IDLE;
-                    d->preamble_count = 0;
+                                d->sync2_bin);
+                    reset_to_idle(d);
                     break;
                 }
             }
@@ -779,7 +797,14 @@ static void state_tick(lora_decoder_t *d)
                  * cancelled by apply_cfo_correction; the sample half has to
                  * be made up here, otherwise every subsequent FFT lands its
                  * peak at v - cfo_int instead of v. */
-                d->sto_skip_remaining += d->N / 4 + d->cfo_int;
+                /* Clamp to non-negative: a sufficiently negative cfo_int
+                 * (>|N/4|) would otherwise leave sto_skip_remaining < 0,
+                 * which the > 0 check in lora_decoder_feed silently treats
+                 * as "no skip" and quietly drops the cfo correction. Real
+                 * radio CFO is well within ±N/4 so this is a safety belt. */
+                int trim = d->N / 4 + d->cfo_int;
+                if (trim < 0) trim = 0;
+                d->sto_skip_remaining += trim;
             }
             break;
         }
@@ -869,8 +894,7 @@ static void state_tick(lora_decoder_t *d)
                             header_chk, computed_chk,
                             n[0], n[1], n[2], n[3], n[4],
                             d->payload_len, d->payload_cr, d->payload_has_crc);
-                d->state = STATE_IDLE;
-                d->preamble_count = 0;
+                reset_to_idle(d);
                 break;
             }
             /* Stash leftover header-block nibbles (positions 5..sf_app-1)
@@ -914,8 +938,7 @@ static void state_tick(lora_decoder_t *d)
             if (d->payload_sym_target == 0) {
                 /* Empty payload -> deliver immediately as just-header. */
                 if (d->cb) d->cb(NULL, 0, &d->meta, d->user);
-                d->state = STATE_IDLE;
-                d->preamble_count = 0;
+                reset_to_idle(d);
             }
         }
         break;
@@ -996,8 +1019,7 @@ static void state_tick(lora_decoder_t *d)
                         bytes[0], bytes[1], bytes[2], bytes[3],
                         bytes[4], bytes[5], bytes[6], bytes[7]);
             if (d->cb) d->cb(bytes, (size_t)d->payload_len, &d->meta, d->user);
-            d->state = STATE_IDLE;
-            d->preamble_count = 0;
+            reset_to_idle(d);
         }
         break;
     }
