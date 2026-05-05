@@ -505,6 +505,18 @@ static void *stats_thread(void *arg)
                     rate_msps, (unsigned long long)f, (unsigned long long)d,
                     (unsigned long long)og);
 
+            /* Mirror the same numbers to the web SSE stream so the
+             * dashboard's persistent header can show them live. */
+            if (opt_web_port > 0) {
+                char sline[256];
+                int sn = snprintf(sline, sizeof(sline),
+                    "{\"event\":\"STATS\",\"msps\":%.2f,\"frames\":%llu,"
+                    "\"decrypted\":%llu,\"off_grid\":%llu}\n",
+                    rate_msps, (unsigned long long)f,
+                    (unsigned long long)d, (unsigned long long)og);
+                if (sn > 0) web_publish_line(sline, (size_t)sn);
+            }
+
             if (opt_stats_json) {
                 FILE *sf = fopen(opt_stats_json, "w");
                 if (sf) {
