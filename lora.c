@@ -293,6 +293,11 @@ struct lora_decoder {
 
     /* Per-frame metadata, updated as we go. */
     lora_frame_meta_t meta;
+    /* Running SNR accumulator across the header + payload symbols.
+     * dB-domain mean of (peak / noise_floor_avg) per FFT, averaged at
+     * frame delivery and written into meta.snr_db. */
+    double            snr_db_sum;
+    int               snr_db_count;
 
     lora_frame_cb_t cb;
     void           *user;
@@ -670,6 +675,8 @@ static void reset_to_idle(lora_decoder_t *d)
     d->payload_ldro       = false;
     d->cfo_int            = 0;
     d->cfo_frac           = 0.0f;
+    d->snr_db_sum         = 0.0;
+    d->snr_db_count       = 0;
 }
 
 /* Run the state machine for one accumulated symbol. */
@@ -704,6 +711,18 @@ static void state_tick(lora_decoder_t *d)
     uint16_t sym = demod_one_symbol_full(d, sym_samples, &peak, &noise,
         capture_preamble ? d->preamble_bin : -1,
         capture_preamble ? &preamble_bin_val : NULL);
+
+    /* SNR accumulation across the demodulated frame. We average the dB
+     * ratio of FFT peak to noise-floor-average across header+payload
+     * symbols and write it into meta.snr_db at frame delivery. Ignore
+     * IDLE and PREAMBLE_OK ticks (those before lock are mostly noise);
+     * STATE_HEADER and STATE_PAYLOAD are the meaningful ones. */
+    if ((d->state == STATE_HEADER || d->state == STATE_PAYLOAD) &&
+        peak > 0.0f && noise > 0.0f) {
+        double snr_db = 20.0 * log10((double)peak / (double)noise);
+        d->snr_db_sum += snr_db;
+        d->snr_db_count++;
+    }
 
     /* Per-tick state-machine trace. Enabled by either MESHTASTIC_LORA_TRACE=1
      * in the env (legacy) or -vvv on the command line. Useful for cross-
@@ -1027,6 +1046,9 @@ static void state_tick(lora_decoder_t *d)
 
             if (d->payload_sym_target == 0) {
                 /* Empty payload -> deliver immediately as just-header. */
+                d->meta.snr_db = (d->snr_db_count > 0)
+                               ? (float)(d->snr_db_sum / (double)d->snr_db_count)
+                               : 0.0f;
                 if (d->cb) d->cb(NULL, 0, &d->meta, d->user);
                 reset_to_idle(d);
             }
@@ -1103,9 +1125,15 @@ static void state_tick(lora_decoder_t *d)
                 d->meta.payload_crc_ok = !d->payload_has_crc;
             }
 
+            /* Stash the running average SNR for this frame so callers
+             * (feed/web) can render it. */
+            d->meta.snr_db = (d->snr_db_count > 0)
+                           ? (float)(d->snr_db_sum / (double)d->snr_db_count)
+                           : 0.0f;
             if (trace_on)
-                fprintf(stderr, "[lora] DELIVER: %d payload bytes, crc_ok=%d, first 8: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                fprintf(stderr, "[lora] DELIVER: %d payload bytes, crc_ok=%d, snr=%.1fdB, first 8: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                         d->payload_len, d->meta.payload_crc_ok,
+                        (double)d->meta.snr_db,
                         bytes[0], bytes[1], bytes[2], bytes[3],
                         bytes[4], bytes[5], bytes[6], bytes[7]);
             if (d->cb) d->cb(bytes, (size_t)d->payload_len, &d->meta, d->user);
