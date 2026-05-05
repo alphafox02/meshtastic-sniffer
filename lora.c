@@ -250,8 +250,6 @@ struct lora_decoder {
     int          sto_skip_remaining; /* gr-lora_sdr-style k_hat realignment after preamble lock */
     uint16_t     header_syms[8];
     int          header_idx;
-    int          sync2_bin;          /* observed bin of sync2 -- per-decoder so
-                                      * parallel decoders don't stomp each other */
 
     /* Carrier frequency offset compensation (gr-lora_sdr frame_sync_impl.cc).
      * cfo_int  : integer-bin offset, derived from dechirped downchirp peak.
@@ -672,7 +670,6 @@ static void reset_to_idle(lora_decoder_t *d)
     d->payload_ldro       = false;
     d->cfo_int            = 0;
     d->cfo_frac           = 0.0f;
-    d->sync2_bin          = -1;
 }
 
 /* Run the state machine for one accumulated symbol. */
@@ -846,9 +843,9 @@ static void state_tick(lora_decoder_t *d)
                 d->cfo_frac = 0.0f;
             }
 
-            /* Update preamble_bin to the mode-derived k_hat so subsequent
-             * sync-word checks use the corrected value, then zero it for
-             * post-realignment FFT bin interpretation. */
+            /* After the (N - k_hat) skip the symbol grid restarts at bin 0
+             * so subsequent header/payload FFT-bin interpretation should
+             * subtract 0 (not k_hat). */
             d->preamble_bin = 0;
             d->preamble_bin_hist_count = 0;
         } else {

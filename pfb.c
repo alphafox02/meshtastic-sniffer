@@ -9,13 +9,17 @@
  *   1. Design a prototype lowpass h[0..L*M-1] with cutoff 1/(2M).
  *   2. Decompose into M branches: h_p[i][k] = h[k*M + i].
  *   3. Per input sample x[n]:
- *        branch i = (M-1) - (n mod M)        -- reversed commutator
+ *        branch i = n mod M                   -- forward commutator
  *        branch[i].delay <- shift_in(x[n])   -- length-L delay line
  *      When (n+1) mod M == 0 (cycle boundary):
  *        For each branch i:
  *          y_i = sum_{k=0..L-1} branch[i].delay[k] * h_p[i][k]
- *        Y[k] = FFT(y)                        -- M-point DFT
+ *        Y[k] = FFT(y)                        -- M-point forward DFT
  *        emit Y[bin] to each channel registered on `bin`
+ *
+ * Forward commutator + forward FFT: an input tone at frequency +f Hz
+ * lights up output bin round(f * M / Fs), with FFTW natural ordering
+ * (bins 0..M/2 = positive frequencies, M/2..M-1 = negative wrap).
  *
  * Output rate per channel = Fs / M. Adjacent-channel rejection is set
  * by the prototype filter; with a Hamming-windowed sinc of length 12*M

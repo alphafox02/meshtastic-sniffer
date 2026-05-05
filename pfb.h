@@ -53,8 +53,11 @@ int pfb_register_bin(pfb_t *p, int bin, int channel_id,
  * dispatched via the registered callbacks at output rate. */
 void pfb_process(pfb_t *p, const float complex *samples, size_t n);
 
-/* Flush any partial output buffers to their callbacks and reset
- * accumulator state. */
+/* Flush any partial per-bin output buffers to their callbacks. Does
+ * NOT reset the polyphase delay line, commutator phase, or warmup
+ * counter -- that would lose continuity in the middle of a stream.
+ * Call once at end-of-stream (file replay EOF) so the demods see the
+ * tail. */
 void pfb_flush(pfb_t *p);
 
 void pfb_destroy(pfb_t *p);
