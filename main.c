@@ -165,55 +165,46 @@ static void on_off_grid_discovery(const scanner_discovery_t *disc, void *user)
 
 /* ---- Pipeline glue: channelizer -> lora demod -> mesh packet -> feed ---- */
 
-/* Forward declaration -- definition follows below. Marks the most
- * recent (sf, bw) dedup entry within the leakage window as decrypted. */
-static void dedup_mark_recent_decrypted(int sf, int bw_hz);
-
 static void on_mesh_event(const mesh_event_t *ev, void *user) {
     intptr_t channel_id = (intptr_t)user;
     if (ev->decrypted) {
         __atomic_add_fetch(&g_decrypts_total, 1, __ATOMIC_RELAXED);
         if (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS)
             __atomic_add_fetch(&g_chan_stats[channel_id].decrypted, 1, __ATOMIC_RELAXED);
-        /* Tell dedup we got cleartext for this transmission; later
-         * leakage copies in the same window get suppressed. */
-        dedup_mark_recent_decrypted(ev->sf, ev->bw_hz);
     }
     feed_publish_event(ev);
 }
 
-/* Dedupe PFB bin-leakage copies of a single transmission.
+/* Delayed best-pick dedup of PFB bin-leakage copies.
  *
- * The SDR captures one chirp; every PFB output bin within the chirp's
- * sidelobe range produces a decode of the same payload, milliseconds
- * apart. Each adjacent bin has a slightly worse SNR and produces a
- * different small set of bit errors -- so packet_id, from-ID, and
- * channel hash all mutate 1-3 bits between copies. Pure exact-match
- * dedup fails. Pure time-window dedup fails too: two genuine concurrent
- * transmissions on the same (sf, bw) would be wrongly suppressed.
+ * Each LoRa transmission produces ~30 leakage replicas across adjacent
+ * PFB output bins. Per-replica bit errors are independent across bins;
+ * the cleanest decode is whichever bin had the highest SNR. Picking
+ * the FIRST replica that arrives (eager emit) is random; picking the
+ * highest-SNR replica is deterministically the best-quality copy.
  *
- * Bulletproof signal: PAYLOAD FINGERPRINT SIMILARITY. Two leakage
- * copies of one transmission share ~99% of payload bytes -- their
- * fingerprints differ by only a few bits (= the bit errors). Two
- * unrelated transmissions have effectively random fingerprints with
- * Hamming distance ~32 / 64 bits.
+ * Algorithm:
+ *   1. New replica arrives -> compute payload fingerprint.
+ *   2. Find an existing cluster within Hamming distance 14 (real
+ *      transmissions have fingerprint distance ~32; bit-error replicas
+ *      ~1-5).
+ *   3. If found and this replica's SNR is higher: replace the cluster's
+ *      stored best.
+ *   4. If not found: open a new cluster with this replica as best,
+ *      schedule emit at now + DEDUP_WINDOW_US.
+ *   5. Drainer thread polls every few ms; when a cluster's emit time
+ *      passes, hand its best-stored replica to mesh_packet_decode_with_radio
+ *      (single attempt, gets the cleanest SNR copy = best decrypt odds).
  *
- * Algorithm: keep a small ring of recent (fingerprint, ts, sf, bw,
- * decrypted) tuples. A new frame is a duplicate iff some recent
- * fingerprint within DEDUP_WINDOW_US has popcount(xor) <= threshold
- * AND same (sf, bw). Threshold is well below random-distance so
- * false matches are essentially impossible. */
-#define DEDUP_RING_SIZE             128
-#define DEDUP_WINDOW_US             50000   /* 50 ms */
-#define DEDUP_FP_HAMMING_THRESH     14      /* random 64-bit dist ~32 */
-/* Two retry budgets. When a leakage cluster's channel-hash matches a
- * key we have loaded, ride the cluster long enough to find a copy
- * with few enough bit errors that AES decrypts cleanly (up to ~30
- * leakage replicas per chirp). When no key matches that hash, no
- * point retrying -- emit one undecrypted line and suppress the rest
- * to keep the JSON stream readable. */
-#define DEDUP_ATTEMPTS_KEYED        32
-#define DEDUP_ATTEMPTS_UNKEYED      1
+ * One JSON line per real transmission, regardless of PFB leakage count.
+ * Density-safe: 100 simultaneous distinct transmissions create 100
+ * distinct clusters (random fingerprints don't collide within 14
+ * Hamming bits). 30 ms window swallows leakage cluster from a single
+ * chirp without merging adjacent unrelated transmissions. */
+#define DEDUP_RING_SIZE         512
+#define DEDUP_WINDOW_US         30000   /* 30 ms is well past leakage spread */
+#define DEDUP_FP_HAMMING_THRESH 14
+#define DEDUP_MAX_PAYLOAD       256
 
 /* 64-bit XOR-fold fingerprint of the payload bytes. Two near-identical
  * byte arrays produce near-identical fingerprints; a single bit error
@@ -225,11 +216,8 @@ static uint64_t payload_fingerprint(const uint8_t *p, size_t n)
         uint64_t w;
         memcpy(&w, p + i, sizeof(w));
         h ^= w;
-        /* Light rotation prevents long aligned runs of zeros from
-         * fingerprint-collapsing into 0 -- stay sensitive to position. */
         h = (h << 1) | (h >> 63);
     }
-    /* Tail bytes (n mod 8). */
     uint64_t tail = 0;
     for (size_t i = (n & ~7ULL); i < n; ++i)
         tail |= (uint64_t)p[i] << ((i - (n & ~7ULL)) * 8);
@@ -237,130 +225,176 @@ static uint64_t payload_fingerprint(const uint8_t *p, size_t n)
 }
 
 typedef struct {
-    uint64_t fp;
-    int      sf;
-    int      bw_hz;
-    uint64_t ts_us;
-    int      attempts;
-    bool     ever_decrypted;
+    bool                in_use;
+    uint64_t            fp;
+    int                 sf;
+    int                 bw_hz;
+    uint64_t            emit_at_us;     /* now_us + window when first opened */
+    /* Highest-SNR replica seen so far for this cluster. */
+    float               best_snr_db;
+    size_t              best_payload_len;
+    uint8_t             best_payload[DEDUP_MAX_PAYLOAD];
+    lora_frame_meta_t   best_meta;
+    intptr_t            best_user;
+    int                 replica_count;  /* for telemetry / debug */
 } dedup_entry_t;
-static dedup_entry_t g_dedup[DEDUP_RING_SIZE];
-static int           g_dedup_head;
+
+static dedup_entry_t   g_dedup[DEDUP_RING_SIZE];
 static pthread_mutex_t g_dedup_mu = PTHREAD_MUTEX_INITIALIZER;
 
-/* The new key is a fingerprint, not a packet_id (packet_id mutates
- * with bit errors). Keep the function signature compatible with
- * on_lora_frame's call-site by computing the fingerprint inside.
- * The channel_hash arg drives the keyed/unkeyed retry budget. */
-static bool frame_is_duplicate(const uint8_t *payload, size_t payload_len,
-                               int sf, int bw_hz, uint8_t channel_hash)
+static uint64_t monotonic_us(void)
 {
-    if (!payload || payload_len < 12) return false;
-    uint64_t fp = payload_fingerprint(payload, payload_len);
-
-    /* Probe the keyset to set the retry budget. If we have any key
-     * with this channel_hash, ride leakage cluster long enough to
-     * find a clean-bit-error copy. Otherwise: cap at 1 line per
-     * cluster -- the user can't decrypt these anyway. */
-    int budget = DEDUP_ATTEMPTS_UNKEYED;
-    if (g_keys) {
-        keyset_rdlock(g_keys);
-        const int8_t *idxs = keyset_lookup(g_keys, channel_hash);
-        if (idxs && idxs[0] != -1) budget = DEDUP_ATTEMPTS_KEYED;
-        keyset_rdunlock(g_keys);
-    }
-
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
 
-    bool suppress = false;
+/* Buffer the replica into its cluster (matched by fingerprint), keeping
+ * the highest-SNR copy seen so far. Returns true if a new cluster was
+ * opened (= caller can stop here; the drainer will emit). */
+static void dedup_buffer(const uint8_t *payload, size_t payload_len,
+                         const lora_frame_meta_t *meta, intptr_t user)
+{
+    if (!payload || payload_len < 14 || payload_len > DEDUP_MAX_PAYLOAD) return;
+    int sf = meta ? meta->sf    : 0;
+    int bw = meta ? meta->bw_hz : 0;
+    float snr = meta ? meta->snr_db : 0.0f;
+    uint64_t fp = payload_fingerprint(payload, payload_len);
+    uint64_t now_us = monotonic_us();
+
     pthread_mutex_lock(&g_dedup_mu);
     dedup_entry_t *match = NULL;
+    int free_slot = -1;
     for (int i = 0; i < DEDUP_RING_SIZE; ++i) {
         dedup_entry_t *e = &g_dedup[i];
-        if (e->sf != sf || e->bw_hz != bw_hz) continue;
-        if (now_us - e->ts_us >= DEDUP_WINDOW_US) continue;
+        if (!e->in_use) {
+            if (free_slot < 0) free_slot = i;
+            continue;
+        }
+        if (e->sf != sf || e->bw_hz != bw) continue;
         int hd = __builtin_popcountll(e->fp ^ fp);
         if (hd <= DEDUP_FP_HAMMING_THRESH) { match = e; break; }
     }
     if (match) {
-        if (match->ever_decrypted || match->attempts >= budget) {
-            suppress = true;
-        } else {
-            match->attempts++;
-            match->ts_us = now_us;
+        match->replica_count++;
+        if (snr > match->best_snr_db) {
+            match->best_snr_db      = snr;
+            match->best_payload_len = payload_len;
+            memcpy(match->best_payload, payload, payload_len);
+            if (meta) match->best_meta = *meta;
+            match->best_user        = user;
+            match->fp               = fp;   /* update to cleaner fp */
         }
-    } else {
-        g_dedup[g_dedup_head] = (dedup_entry_t){
-            .fp = fp, .sf = sf, .bw_hz = bw_hz,
-            .ts_us = now_us, .attempts = 1, .ever_decrypted = false,
-        };
-        g_dedup_head = (g_dedup_head + 1) % DEDUP_RING_SIZE;
+    } else if (free_slot >= 0) {
+        dedup_entry_t *e = &g_dedup[free_slot];
+        e->in_use           = true;
+        e->fp               = fp;
+        e->sf               = sf;
+        e->bw_hz            = bw;
+        e->emit_at_us       = now_us + DEDUP_WINDOW_US;
+        e->best_snr_db      = snr;
+        e->best_payload_len = payload_len;
+        memcpy(e->best_payload, payload, payload_len);
+        if (meta) e->best_meta = *meta;
+        e->best_user        = user;
+        e->replica_count    = 1;
     }
+    /* else: ring full -- silently drop. With RING_SIZE=512 and 30 ms
+     * window, this would require ~17000 distinct clusters/sec, far
+     * above any realistic urban Meshtastic load. */
     pthread_mutex_unlock(&g_dedup_mu);
-    return suppress;
 }
 
-/* Mark the most-recent (sf, bw) dedup entry within the leakage window
- * as decrypted; future leakage copies of the same fingerprint will
- * suppress immediately. We use 'most recent in window' as a proxy for
- * 'this entry' because mesh_event_t doesn't carry the original
- * payload bytes; the decryption happens AFTER frame_is_duplicate
- * already created the entry, so the most-recent one in the same
- * (sf, bw) bucket within the window is necessarily ours. */
-static void dedup_mark_recent_decrypted(int sf, int bw_hz)
+/* Drainer thread: every few ms, emit any cluster whose window has
+ * expired by handing its best-SNR replica to mesh_packet_decode_with_radio.
+ * The decode runs OUTSIDE the dedup mutex so the decrypt + publish
+ * path doesn't serialize against incoming replicas. */
+static volatile bool g_dedup_drainer_run = false;
+static pthread_t     g_dedup_drainer_tid;
+
+static void dedup_emit_locked(const dedup_entry_t *e)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-    pthread_mutex_lock(&g_dedup_mu);
-    uint64_t latest_ts = 0;
-    dedup_entry_t *latest = NULL;
-    for (int i = 0; i < DEDUP_RING_SIZE; ++i) {
-        dedup_entry_t *e = &g_dedup[i];
-        if (e->sf != sf || e->bw_hz != bw_hz) continue;
-        if (now_us - e->ts_us >= DEDUP_WINDOW_US) continue;
-        if (e->ts_us > latest_ts) { latest_ts = e->ts_us; latest = e; }
+    intptr_t channel_id = e->best_user;
+    __atomic_add_fetch(&g_frames_total, 1, __ATOMIC_RELAXED);
+    if (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS) {
+        __atomic_add_fetch(&g_chan_stats[channel_id].frames, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&g_chan_stats[channel_id].bytes,
+                           e->best_payload_len, __ATOMIC_RELAXED);
+        g_chan_stats[channel_id].snr_db_sum   += (double)e->best_meta.snr_db;
+        g_chan_stats[channel_id].snr_db_count += 1;
     }
-    if (latest) latest->ever_decrypted = true;
-    pthread_mutex_unlock(&g_dedup_mu);
+    mesh_packet_decode_with_radio(e->best_payload, e->best_payload_len,
+                                  e->best_meta.rssi_db, e->best_meta.snr_db,
+                                  e->best_meta.sf, e->best_meta.cr,
+                                  e->best_meta.bw_hz,
+                                  g_keys, on_mesh_event, (void *)channel_id);
 }
 
+/* Per-tick batch capacity. ~30 ms window × ~few hundred frames/sec
+ * upper bound = handful of expirations per 5 ms tick on a busy mesh. */
+#define DEDUP_DRAIN_BATCH 64
+
+static void *dedup_drainer_thread(void *arg)
+{
+    (void)arg;
+#ifdef _GNU_SOURCE
+    pthread_setname_np(pthread_self(), "dedup-drain");
+#endif
+    /* Per-tick: ONE lock, scan ring, copy out all ready entries, unlock,
+     * emit. That keeps lock-hold time bounded and decoupled from the
+     * decode/publish path which can block on mqtt/web/stdout. */
+    dedup_entry_t batch[DEDUP_DRAIN_BATCH];
+    while (g_dedup_drainer_run) {
+        usleep(5000); /* 5 ms tick = ~6 ticks per window */
+        uint64_t now_us = monotonic_us();
+        int n = 0;
+        pthread_mutex_lock(&g_dedup_mu);
+        for (int i = 0; i < DEDUP_RING_SIZE && n < DEDUP_DRAIN_BATCH; ++i) {
+            dedup_entry_t *e = &g_dedup[i];
+            if (e->in_use && now_us >= e->emit_at_us) {
+                batch[n++] = *e;
+                e->in_use = false;
+            }
+        }
+        pthread_mutex_unlock(&g_dedup_mu);
+        for (int i = 0; i < n; ++i) dedup_emit_locked(&batch[i]);
+    }
+    return NULL;
+}
+
+static void dedup_drainer_start(void)
+{
+    g_dedup_drainer_run = true;
+    pthread_create(&g_dedup_drainer_tid, NULL, dedup_drainer_thread, NULL);
+}
+
+static void dedup_drainer_stop(void)
+{
+    g_dedup_drainer_run = false;
+    pthread_join(g_dedup_drainer_tid, NULL);
+    /* Single locked sweep, emit outside the lock. */
+    dedup_entry_t batch[DEDUP_RING_SIZE];
+    int n = 0;
+    pthread_mutex_lock(&g_dedup_mu);
+    for (int i = 0; i < DEDUP_RING_SIZE; ++i) {
+        if (g_dedup[i].in_use) {
+            batch[n++] = g_dedup[i];
+            g_dedup[i].in_use = false;
+        }
+    }
+    pthread_mutex_unlock(&g_dedup_mu);
+    for (int i = 0; i < n; ++i) dedup_emit_locked(&batch[i]);
+}
+
+/* Hot-path callback fires on EVERY LoRa frame from EVERY PFB output bin.
+ * Including the leakage replicas. Just buffer here and return; the
+ * drainer picks the highest-SNR replica per cluster after the dedup
+ * window expires and only THEN runs decrypt + publish. */
 static void on_lora_frame(const uint8_t *payload, size_t payload_len,
                           const lora_frame_meta_t *meta, void *user)
 {
     intptr_t channel_id = (intptr_t)user;
-    /* Drop PFB bin-leakage duplicates BEFORE counters and decode.
-     * Dedup matches by payload-fingerprint Hamming distance so that
-     * bit-error mutations in packet_id / from / channel don't slip
-     * leakage replicas through. */
-    {
-        int sf = meta ? meta->sf    : 0;
-        int bw = meta ? meta->bw_hz : 0;
-        /* channel_hash is at offset 13 in the radio header (preceded
-         * by to[4], from[4], packet_id[4], flags[1]). */
-        uint8_t channel_hash = payload_len > 13 ? payload[13] : 0;
-        if (frame_is_duplicate(payload, payload_len, sf, bw, channel_hash))
-            return;
-    }
-    __atomic_add_fetch(&g_frames_total, 1, __ATOMIC_RELAXED);
-    if (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS) {
-        __atomic_add_fetch(&g_chan_stats[channel_id].frames, 1, __ATOMIC_RELAXED);
-        __atomic_add_fetch(&g_chan_stats[channel_id].bytes, payload_len, __ATOMIC_RELAXED);
-        if (meta) {
-            /* Non-atomic float update -- imprecise but fine for stats. */
-            g_chan_stats[channel_id].snr_db_sum += (double)meta->snr_db;
-            g_chan_stats[channel_id].snr_db_count++;
-        }
-    }
-    float rssi = meta ? meta->rssi_db : 0.0f;
-    float snr  = meta ? meta->snr_db  : 0.0f;
-    int   sf   = meta ? meta->sf      : 0;
-    int   cr   = meta ? meta->cr      : 0;
-    int   bw   = meta ? meta->bw_hz   : 0;
-    mesh_packet_decode_with_radio(payload, payload_len, rssi, snr, sf, cr, bw,
-                                  g_keys, on_mesh_event, user);
+    dedup_buffer(payload, payload_len, meta, channel_id);
 }
 
 /* Forward decl for the web SSE publisher (we don't include web.h here
@@ -1129,6 +1163,10 @@ static int run_live(void)
     pthread_create(&stats_tid, NULL, stats_thread, NULL);
     pthread_create(&wd_tid,    NULL, watchdog_thread, NULL);
 
+    /* Dedup drainer: emits the highest-SNR copy of each PFB bin-leakage
+     * cluster after a 30 ms window. One JSON line per real transmission. */
+    dedup_drainer_start();
+
     /* Spawn input thread (or reuse VITA-49 listener already started above). */
     pthread_t input_tid = 0;
     if (vita_started) {
@@ -1147,6 +1185,10 @@ static int run_live(void)
     pthread_join(input_tid, NULL);
     pthread_join(stats_tid, NULL);
     pthread_join(wd_tid, NULL);
+
+    /* Stop the dedup drainer last; it flushes any pending clusters
+     * before returning so the JSON stream gets the tail. */
+    dedup_drainer_stop();
 
     /* Cleanup */
     if (g_iq_record_fp) { fclose(g_iq_record_fp); g_iq_record_fp = NULL; }
