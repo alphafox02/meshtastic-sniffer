@@ -182,78 +182,86 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
 
 /* Dedupe PFB bin-leakage copies of one real transmission. Each chirp
  * spreads across several adjacent FFT output bins; every bin's decoder
- * locks on it and produces the same payload milliseconds apart. We
- * track recent (packet_id, sf, bw) tuples in a ring buffer.
+ * locks on it and produces nearly-identical payloads decoded within
+ * <1 ms of each other. Adjacent bins see slightly different SNR, so
+ * each leakage copy has bit errors in DIFFERENT positions: the
+ * packet_id, from-ID, and even channel hash all mutate by 1-3 bits
+ * across copies. So matching on packet_id alone misses most replicas.
  *
- * Two competing goals -- balance via a small retry budget:
- *   - Keep duplicate emissions out of the JSON stream.
- *   - Don't lose decrypt opportunities if the first leakage copy had
- *     bit errors that broke its AES-CTR CRC.
+ * Reliable signal: TIME PROXIMITY for the same (sf, bw). One real
+ * Meshtastic transmission has a single decode-completion instant;
+ * leakage copies cluster at that instant within a few ms. Real
+ * transmissions on the same (sf, bw) are separated by at least the
+ * frame's air-time (tens of ms) plus normal mesh inter-frame gap.
  *
- * We let up to DEDUP_DECRYPT_ATTEMPTS copies of a same-key frame
- * through the decode path. If any decrypts, dedup_mark_decrypted()
- * suppresses all further copies (we have the cleartext). After the
- * budget is exhausted with no decrypt, all further copies are
- * suppressed too -- avoids the 30-copy spam for packets we don't
- * have keys for. */
-#define DEDUP_RING_SIZE        256
-#define DEDUP_WINDOW_US        500000    /* 500 ms */
-#define DEDUP_DECRYPT_ATTEMPTS 3         /* try at most 3 leakage copies */
+ * We treat any frame arriving within DEDUP_WINDOW_US after a previous
+ * frame on the same (sf, bw) bucket as a leakage replica. To avoid
+ * losing decrypt opportunities we let up to DEDUP_DECRYPT_ATTEMPTS
+ * copies through; once any copy decrypts, we suppress the rest
+ * immediately. */
+#define DEDUP_BUCKETS          16        /* unique (sf, bw) combos in flight */
+#define DEDUP_WINDOW_US        50000     /* 50 ms */
+#define DEDUP_DECRYPT_ATTEMPTS 3
 typedef struct {
-    uint32_t packet_id;
     int      sf;
     int      bw_hz;
-    uint64_t ts_us;
-    int      attempts;          /* copies allowed through so far */
+    uint64_t ts_us;             /* timestamp of the most recent emit */
+    int      attempts;          /* copies let through inside the window */
     bool     ever_decrypted;
-} dedup_entry_t;
-static dedup_entry_t g_dedup[DEDUP_RING_SIZE];
-static int           g_dedup_head;
+} dedup_bucket_t;
+static dedup_bucket_t g_dedup[DEDUP_BUCKETS];
 static pthread_mutex_t g_dedup_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static bool frame_is_duplicate(uint32_t packet_id, int sf, int bw_hz)
 {
+    (void)packet_id;            /* kept for trace / future fuzzy matching */
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
     bool suppress = false;
     pthread_mutex_lock(&g_dedup_mu);
-    dedup_entry_t *match = NULL;
-    for (int i = 0; i < DEDUP_RING_SIZE; ++i) {
-        dedup_entry_t *e = &g_dedup[i];
-        if (e->packet_id == packet_id && e->sf == sf && e->bw_hz == bw_hz &&
-            now_us - e->ts_us < DEDUP_WINDOW_US) {
-            match = e;
+    dedup_bucket_t *b = NULL;
+    dedup_bucket_t *oldest = &g_dedup[0];
+    for (int i = 0; i < DEDUP_BUCKETS; ++i) {
+        if (g_dedup[i].sf == sf && g_dedup[i].bw_hz == bw_hz) {
+            b = &g_dedup[i];
             break;
         }
+        if (g_dedup[i].ts_us < oldest->ts_us) oldest = &g_dedup[i];
     }
-    if (match) {
-        if (match->ever_decrypted || match->attempts >= DEDUP_DECRYPT_ATTEMPTS) {
+    if (!b) {
+        /* No bucket for this (sf, bw) yet: take over the LRU slot. */
+        b = oldest;
+        b->sf = sf; b->bw_hz = bw_hz;
+        b->ts_us = 0; b->attempts = 0; b->ever_decrypted = false;
+    }
+    if (now_us - b->ts_us < DEDUP_WINDOW_US) {
+        /* Inside the leakage window for this bucket. */
+        if (b->ever_decrypted || b->attempts >= DEDUP_DECRYPT_ATTEMPTS) {
             suppress = true;
         } else {
-            match->attempts++;
-            match->ts_us = now_us;
+            b->attempts++;
         }
     } else {
-        g_dedup[g_dedup_head] = (dedup_entry_t){
-            .packet_id = packet_id, .sf = sf, .bw_hz = bw_hz,
-            .ts_us = now_us, .attempts = 1, .ever_decrypted = false,
-        };
-        g_dedup_head = (g_dedup_head + 1) % DEDUP_RING_SIZE;
+        /* New unique transmission on this (sf, bw): reset bucket. */
+        b->ts_us = now_us;
+        b->attempts = 1;
+        b->ever_decrypted = false;
     }
     pthread_mutex_unlock(&g_dedup_mu);
     return suppress;
 }
 
-/* Mark a packet_id as decrypted; future leakage copies are suppressed.
- * Called from on_mesh_event when ev->decrypted == true. */
+/* Mark the current bucket as decrypted; remaining leakage replicas in
+ * the same window get suppressed. Called from on_mesh_event when
+ * ev->decrypted == true. */
 static void dedup_mark_decrypted(uint32_t packet_id, int sf, int bw_hz)
 {
+    (void)packet_id;
     pthread_mutex_lock(&g_dedup_mu);
-    for (int i = 0; i < DEDUP_RING_SIZE; ++i) {
-        dedup_entry_t *e = &g_dedup[i];
-        if (e->packet_id == packet_id && e->sf == sf && e->bw_hz == bw_hz) {
-            e->ever_decrypted = true;
+    for (int i = 0; i < DEDUP_BUCKETS; ++i) {
+        if (g_dedup[i].sf == sf && g_dedup[i].bw_hz == bw_hz) {
+            g_dedup[i].ever_decrypted = true;
             break;
         }
     }
