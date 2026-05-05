@@ -16,8 +16,14 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "../lora.h"
+
+/* Stub the symbols lora.c expects from the rest of the project so this
+ * test compiles standalone without dragging in main.c / options.c. */
+pthread_mutex_t fftw_planner_mutex = PTHREAD_MUTEX_INITIALIZER;
+int verbose = 0;
 
 static int g_pass = 0, g_fail = 0;
 #define CHECK(cond, fmt, ...) do { \
