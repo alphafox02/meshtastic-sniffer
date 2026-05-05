@@ -718,14 +718,19 @@ static void state_tick(lora_decoder_t *d)
          * downchirp" tail before header. We schedule a 512-sample skip
          * after header_idx reaches 3 to absorb that quarter chirp. */
         if (d->header_idx < 3) {
-            /* Tick 1 = sync2 (upchirp), tick 2 = down1, tick 3 = down2.
-             * On the down1 tick, demod the *downchirp* by multiplying with
-             * our upchirp reference (dechirping it backwards) -- the argmax
-             * of that FFT gives gr-lora_sdr's `down_val`, which encodes
-             * 2*cfo_int with a sign convention based on which half of N it
-             * lands in (frame_sync_impl.cc:613-621). One downchirp is
-             * enough; we use the first to leave room for the quarter-chirp
-             * timing. */
+            /* Tick 0 = sync2 (upchirp), tick 1 = down1, tick 2 = down2.
+             *
+             * Stash sync2's bin so we can verify it against the known
+             * Meshtastic sync words once cfo_int is in hand. The two
+             * legal values are 0x12 (legacy / sync2 bin 16) and 0x2B
+             * (mainland Meshtastic / sync2 bin 88). Anything else after
+             * cfo subtraction is almost certainly a false preamble lock
+             * on noise -- drop it before we waste payload symbols on
+             * garbage. */
+            static int sync2_bin = -1;
+            if (d->header_idx == 0) {
+                sync2_bin = (int)sym;
+            }
             if (d->header_idx == 1) {
                 int down_val = demod_downchirp_argmax(d, d->symbuf);
                 if ((uint32_t)down_val < (uint32_t)(d->N / 2))
@@ -739,6 +744,27 @@ static void state_tick(lora_decoder_t *d)
                 if (trace_on)
                     fprintf(stderr, "[lora] cfo_int=%d cfo_frac=%.4f (down_val=%d)\n",
                             d->cfo_int, (double)d->cfo_frac, down_val);
+
+                /* Sync-word check: Meshtastic uses 0x12 (sync2 = 16) or 0x2B
+                 * (sync2 = 88). The (N - preamble_bin) STO skip happens to
+                 * *cancel* the carrier-offset contribution to sync2's peak
+                 * position at the cost of injecting an equal-magnitude
+                 * sample shift; the net effect is that sync2's observed
+                 * bin equals the literal sync_word[1] value directly,
+                 * before any cfo subtraction. (Sounds odd but the math
+                 * works out because preamble_bin = -k_sample + cfo_int.)
+                 * Allow ±1 bin slop for residual fractional cfo. */
+                int d12 = abs(sync2_bin - 16);  if (d12 > d->N / 2) d12 = d->N - d12;
+                int d2b = abs(sync2_bin - 88);  if (d2b > d->N / 2) d2b = d->N - d2b;
+                if (d12 > 1 && d2b > 1) {
+                    if (trace_on || verbose >= 2)
+                        fprintf(stderr, "[lora] sync-word mismatch: sync2 bin %d, "
+                                "expected 16 (0x12) or 88 (0x2B) -- dropping frame\n",
+                                sync2_bin);
+                    d->state = STATE_IDLE;
+                    d->preamble_count = 0;
+                    break;
+                }
             }
             d->header_idx++;
             if (d->header_idx == 3) {
