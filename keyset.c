@@ -210,7 +210,7 @@ int keyset_parse_spec(keyset_t *k, const char *spec)
         psk_len = b64_decode(value + 7, psk, sizeof(psk));
         if (psk_len <= 0) return -1;
     } else {
-        /* Bare hex shorthand? Try base64 first then hex. */
+        /* No prefix: try base64 first, fall back to hex. */
         psk_len = b64_decode(value, psk, sizeof(psk));
         if (psk_len <= 0) psk_len = hex_decode(value, psk, sizeof(psk));
         if (psk_len <= 0) return -1;

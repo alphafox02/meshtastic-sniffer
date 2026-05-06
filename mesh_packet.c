@@ -28,9 +28,6 @@
  *                  -- OpenSSL CTR mode increments the full IV as a
  *                     big-endian counter, which only changes the last
  *                     four bytes for any LoRa-sized payload.
- *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "mesh_packet.h"
@@ -221,7 +218,7 @@ int mesh_packet_decode_with_radio(const uint8_t *frame, size_t frame_len,
     const uint8_t *cipher = frame + MESH_HEADER_BYTES;
     size_t         cipher_len = frame_len - MESH_HEADER_BYTES;
 
-    /* No payload? Just emit the header (e.g., a routing-only ack). */
+    /* Header-only frame (e.g., a routing-only ack): emit and skip decrypt. */
     if (cipher_len == 0) {
         ev.decrypted = true;  /* nothing to decrypt */
         if (cb) cb(&ev, user);
@@ -255,7 +252,7 @@ int mesh_packet_decode_with_radio(const uint8_t *frame, size_t frame_len,
 
             if (verbose >= 2) {
                 fprintf(stderr, "[mesh] decrypt attempt: from=!%08x ch=0x%02x "
-                        "vs key '%s' psk=%dB\n",
+                        "vs key '%s' psk=%zuB\n",
                         ev.header.from, ev.header.channel,
                         e->channel_name, e->psk_len);
             }

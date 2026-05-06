@@ -189,7 +189,9 @@ void sdrplay_list(void)
         default:                 model = "Unknown";  break;
         }
         {
-            char val[64];
+            /* SerNo is up to SDRPLAY_MAX_SER_NO_LEN (64) chars; the
+             * "sdrplay-" prefix needs 8 + NUL, so 80 is safe. */
+            char val[80];
             snprintf(val, sizeof(val), "sdrplay-%s", devices[i].SerNo);
             printf("  %-24s SDRplay %s\n", val, model);
         }
