@@ -28,37 +28,73 @@ import (
 // SSEHub broadcasts byte slices to all currently-connected clients.
 // Each client gets its own buffered channel; slow clients are dropped
 // when the buffer fills, so a frozen browser can't stall the publisher.
+//
+// Maintains a bounded ring of recent events. New clients get the ring's
+// contents replayed before going live so a browser refresh / new tab
+// reconstructs dashboard state without waiting for new traffic.
+const sseHistorySize = 1024
+
 type SSEHub struct {
-	mu      sync.Mutex
-	clients map[chan []byte]struct{}
+	mu       sync.Mutex
+	clients  map[chan []byte]struct{}
+	history  [][]byte
+	histHead int // index of next slot to write
+	histLen  int // total entries currently stored, capped at sseHistorySize
 }
 
 func newSSEHub() *SSEHub {
-	return &SSEHub{clients: map[chan []byte]struct{}{}}
+	return &SSEHub{
+		clients: map[chan []byte]struct{}{},
+		history: make([][]byte, sseHistorySize),
+	}
 }
 
-// Publish sends `event` (raw JSON, no SSE framing) to every connected
-// client. Non-blocking: drops events for any client whose buffer is full.
+// Publish sends `event` to every connected client and records it in the
+// history ring. Non-blocking on broadcast: drops events for any client
+// whose buffer is full. Caller retains ownership of `event`; we copy.
 func (h *SSEHub) Publish(event []byte) {
+	// Copy once outside the lock; everyone shares the same byte slice.
+	cp := make([]byte, len(event))
+	copy(cp, event)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for ch := range h.clients {
 		select {
-		case ch <- event:
+		case ch <- cp:
 		default:
 			// Slow client. Drop this event for them; live ones are unaffected.
 		}
 	}
+	// Record into the ring. Overwrite the oldest slot when full.
+	h.history[h.histHead] = cp
+	h.histHead = (h.histHead + 1) % sseHistorySize
+	if h.histLen < sseHistorySize {
+		h.histLen++
+	}
 }
 
 // register adds a new SSE client and returns its inbound channel + an
-// unregister fn that closes the channel and removes the client.
-func (h *SSEHub) register() (chan []byte, func()) {
+// unregister fn that closes the channel and removes the client. The
+// returned `replay` slice contains the history ring oldest-to-newest,
+// to be sent before live events flow.
+func (h *SSEHub) register() (chan []byte, [][]byte, func()) {
 	ch := make(chan []byte, 256)
 	h.mu.Lock()
 	h.clients[ch] = struct{}{}
+	// Snapshot history under the lock so a concurrent Publish can't race.
+	replay := make([][]byte, 0, h.histLen)
+	start := 0
+	if h.histLen == sseHistorySize {
+		start = h.histHead
+	}
+	for i := 0; i < h.histLen; i++ {
+		idx := (start + i) % sseHistorySize
+		if h.history[idx] != nil {
+			replay = append(replay, h.history[idx])
+		}
+	}
 	h.mu.Unlock()
-	return ch, func() {
+	return ch, replay, func() {
 		h.mu.Lock()
 		delete(h.clients, ch)
 		close(ch)
@@ -134,8 +170,17 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		flusher.Flush()
 
-		ch, unregister := hub.register()
+		ch, replay, unregister := hub.register()
 		defer unregister()
+
+		// Replay buffered history first so browser refreshes reconstruct
+		// state without waiting for new traffic.
+		for _, ev := range replay {
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", ev); err != nil {
+				return
+			}
+		}
+		flusher.Flush()
 
 		// Periodic comment-line keepalive so transparent proxies don't
 		// reap an idle connection.

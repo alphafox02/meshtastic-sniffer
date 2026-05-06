@@ -36,23 +36,54 @@ type FanoutResult struct {
 // sensor is hung and we should move on.
 var fanoutClient = &http.Client{Timeout: 5 * time.Second}
 
-// fanoutCommand POSTs `body` to <sensor.Api>/api/<path> for every
-// sensor in the registry that has a non-empty Api endpoint. Adds the
-// sensor's ApiToken as a Bearer header when set. Calls run in
-// parallel; results come back in registry order.
+// fanoutCommand pushes `body` to every registered sensor in parallel.
+// Per-sensor transport pick:
+//   - if a DEALER session is open for this sensor name, use DEALER
+//     (works through NAT; no inbound port required on the sensor)
+//   - else if the sensor has an Api endpoint, fall back to HTTP POST
+//   - else mark as "no transport"
+// Results come back in registry order. Adds the sensor's ApiToken as
+// a Bearer header on HTTP fallback when set.
 func fanoutCommand(registry *Registry, path string, body []byte) []FanoutResult {
 	sensors := registry.List()
+	dealer := registry.DealerHub()
 	results := make([]FanoutResult, len(sensors))
+
+	// Translate fan-out path -> dealer command name. The DEALER side
+	// uses underscored command names; HTTP side uses dashed paths.
+	cmdName := map[string]string{
+		"keys":          "keys_add",
+		"share-url":     "share_url",
+		"extra-freq":    "extra_freq",
+		"cot-multicast": "cot_multicast",
+	}[path]
 
 	var wg sync.WaitGroup
 	for i := range sensors {
 		s := sensors[i]
+		idx := i
+		// Prefer DEALER if available.
+		if dealer != nil && cmdName != "" && dealer.HasSession(s.Name) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				status, replyBody, err := dealer.SendCommand(s.Name, cmdName, string(body), 5*time.Second)
+				if err != nil {
+					results[idx] = FanoutResult{Sensor: s.Name, Error: "dealer: " + err.Error()}
+					return
+				}
+				results[idx] = FanoutResult{
+					Sensor: s.Name, Status: status, Body: replyBody,
+				}
+			}()
+			continue
+		}
 		if s.Api == "" {
-			results[i] = FanoutResult{Sensor: s.Name, Error: "no api endpoint configured"}
+			results[idx] = FanoutResult{Sensor: s.Name, Error: "no api endpoint configured"}
 			continue
 		}
 		wg.Add(1)
-		go func(idx int, s Sensor) {
+		go func(s Sensor) {
 			defer wg.Done()
 			url := s.Api + "/api/" + path
 			req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
@@ -74,7 +105,7 @@ func fanoutCommand(registry *Registry, path string, body []byte) []FanoutResult 
 			results[idx] = FanoutResult{
 				Sensor: s.Name, Status: resp.StatusCode, Body: string(b),
 			}
-		}(i, s)
+		}(s)
 	}
 	wg.Wait()
 	return results

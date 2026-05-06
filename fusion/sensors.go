@@ -16,6 +16,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,14 +35,22 @@ import (
 // (ZMQ) and command (HTTP) endpoints. ApiToken and CurvePub are
 // optional; absence means "no auth" / "no CurveZMQ on the wire".
 type Sensor struct {
-	Name      string `json:"name"`
-	Zmq       string `json:"zmq"`             // e.g. "tcp://10.0.0.5:7008"
-	Api       string `json:"api,omitempty"`   // e.g. "http://10.0.0.5:8888"
-	ApiToken  string `json:"api_token,omitempty"`
-	CurvePub  string `json:"curve_pub,omitempty"`
+	Name      string  `json:"name"`
+	Zmq       string  `json:"zmq"`             // e.g. "tcp://10.0.0.5:7008"
+	Api       string  `json:"api,omitempty"`   // e.g. "http://10.0.0.5:8888"
+	ApiToken  string  `json:"api_token,omitempty"`
+	CurvePub  string  `json:"curve_pub,omitempty"`
+	Lat       float64 `json:"lat,omitempty"`
+	Lon       float64 `json:"lon,omitempty"`
+	AltM      float64 `json:"alt_m,omitempty"`
 	// LastSeen tracks the most recent event timestamp from this sensor's
 	// stream; updated by the subscriber loop. Not persisted.
 	LastSeen time.Time `json:"-"`
+	// Dealer is true when the fusion is currently receiving heartbeats
+	// from this sensor over its ROUTER socket. Dashboard surfaces a
+	// badge in the Sensors tab so operators can tell which transport
+	// fan-out commands will travel over.
+	Dealer bool `json:"dealer,omitempty"`
 }
 
 // Registry is the in-memory list + the disk-backed file. All public
@@ -52,6 +61,22 @@ type Registry struct {
 	byName   map[string]*Sensor // name -> entry
 	pool     *SubscriberPool    // dynamic subscriber manager
 	hub      *SSEHub            // for forwarding raw events
+	dealer   *DealerHub         // optional: nil when --c2-router not set
+}
+
+// SetDealerHub wires in the DEALER C2 hub so the fanout layer can
+// prefer DEALER over HTTP when a sensor is connected via DEALER.
+// Optional; nil = HTTP-only fan-out.
+func (r *Registry) SetDealerHub(d *DealerHub) {
+	r.mu.Lock()
+	r.dealer = d
+	r.mu.Unlock()
+}
+
+func (r *Registry) DealerHub() *DealerHub {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.dealer
 }
 
 // NewRegistry creates a registry, optionally loading from `path`. The
@@ -162,13 +187,20 @@ func (r *Registry) Remove(name string) error {
 	return nil
 }
 
-// List returns a copy of the current registry, sorted by name.
+// List returns a copy of the current registry, sorted by name. Each
+// returned Sensor has its Dealer field populated from the live hub.
 func (r *Registry) List() []Sensor {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	dealer := r.dealer
 	out := make([]Sensor, 0, len(r.byName))
 	for _, s := range r.byName {
 		out = append(out, *s)
+	}
+	r.mu.Unlock()
+	for i := range out {
+		if dealer != nil {
+			out[i].Dealer = dealer.HasSession(out[i].Name)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
@@ -240,12 +272,22 @@ func (p *SubscriberPool) Add(name, endpoint string) {
 			if len(msg.Frames) == 0 {
 				continue
 			}
+			payload := msg.Frames[0]
+			/* Defensive station tagging: if the sniffer-side event JSON
+			 * doesn't already carry "station":"..." (older builds, or
+			 * STATS heartbeat events from a sniffer without
+			 * --station-id), inject the registry name. The dashboard
+			 * needs a station label per event for multi-sensor accounting. */
+			if !bytes.Contains(payload, []byte(`"station":`)) && len(payload) > 1 && payload[0] == '{' {
+				inj := []byte(fmt.Sprintf(`{"station":%q,`, name))
+				payload = append(inj, payload[1:]...)
+			}
 			if hub != nil {
-				hub.Publish(msg.Frames[0])
+				hub.Publish(payload)
 			}
 			if raw != nil {
 				select {
-				case raw <- msg.Frames[0]:
+				case raw <- payload:
 				case <-subCtx.Done():
 					return
 				}

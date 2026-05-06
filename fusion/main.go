@@ -40,8 +40,9 @@ type Frame struct {
 	StationLon  float64 `json:"station_lon,omitempty"`
 	From        string  `json:"from,omitempty"`
 	PacketID    uint32  `json:"packet_id,omitempty"`
-	Channel     uint8   `json:"channel,omitempty"`
-	ChannelName string  `json:"channel_name,omitempty"`
+	ChannelHash uint8   `json:"channel_hash,omitempty"`   /* 1-byte routing hash from radio header */
+	SlotID      int     `json:"slot_id,omitempty"`        /* decoder slot index that caught the frame */
+	ChannelName string  `json:"channel_name,omitempty"`   /* human label, only when decrypted */
 	Preset      string  `json:"preset,omitempty"`
 	HopLimit    int     `json:"hop_limit,omitempty"`
 	HopStart    int     `json:"hop_start,omitempty"`
@@ -162,6 +163,8 @@ func main() {
 		"HTTP listen address (e.g. :9000). Empty = CLI-only mode.")
 	sensorsFile := flag.String("sensors-file", "",
 		"Path to persistent sensor registry JSON. Empty = CLI-args only.")
+	c2Router := flag.String("c2-router", "",
+		"ZMQ ROUTER bind address (e.g. tcp://*:7009) for DEALER C2 from sensors. Empty = HTTP fan-out only.")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr,
 			"Usage: %s [flags] tcp://host1:7008 tcp://host2:7008 ...\n\n"+
@@ -204,6 +207,9 @@ func main() {
 	for _, ep := range endpoints {
 		registry.pool.Add("cli-"+ep, ep)
 	}
+
+	dealerHub := NewDealerHub(ctx, *c2Router, hub)
+	registry.SetDealerHub(dealerHub)
 
 	if *listen != "" {
 		go func() {
