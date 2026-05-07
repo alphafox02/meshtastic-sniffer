@@ -1,11 +1,12 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * VITA 49 (VRT) UDP input - receives IQ samples via VRT signal data packets
  *
  * Supports VRL-wrapped and unwrapped VRT packets, IF context extraction
  * (sample rate, RF frequency), and all three IQ formats (ci8, ci16, cf32).
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <arpa/inet.h>

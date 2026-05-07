@@ -1,8 +1,9 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * SDRplay native API v3 backend for inmarsat-sniffer
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef SDRPLAY_H

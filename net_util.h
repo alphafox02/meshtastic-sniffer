@@ -1,8 +1,9 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * Network utility helpers
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef NET_UTIL_H

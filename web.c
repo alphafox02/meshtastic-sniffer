@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: built-in web dashboard.
  *
  * Single-threaded TCP listener that accepts HTTP/1.1 connections.
@@ -10,8 +13,6 @@
  * node table + message log + discoveries panel, all wired to the
  * /events SSE stream.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #define _GNU_SOURCE

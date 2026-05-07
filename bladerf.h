@@ -1,8 +1,9 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * BladeRF native backend for inmarsat-sniffer
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 #ifndef INMARSAT_BLADERF_H
 #define INMARSAT_BLADERF_H

@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: LoRa CSS demodulator.
  *
  * One instance per (channel center, BW, SF, CR). Fed baseband samples
@@ -16,8 +19,6 @@
  *     -> [CRC16]      verify two-byte trailing CRC if header asserts it
  *     -> on_frame(payload, len, header_metadata)
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef LORA_H

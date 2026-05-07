@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: wideband Meshtastic LoRa receiver.
  *
  * Captures a single wide IQ slice from one SDR, channelizes into every
@@ -8,8 +11,6 @@
  * routing, traceroute, neighborinfo, waypoint, admin, etc.) in
  * parallel.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "channelizer.h"

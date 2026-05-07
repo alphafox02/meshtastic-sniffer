@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: off-grid LoRa discovery.
  *
  * Watches the full SDR passband for energy outside the configured
@@ -8,8 +11,6 @@
  * walk across FFT bins over time at one of the 9 (SF,BW) chirp
  * slopes) is a planned refinement to drop the false positive rate.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef SCANNER_H

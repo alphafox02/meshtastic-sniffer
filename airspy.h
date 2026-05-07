@@ -1,8 +1,9 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * Airspy R2/Mini native backend for inmarsat-sniffer
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef __AIRSPY_BACKEND_H__

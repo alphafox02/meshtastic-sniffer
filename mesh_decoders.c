@@ -1,12 +1,13 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: per-port protobuf decoders.
  *
  * Field numbers and types come from the Meshtastic .proto files
  * (meshtastic/mesh.proto, telemetry.proto). Each decoder is a tag
  * switch over the input buffer; unknown fields are skipped.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "mesh_decoders.h"

@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: MQTT publisher.
  *
  * Connects to a broker (libmosquitto) and publishes one JSON line per
@@ -8,8 +11,6 @@
  * Compiled in only when libmosquitto is found at configure time
  * (HAVE_MQTT define). When it isn't, the symbols below are stubs.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "options.h"

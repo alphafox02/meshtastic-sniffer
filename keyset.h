@@ -1,11 +1,12 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: multi-key dispatch.
  *
  * Holds the user's set of (channel_name, PSK) pairs and routes
  * incoming packets to the right key by precomputed channel hash.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef KEYSET_H

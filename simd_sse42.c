@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * SSE4.2 SIMD kernel implementations
  *
  * This file is compiled with -msse4.2 flags.
@@ -7,8 +10,6 @@
  * Complex float layout: interleaved [re0, im0, re1, im1, ...]
  * SSE __m128 holds 4 floats = 2 complex values.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <smmintrin.h>  /* SSE4.1 */

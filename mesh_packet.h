@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: packet decoder.
  *
  * Takes raw bytes from the LoRa demod (16-byte radio header + N
@@ -6,8 +9,6 @@
  * AES-CTR decrypts, parses the protobuf Data envelope, and emits a
  * structured event to a callback.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef MESH_PACKET_H

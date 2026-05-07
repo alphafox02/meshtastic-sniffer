@@ -1,12 +1,13 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: minimal protobuf wire-format reader.
  *
  * No code generation -- we walk the wire format directly. Every read
  * returns false on malformed input or buffer overrun, never reads past
  * `end`, and updates *cur in place.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef PROTOBUF_H

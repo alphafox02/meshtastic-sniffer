@@ -1,12 +1,13 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * SDRplay native API v3 backend for inmarsat-sniffer
  *
  * Bypasses SoapySDR to talk directly to the SDRplay API, fixing
  * device-specific issues (RSP1A bias tee segfault, etc.) and giving
  * full control over per-model settings.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <err.h>

@@ -1,9 +1,10 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * BladeRF native backend for inmarsat-sniffer.
  * Ported from iridium-sniffer's bladerf.c, simplified for sample_buf_t.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <complex.h>

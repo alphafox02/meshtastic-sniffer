@@ -1,14 +1,17 @@
 /*
- * ARM NEON SIMD kernel implementations
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
  *
- * Compiled on AArch64 only. NEON is mandatory on AArch64 — it is part of
+ * ARM NEON SIMD kernel implementations.
+ *
+ * Compiled on AArch64 only. NEON is mandatory on AArch64 -- it is part of
  * the base ISA, not an optional extension. No -mfpu=neon flag is needed.
  * Include <arm_neon.h> and the compiler emits SIMD instructions directly.
  *
  * Register model: float32x4_t holds 4 x float32 = 128 bits = 2 complex
  * samples (interleaved re/im layout). This is identical in width to SSE's
  * __m128, so all kernels vectorize at the same granularity as the SSE4.2
- * tier — with the bonus of hardware-native FMA (vfmaq_f32) on every core.
+ * tier -- with the bonus of hardware-native FMA (vfmaq_f32) on every core.
  *
  * Key differences from x86:
  *   - FMA is always available (AArch64 base ISA); no separate detection.
@@ -18,8 +21,6 @@
  *   - vld1q_f32 / vst1q_f32 handle alignment naturally; no _loadu_ needed.
  *
  * All functions match the signatures in simd_kernels.h exactly.
- *
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #if defined(__aarch64__) || defined(_M_ARM64)

@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: per-channel decimating DDC.
  *
  * Takes a single wideband IQ stream from the SDR and feeds N
@@ -9,8 +12,6 @@
  * unit), which is the natural input rate for a LoRa CSS demod with
  * FFT size 2^SF.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef CHANNELIZER_H

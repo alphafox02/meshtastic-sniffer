@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * AVX2 + FMA SIMD kernel implementations
  *
  * This file is compiled with -mavx2 -mfma flags.
@@ -7,8 +10,6 @@
  * Complex float layout: interleaved [re0, im0, re1, im1, ...]
  * AVX2 __m256 holds 8 floats = 4 complex values.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <immintrin.h>

@@ -1,11 +1,12 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * SIMD kernel dispatch + scalar (generic) implementations
  *
  * The scalar versions are the exact same algorithms as the original code,
  * just refactored into standalone functions matching the simd_* API.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <math.h>

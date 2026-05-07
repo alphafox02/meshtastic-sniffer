@@ -1,9 +1,10 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * USRP (UHD) native backend for inmarsat-sniffer.
  * Ported from iridium-sniffer's usrp.c, simplified for sample_buf_t.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <err.h>

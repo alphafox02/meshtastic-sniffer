@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: CoT (Cursor-on-Target) XML multicast republish.
  *
  * Converts decoded packets with positional data into standard
@@ -19,8 +22,6 @@
  * runtime via cot_set_endpoint() (called from the web /api/cot-multicast
  * handler).
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef COT_H

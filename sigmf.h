@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: SigMF metadata reader.
  *
  * If user passes --file=PATH and a sibling PATH.sigmf-meta exists,
@@ -6,8 +9,6 @@
  * to populate samp_rate, center_freq, and iq_format. User CLI flags
  * (--rate, --center, --iq-format) take precedence.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef SIGMF_H

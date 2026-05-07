@@ -1,12 +1,13 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: per-port protobuf decoders.
  *
  * Each function takes the raw payload bytes from a Data envelope and
  * produces a typed struct. Returns true if at least one field parsed
  * cleanly (best-effort: malformed extras are skipped, not fatal).
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef MESH_DECODERS_H

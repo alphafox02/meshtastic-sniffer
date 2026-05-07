@@ -1,12 +1,13 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: in-memory node-info cache.
  *
  * Tiny map from from-node id (uint32) to last-seen long/short name and
  * hardware-model. Populated by NODEINFO packets, queried by POSITION
  * packets so CoT republish can label markers with a real callsign.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef NODE_DB_H

@@ -1,11 +1,12 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * SIMD kernel dispatch - runtime CPU feature detection
  *
  * Call simd_init() once at startup. All function pointers are then set
  * to either AVX2 or scalar implementations based on CPU capabilities.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef SIMD_KERNELS_H

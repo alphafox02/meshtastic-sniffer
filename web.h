@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: built-in web dashboard.
  *
  * HTTP server on port opt_web_port. Endpoints:
@@ -8,8 +11,6 @@
  * web_publish_line() pushes one event to all connected SSE clients
  * non-blocking; slow clients drop messages.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef WEB_H

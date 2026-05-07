@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: JSON output sink.
  *
  * Serialises decoded packets to newline-delimited JSON. Writes to:
@@ -10,8 +13,6 @@
  * Per-packet output is non-blocking on every sink: a stalled
  * downstream consumer drops a message rather than freezing decode.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef FEED_H

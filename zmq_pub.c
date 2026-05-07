@@ -1,12 +1,13 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: ZMQ PUB output.
  *
  * One PUB socket bound or connected to --zmq=ENDPOINT (default
  * tcp endpoints, default tcp://(asterisk):7008). One JSON line per send. Uses ZMQ_DONTWAIT so a
  * stalled subscriber drops messages rather than blocking decode.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "options.h"

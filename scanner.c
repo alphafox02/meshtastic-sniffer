@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: off-grid LoRa discovery (energy-based v1).
  *
  * Pipeline:
@@ -9,8 +12,6 @@
  *                       -> rate-limit + dedupe per peak
  *                       -> on_discovery callback
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "scanner.h"

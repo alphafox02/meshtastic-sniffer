@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: polyphase filterbank channelizer.
  *
  * Decimator-by-M PFB with critical sampling: input at Fs, M output
@@ -15,8 +18,6 @@
  * ops per input sample -- vs O(M) for the per-channel cascade DDC, an
  * O(M / log M) speedup.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #ifndef PFB_H

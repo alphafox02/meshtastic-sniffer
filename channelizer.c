@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * meshtastic-sniffer: polyphase channelizer.
  *
  * Replaces the old per-channel cascade DDC with one polyphase filterbank
@@ -21,8 +24,6 @@
  * the cascade's ~200 ops per channel * 256 channels = 50,000 ops. Three
  * orders of magnitude cheaper at full US-band coverage.
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "channelizer.h"

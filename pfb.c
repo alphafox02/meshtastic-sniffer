@@ -1,4 +1,7 @@
 /*
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (c) 2026 CEMAXECUTER LLC
+ *
  * Polyphase filterbank channelizer -- implementation.
  *
  * Reference: Hentschel & Fettweis, "Sample Rate Conversion for Software
@@ -30,8 +33,6 @@
  * channel grid (e.g. Meshtastic 250 kHz channels are offset by
  * 125 kHz from a 0-aligned 250 kHz FFT bin grid).
  *
- * Copyright (c) 2026 CEMAXECUTER LLC
- * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include "pfb.h"
