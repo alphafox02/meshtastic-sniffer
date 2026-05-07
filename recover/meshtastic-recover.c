@@ -316,9 +316,14 @@ static const char USAGE[] =
     "  --max-frames=N      stop after testing N frames against each candidate (0=all)\n"
     "  --hashcat-export=FILE\n"
     "                      write each frame as a hashcat-compatible hash line:\n"
-    "                          $meshtastic$1*<chash>*<nonce_hex>*<ciphertext_hex>\n"
+    "                          $meshtastic$1*<chash>*<packet_id>*<from_node>*<name_hex>*<ciphertext_hex>\n"
     "                      consumable by a future hashcat custom-mode plugin\n"
     "                      (work in progress; format documented in recover/README.md)\n"
+    "  --channel-name=NAME populate the <name_hex> field on export. Use when the\n"
+    "                      attacker knows the channel name (most realistic case --\n"
+    "                      Meshtastic NodeInfo advertises names in cleartext).\n"
+    "                      Empty by default; the future plugin iterates common\n"
+    "                      preset names internally when this is empty.\n"
     "  -h, --help          this help\n"
     "\n"
     "Examples:\n"
@@ -332,6 +337,7 @@ int main(int argc, char **argv)
     const char *wordlist_path = NULL;
     const char *out_path = NULL;
     const char *hashcat_path = NULL;
+    const char *channel_name = "";
     bool also_simple = false;
     int max_frames = 0;
 
@@ -340,6 +346,7 @@ int main(int argc, char **argv)
         else if (!strncmp(argv[i], "--wordlist=", 11)) wordlist_path = argv[i] + 11;
         else if (!strncmp(argv[i], "--output=", 9))   out_path = argv[i] + 9;
         else if (!strncmp(argv[i], "--hashcat-export=", 17)) hashcat_path = argv[i] + 17;
+        else if (!strncmp(argv[i], "--channel-name=", 15)) channel_name = argv[i] + 15;
         else if (!strncmp(argv[i], "--max-frames=", 13)) max_frames = atoi(argv[i] + 13);
         else if (!strcmp(argv[i], "--simple-keys"))   also_simple = true;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
@@ -385,27 +392,29 @@ int main(int argc, char **argv)
         free(frames); return 1;
     }
 
-    /* Hashcat export: one line per frame, in a hashcat-idiomatic format
-     * a future hashcat plugin will consume. Modeled on mode 22400 (AES
-     * Crypt; `$aescrypt$1*<iv>*<salt>*<ct>*<hmac>`) for the dollar-tag
-     * + star-delimited shape, and on mode 22000 (WPA; exposes ANonce /
-     * SNonce / MACs separately rather than the assembled PTK input)
-     * for the "kernel reconstructs structured fields" philosophy.
+    /* Hashcat export: one line per frame, hashcat-idiomatic format.
+     * Modeled on mode 22400 (AES Crypt) for the dollar-tag + star-delimited
+     * shape, and on mode 22000 (WPA-EAPOL) for the "expose nonce parts +
+     * ESSID separately, kernel reconstructs" philosophy.
      *
      * Format v1:
-     *   $meshtastic$1*<chash>*<packet_id>*<from_node>*<ciphertext>
+     *   $meshtastic$1*<chash>*<packet_id>*<from_node>*<name_hex>*<ciphertext>
      *
-     *   chash      -- 2 hex chars; channel-hash byte from frame[13]
-     *   packet_id  -- 8 hex chars; uint32 LE from frame[8..11]
-     *   from_node  -- 8 hex chars; uint32 LE from frame[4..7]
-     *   ciphertext -- variable hex; frame[16..end] (encrypted Data envelope)
+     *   chash       -- 2 hex chars; channel-hash byte from frame[13]
+     *   packet_id   -- 8 hex chars; uint32 LE from frame[8..11]
+     *   from_node   -- 8 hex chars; uint32 LE from frame[4..7]
+     *   name_hex    -- variable hex (may be empty); UTF-8 channel name when
+     *                  known. Empty signals "unknown name" -- the plugin
+     *                  falls back to iterating a builtin list of common
+     *                  preset names per candidate PSK.
+     *   ciphertext  -- variable hex; frame[16..end] (encrypted Data envelope)
      *
      * The kernel reconstructs the AES-CTR 16-byte nonce as
      *   packet_id_LE || 0x00000000 || from_node_LE || 0x00000000
      * matching build_nonce() in mesh_packet.c.
      *
-     * Verifier given candidate (channel_name, psk):
-     *   1. compute xorHash(name) ^ xorHash(psk); compare to chash
+     * Verifier given candidate (psk, name):
+     *   1. compute xorByte(name) ^ xorByte(psk); compare to chash
      *   2. if match, AES-CTR decrypt ciphertext with (psk, reconstructed nonce)
      *   3. confirm decrypted bytes parse as a Meshtastic Data envelope
      *      with portnum > 0 and non-empty payload */
@@ -414,7 +423,7 @@ int main(int argc, char **argv)
         if (!hf) { perror(hashcat_path); free(frames); return 1; }
         size_t emitted = 0;
         for (size_t i = 0; i < n_frames; ++i) {
-            if (frames[i].len < 16) continue; /* header only, nothing to crack */
+            if (frames[i].len < 16) continue;
             const uint8_t *b = frames[i].bytes;
             uint8_t chash = b[13];
             fprintf(hf, "$meshtastic$1*%02x*", chash);
@@ -422,14 +431,18 @@ int main(int argc, char **argv)
             fputc('*', hf);
             for (int k = 0; k < 4; ++k) fprintf(hf, "%02x", b[4 + k]);  /* from LE */
             fputc('*', hf);
+            for (const char *p = channel_name; *p; ++p) fprintf(hf, "%02x", (unsigned char)*p);
+            fputc('*', hf);
             for (size_t k = 16; k < frames[i].len; ++k)
                 fprintf(hf, "%02x", b[k]);
             fputc('\n', hf);
             ++emitted;
         }
         fclose(hf);
-        fprintf(stderr, "recover: wrote %zu hashcat-format lines to %s\n",
-                emitted, hashcat_path);
+        fprintf(stderr, "recover: wrote %zu hashcat-format lines to %s%s%s\n",
+                emitted, hashcat_path,
+                channel_name && *channel_name ? " (channel_name=" : "",
+                channel_name && *channel_name ? channel_name : "");
     }
 
     /* Channel names to pair with each candidate PSK. The Meshtastic

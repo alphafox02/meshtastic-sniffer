@@ -131,7 +131,7 @@ private OpenCL kernel inside this binary. Reasons:
 hashcat-idiomatic format the plugin will consume. One line per frame:
 
 ```
-$meshtastic$1*<chash>*<packet_id>*<from_node>*<ciphertext>
+$meshtastic$1*<chash>*<packet_id>*<from_node>*<name_hex>*<ciphertext>
 ```
 
 | Field | Length | Meaning |
@@ -141,7 +141,14 @@ $meshtastic$1*<chash>*<packet_id>*<from_node>*<ciphertext>
 | `<chash>` | 2 hex | 1-byte channel-hash from frame[13] |
 | `<packet_id>` | 8 hex | uint32 LE from frame[8..11] |
 | `<from_node>` | 8 hex | uint32 LE from frame[4..7] |
+| `<name_hex>` | 0+ hex | UTF-8 channel name (when known); empty signals unknown |
 | `<ciphertext>` | variable hex | frame[16..end] (encrypted Data envelope) |
+
+`--channel-name=NAME` populates the name field (matches WPA-EAPOL's
+ESSID-in-hash pattern; the realistic attack model is "operator knows
+the channel name from cleartext NodeInfo broadcasts and brute-forces
+the PSK"). When empty (default), the future plugin iterates a builtin
+list of common preset names per candidate.
 
 **Format precedents** (so hashcat maintainers can match it on sight):
 
