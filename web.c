@@ -36,7 +36,8 @@ extern int       app_add_runtime_extra_freq(uint64_t f_hz, int bw_hz, int sf, in
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define MAX_SSE_CLIENTS 8
+#define MAX_SSE_CLIENTS    8
+#define HISTORY_RING_SIZE  1024  /* recent events replayed to new SSE clients */
 
 static int  g_listen_fd = -1;
 static int  g_sse_fds[MAX_SSE_CLIENTS];
@@ -44,6 +45,20 @@ static int  g_sse_count = 0;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_thread;
 static volatile int g_thread_running = 0;
+
+/* Ring buffer of recently-published JSON lines. New SSE clients (browser
+ * refresh, multi-tab) get the buffer's contents replayed to them so the
+ * dashboard reconstructs its node / channel / activity / topology state
+ * without having to wait for new traffic. Bounded memory: average event
+ * is ~200 bytes -> <250 KB at full capacity. Cleared on sniffer restart;
+ * the long-term archive feature is a separate, opt-in concern. */
+typedef struct {
+    char  *buf;
+    size_t len;
+} history_entry_t;
+static history_entry_t g_history[HISTORY_RING_SIZE];
+static int g_history_head  = 0;  /* index of next slot to write */
+static int g_history_count = 0;  /* total entries currently stored, capped */
 
 static const char DASHBOARD_HTML[] =
 "<!doctype html>\n"
@@ -1447,12 +1462,30 @@ static void promote_to_sse(int fd) {
         "Access-Control-Allow-Origin: *\r\n\r\n"
         "retry: 2000\n\n";
     send_all(fd, hdr, strlen(hdr));
-    set_nonblock(fd);
 
     pthread_mutex_lock(&g_lock);
+    /* Replay the history ring oldest-to-newest before going live, then
+     * add to the broadcast list atomically -- so the new client doesn't
+     * miss events published between replay-end and add-to-list. */
+    int start = (g_history_count < HISTORY_RING_SIZE) ? 0 : g_history_head;
+    static const char data_prefix[] = "data: ";
+    for (int k = 0; k < g_history_count; ++k) {
+        int idx = (start + k) % HISTORY_RING_SIZE;
+        history_entry_t *e = &g_history[idx];
+        if (!e->buf || e->len == 0) continue;
+        /* Blocking sends here: the connection is fresh so the kernel buffer
+         * is empty, and the dashboard JS handles dupes idempotently. If a
+         * peer is genuinely slow we'll spend more time in the lock, but the
+         * publishers (low-rate stats + per-frame events) tolerate it. */
+        if (send(fd, data_prefix, 6, MSG_NOSIGNAL) < 0) break;
+        if (send(fd, e->buf, e->len, MSG_NOSIGNAL) < 0) break;
+        if (send(fd, "\n", 1, MSG_NOSIGNAL) < 0) break;
+    }
+    set_nonblock(fd);
     if (g_sse_count < MAX_SSE_CLIENTS) {
         g_sse_fds[g_sse_count++] = fd;
-        if (verbose) fprintf(stderr, "web: SSE client connected (%d total)\n", g_sse_count);
+        if (verbose) fprintf(stderr, "web: SSE client connected (%d total, replayed %d events)\n",
+                             g_sse_count, g_history_count);
     } else {
         close(fd);
     }
@@ -1634,6 +1667,22 @@ void web_publish_line(const char *json, size_t len)
         }
         ++i;
     }
+    /* Push into the history ring so a browser refresh / late-joining tab
+     * can reconstruct dashboard state without waiting for new traffic.
+     * Same lock as the broadcast list -- atomicity matters: the new
+     * client's replay (under this lock) must not miss events published
+     * between replay-start and add-to-list. */
+    history_entry_t *e = &g_history[g_history_head];
+    free(e->buf); /* free(NULL) is a no-op for slots not yet written */
+    e->buf = malloc(len);
+    if (e->buf) {
+        memcpy(e->buf, json, len);
+        e->len = len;
+        g_history_head = (g_history_head + 1) % HISTORY_RING_SIZE;
+        if (g_history_count < HISTORY_RING_SIZE) ++g_history_count;
+    } else {
+        e->buf = NULL; e->len = 0; /* malloc fail: slot empty, ring intact */
+    }
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -1648,5 +1697,12 @@ void web_shutdown(void)
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_sse_count; ++i) close(g_sse_fds[i]);
     g_sse_count = 0;
+    /* Release the history ring so leak detectors don't flag exit-time bytes. */
+    for (int i = 0; i < HISTORY_RING_SIZE; ++i) {
+        free(g_history[i].buf);
+        g_history[i].buf = NULL;
+        g_history[i].len = 0;
+    }
+    g_history_head = g_history_count = 0;
     pthread_mutex_unlock(&g_lock);
 }
