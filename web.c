@@ -1206,6 +1206,63 @@ static const char *find_body(const char *buf)
     return p ? p + 4 : NULL;
 }
 
+/* Constant-time string compare for auth tokens. Returns 1 on match. */
+static int ct_str_eq(const char *a, const char *b)
+{
+    if (!a || !b) return 0;
+    size_t la = strlen(a), lb = strlen(b);
+    /* Walk the longer of the two so a length mismatch doesn't short-circuit. */
+    size_t n = la > lb ? la : lb;
+    unsigned diff = (unsigned)la ^ (unsigned)lb;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned ca = i < la ? (unsigned char)a[i] : 0;
+        unsigned cb = i < lb ? (unsigned char)b[i] : 0;
+        diff |= ca ^ cb;
+    }
+    return diff == 0;
+}
+
+/* Bearer-token auth check on POST /api/* requests.
+ *
+ * Returns 1 if the request is authorised (either no token is configured,
+ * or the request carries the correct 'Authorization: Bearer SECRET' header).
+ * On failure, sends a 401 response and returns 0; caller should `continue`.
+ *
+ * Header parsing is line-oriented: split on \r\n, find the line starting
+ * with 'authorization:' (case-insensitive), then expect 'Bearer '. Tokens
+ * with whitespace are unsupported.
+ */
+static int api_auth_ok(const char *buf, int fd)
+{
+    if (!opt_api_token) return 1; /* no auth configured -> allow */
+    /* Search the request headers for an Authorization line. */
+    const char *p = buf;
+    const char *end = strstr(buf, "\r\n\r\n");
+    if (!end) end = buf + strlen(buf);
+    while (p < end) {
+        const char *eol = strstr(p, "\r\n");
+        if (!eol || eol >= end) break;
+        /* Each header line: "Name: Value". Case-insensitive on the name. */
+        if ((size_t)(eol - p) > 15 && !strncasecmp(p, "authorization:", 14)) {
+            const char *v = p + 14;
+            while (v < eol && (*v == ' ' || *v == '\t')) ++v;
+            if ((size_t)(eol - v) > 7 && !strncasecmp(v, "Bearer ", 7)) {
+                v += 7;
+                while (v < eol && (*v == ' ' || *v == '\t')) ++v;
+                size_t tlen = (size_t)(eol - v);
+                char tok[256];
+                if (tlen >= sizeof(tok)) tlen = sizeof(tok) - 1;
+                memcpy(tok, v, tlen); tok[tlen] = 0;
+                if (ct_str_eq(tok, opt_api_token)) return 1;
+            }
+        }
+        p = eol + 2;
+    }
+    send_response(fd, 401,
+        "{\"error\":\"missing or invalid Authorization: Bearer token\"}");
+    return 0;
+}
+
 /* URL-decode in place. Returns new length. */
 static size_t url_decode_inplace(char *s)
 {
@@ -1459,6 +1516,7 @@ static void *web_thread(void *arg)
             strncmp(buf, "GET /index",   10) == 0) serve_index(fd);
         else if (strncmp(buf, "GET /events", 11) == 0) promote_to_sse(fd);
         else if (strncmp(buf, "POST /api/keys", 14) == 0) {
+            if (!api_auth_ok(buf, fd)) { close(fd); continue; }
             const char *body = find_body(buf);
             keyset_t *ks = app_get_keyset();
             if (!body || !ks) { send_response(fd, 400, "{\"error\":\"no body or no keyset\"}"); continue; }
@@ -1467,6 +1525,7 @@ static void *web_thread(void *arg)
             send_response(fd, 200, resp);
         }
         else if (strncmp(buf, "POST /api/share-url", 19) == 0) {
+            if (!api_auth_ok(buf, fd)) { close(fd); continue; }
             const char *body = find_body(buf);
             keyset_t *ks = app_get_keyset();
             if (!body || !ks) { send_response(fd, 400, "{\"error\":\"no body or no keyset\"}"); continue; }
@@ -1481,6 +1540,7 @@ static void *web_thread(void *arg)
             send_response(fd, 200, resp);
         }
         else if (strncmp(buf, "POST /api/extra-freq", 20) == 0) {
+            if (!api_auth_ok(buf, fd)) { close(fd); continue; }
             const char *body = find_body(buf);
             if (!body) { send_response(fd, 400, "{\"error\":\"no body\"}"); continue; }
             /* Format: "HZ:bw=BW:sf=SF:cr=CR" -- match CLI parser. */
@@ -1500,6 +1560,7 @@ static void *web_thread(void *arg)
             send_response(fd, 200, resp);
         }
         else if (strncmp(buf, "POST /api/cot-multicast", 23) == 0) {
+            if (!api_auth_ok(buf, fd)) { close(fd); continue; }
             const char *body = find_body(buf);
             if (!body) { send_response(fd, 400, "{\"error\":\"no body\"}"); continue; }
             /* Body: "HOST:PORT" or empty to disable. */
