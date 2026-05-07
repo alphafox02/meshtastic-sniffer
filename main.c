@@ -166,6 +166,72 @@ static void on_off_grid_discovery(const scanner_discovery_t *disc, void *user)
 
 /* ---- Pipeline glue: channelizer -> lora demod -> mesh packet -> feed ---- */
 
+static uint64_t monotonic_us(void); /* defined below near the dedup ring */
+
+/* Replay-attack flagging.
+ *
+ * Mesh frames carry a (from, packet_id) tuple. The Meshtastic firmware
+ * itself dedups identical (from, packet_id) within a short window so
+ * relayed retransmits don't reach the application layer twice -- but
+ * a sniffer sees every transmission including the relays. Duplicates
+ * within ~10 seconds are normal mesh retransmits (multi-path through
+ * relay nodes); duplicates much later are suspicious and worth a
+ * REPLAY_SUSPECTED alert.
+ *
+ * One alert per (from, packet_id) per process -- the operator decides
+ * whether to investigate. Single-writer (only on_mesh_event touches
+ * the ring), so no mutex needed.
+ */
+#define REPLAY_RING_SIZE       2048
+#define REPLAY_FRESH_WINDOW_S  10  /* duplicates inside this are normal mesh */
+
+typedef struct {
+    uint32_t from;
+    uint32_t packet_id;
+    uint64_t first_seen_us;
+    bool     alerted;
+    bool     in_use;
+} replay_entry_t;
+
+static replay_entry_t g_replay_ring[REPLAY_RING_SIZE];
+static size_t g_replay_next_slot = 0;
+
+static void replay_check(const mesh_event_t *ev)
+{
+    const uint32_t from = ev->header.from;
+    const uint32_t pid  = ev->header.packet_id;
+    const uint64_t now  = monotonic_us();
+    /* Linear scan; ring is small, hot in cache, single-writer. */
+    for (size_t i = 0; i < REPLAY_RING_SIZE; ++i) {
+        replay_entry_t *e = &g_replay_ring[i];
+        if (!e->in_use) continue;
+        if (e->from != from || e->packet_id != pid) continue;
+        uint64_t delta_us = now - e->first_seen_us;
+        if (!e->alerted &&
+            delta_us > (uint64_t)REPLAY_FRESH_WINDOW_S * 1000000ULL) {
+            char line[256];
+            int n = snprintf(line, sizeof(line),
+                "{\"event\":\"REPLAY_SUSPECTED\",\"from\":\"!%08x\","
+                "\"packet_id\":%u,\"delta_s\":%.1f}\n",
+                from, pid, (double)delta_us / 1.0e6);
+            if (n > 0) {
+                fwrite(line, 1, (size_t)n, stdout); fflush(stdout);
+                if (opt_web_port > 0) web_publish_line(line, (size_t)n);
+            }
+            e->alerted = true;
+        }
+        return;
+    }
+    /* No match -- record. Overwrite the oldest slot (FIFO LRU). */
+    replay_entry_t *e = &g_replay_ring[g_replay_next_slot];
+    g_replay_next_slot = (g_replay_next_slot + 1) % REPLAY_RING_SIZE;
+    e->from = from;
+    e->packet_id = pid;
+    e->first_seen_us = now;
+    e->alerted = false;
+    e->in_use = true;
+}
+
 static void on_mesh_event(const mesh_event_t *ev, void *user) {
     intptr_t channel_id = (intptr_t)user;
     if (ev->decrypted) {
@@ -173,6 +239,7 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
         if (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS)
             __atomic_add_fetch(&g_chan_stats[channel_id].decrypted, 1, __ATOMIC_RELAXED);
     }
+    replay_check(ev);
     feed_publish_event(ev);
 }
 
