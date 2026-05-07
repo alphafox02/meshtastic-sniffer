@@ -272,7 +272,7 @@ static const char DASHBOARD_HTML[] =
 "  <div id=\"activity-grid\"></div>\n"
 "</div>\n"
 "<div id=\"topology\" class=\"tab\">\n"
-"  <div id=\"topo-empty\" class=\"empty-hint\">Waiting for NEIGHBORINFO or relay-hop frames... nodes link up as we observe them hearing each other.</div>\n"
+"  <div id=\"topo-empty\" class=\"empty-hint\">Waiting for the first frame... nodes appear as soon as the sniffer hears them, and link up via NEIGHBORINFO and relay-hop hints.</div>\n"
 "  <div id=\"topo-legend\"><span class=l-node></span> node, size = frames seen &nbsp;|&nbsp; <span class=l-edge></span> edge = observed RX, color = SNR &nbsp;|&nbsp; click a node to inspect</div>\n"
 "  <canvas id=\"topo-canvas\"></canvas>\n"
 "</div>\n"
