@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -82,8 +83,9 @@ code{background:#1e293b;padding:2px 6px;border-radius:3px;color:#bae6fd}
 </body></html>`
 
 // startWebServer runs an HTTP server on `listen` that serves the placeholder
-// index plus the /events SSE endpoint. Returns when ctx is cancelled.
-func startWebServer(ctx context.Context, listen string, hub *SSEHub) error {
+// index, /events SSE endpoint, and /api/sensors registry endpoints.
+// Returns when ctx is cancelled.
+func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *Registry) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -92,6 +94,45 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub) error {
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(indexHTML))
+	})
+	mux.HandleFunc("/api/sensors", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(registry.List())
+		case http.MethodPost:
+			var s Sensor
+			if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
+				http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+				return
+			}
+			if err := registry.Add(&s); err != nil {
+				http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"added":"%s"}`, s.Name)
+		default:
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/api/sensors/", func(w http.ResponseWriter, r *http.Request) {
+		// Path: /api/sensors/<name> (DELETE only).
+		if r.Method != http.MethodDelete {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		name := r.URL.Path[len("/api/sensors/"):]
+		if name == "" {
+			http.Error(w, `{"error":"missing name"}`, http.StatusBadRequest)
+			return
+		}
+		if err := registry.Remove(name); err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"removed":"%s"}`, name)
 	})
 	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)

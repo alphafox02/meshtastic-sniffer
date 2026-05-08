@@ -27,11 +27,8 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
-
-	"github.com/go-zeromq/zmq4"
 )
 
 // Frame is the subset of sniffer event JSON fields we care about for
@@ -76,50 +73,10 @@ func clusterKey(from string, pid uint32) string {
 	return fmt.Sprintf("%s|%d", from, pid)
 }
 
-// subscribe connects a SUB socket to each endpoint and writes received
-// raw JSON bytes onto out. Each received message is also broadcast to
-// `hub` if non-nil so SSE clients see the firehose. The context cancels
-// the goroutines on shutdown.
-func subscribe(ctx context.Context, endpoints []string, out chan<- []byte, hub *SSEHub) {
-	var wg sync.WaitGroup
-	for _, ep := range endpoints {
-		wg.Add(1)
-		go func(ep string) {
-			defer wg.Done()
-			s := zmq4.NewSub(ctx)
-			defer s.Close()
-			s.SetOption(zmq4.OptionSubscribe, "") // wildcard
-			if err := s.Dial(ep); err != nil {
-				log.Printf("subscribe %s: dial: %v", ep, err)
-				return
-			}
-			log.Printf("subscribed to %s", ep)
-			for {
-				msg, err := s.Recv()
-				if err != nil {
-					if ctx.Err() != nil {
-						return // shutdown
-					}
-					log.Printf("subscribe %s: recv: %v", ep, err)
-					return
-				}
-				if len(msg.Frames) == 0 {
-					continue
-				}
-				if hub != nil {
-					hub.Publish(msg.Frames[0])
-				}
-				select {
-				case out <- msg.Frames[0]:
-				case <-ctx.Done():
-					return
-				}
-			}
-		}(ep)
-	}
-	wg.Wait()
-	close(out)
-}
+// Subscriber management is in sensors.go's SubscriberPool. CLI-arg
+// endpoints are added to the pool with synthetic names like
+// "cli-tcp://host:port" so they coexist with registry-driven sensors
+// using the same add/remove mechanism.
 
 // flushReady removes clusters older than `window` from `pending`,
 // returning them sorted by first-seen.
@@ -203,6 +160,8 @@ func main() {
 		"Stop after N consolidated frames (0 = unlimited)")
 	listen := flag.String("listen", "",
 		"HTTP listen address (e.g. :9000). Empty = CLI-only mode.")
+	sensorsFile := flag.String("sensors-file", "",
+		"Path to persistent sensor registry JSON. Empty = CLI-args only.")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr,
 			"Usage: %s [flags] tcp://host1:7008 tcp://host2:7008 ...\n\n"+
@@ -214,7 +173,7 @@ func main() {
 	}
 	flag.Parse()
 	endpoints := flag.Args()
-	if len(endpoints) == 0 {
+	if len(endpoints) == 0 && *sensorsFile == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -231,16 +190,29 @@ func main() {
 	var hub *SSEHub
 	if *listen != "" {
 		hub = newSSEHub()
+	}
+
+	// Sensor registry + subscriber pool. Pool starts subscribers on
+	// behalf of both CLI-arg endpoints and registry entries; runtime
+	// add/remove via /api/sensors mutates registry which mutates pool.
+	registry, err := NewRegistry(ctx, *sensorsFile, hub)
+	if err != nil {
+		log.Fatalf("registry: %v", err)
+	}
+	raw := make(chan []byte, 256)
+	registry.pool.SetRawChannel(raw)
+	for _, ep := range endpoints {
+		registry.pool.Add("cli-"+ep, ep)
+	}
+
+	if *listen != "" {
 		go func() {
-			if err := startWebServer(ctx, *listen, hub); err != nil {
+			if err := startWebServer(ctx, *listen, hub, registry); err != nil {
 				log.Printf("web: %v", err)
 				cancel()
 			}
 		}()
 	}
-
-	raw := make(chan []byte, 256)
-	go subscribe(ctx, endpoints, raw, hub)
 
 	pending := map[string]*Cluster{}
 	consolidated := 0
@@ -284,9 +256,9 @@ loop:
 		case now := <-tick.C:
 			ready := flushReady(pending, *window, now)
 			for _, c := range ready {
-				printCluster(c, len(endpoints))
+				printCluster(c, registry.pool.EndpointCount())
 				if hub != nil {
-					if b, err := txEventJSON(c, len(endpoints)); err == nil {
+					if b, err := txEventJSON(c, registry.pool.EndpointCount()); err == nil {
 						hub.Publish(b)
 					}
 				}
@@ -303,6 +275,6 @@ loop:
 
 	// Final flush of anything still pending past the window.
 	for _, c := range flushReady(pending, 0, time.Now()) {
-		printCluster(c, len(endpoints))
+		printCluster(c, registry.pool.EndpointCount())
 	}
 }
