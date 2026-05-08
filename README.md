@@ -34,13 +34,13 @@ The core is honest passive observation; the use case is mostly which outputs you
 
 ## Hardware capacity
 
-The number of channels you stare at simultaneously is set by the SDR's analog bandwidth and your `--rate`. **Any rate works** -- the channelizer auto-fits whichever channels of the configured grid land inside `[center - rate/2, center + rate/2]`. 56 MHz is the threshold to capture *every* US-band 250 kHz slot from one stare; below that you cover a contiguous subset that the binary picks for you.
+The number of channels you stare at simultaneously is set by the SDR's analog bandwidth and your `--rate`. **Any rate works** -- the channelizer auto-fits whichever channels of the configured grid land inside `[center - rate/2, center + rate/2]`. The US ISM band is 902--928 MHz, so **~26 MHz of SDR bandwidth is the threshold to capture every US-band 250 kHz slot from one stare**; below that you cover a contiguous subset that the binary picks for you. Other regions are narrower (EU_868 is ~5 MHz, EU_433 is ~1.7 MHz), so a 20 MHz HackRF is full-coverage in most non-US regions.
 
 | SDR | Bandwidth | Coverage at default rate | Notes |
 |-----|-----------|--------------------------|-------|
-| HackRF One | 20 MHz | 409 channels at `--presets=all` US (41 LongFast slots + every other preset's slot grid that fits) | Most common config; partial cover of LongFast but every preset is decoded in parallel |
-| BladeRF 2.0 | 56 MHz | All 104 US LongFast slots | AD9361, full ISM band coverage |
-| USRP B210 | 56 MHz | All 104 US LongFast slots | UHD-driven |
+| HackRF One | 20 MHz | 409 channels at `--presets=all` US (41 LongFast slots + every other preset's slot grid that fits) | Most common config; partial cover of LongFast but every preset is decoded in parallel. Full coverage in EU_868 / EU_433 / most non-US regions |
+| BladeRF 2.0 | up to 56 MHz (AD9361) | All 104 US LongFast slots at ~26 Msps | Full US ISM coverage; headroom for adjacent-band scanning |
+| USRP B210 | up to 56 MHz (AD9361) | All 104 US LongFast slots at ~26 Msps | UHD-driven; same headroom |
 | SDRplay (RSPdx, RSP1A) | 10 MHz | One BW group + adjacent presets | Native API |
 | Airspy R2 / Mini | 10 MHz | One BW group + adjacent presets | |
 | RTL-SDR (R820T) | 2.4 MHz | One BW group, ~9 LongFast slots | Cheap entry point |
