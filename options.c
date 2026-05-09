@@ -401,7 +401,7 @@ int options_parse(int argc, char **argv)
         case O_RATE:    opt_sample_rate    = (uint32_t)strtoul(optarg, NULL, 10); break;
         case O_GAIN: {
             double g = strtod(optarg, NULL);
-            soapy_gain_val = g; uhd_gain_db = g; bladerf_gain_db = (int)g;
+            soapy_gain_val = g; uhd_gain_db = g; bladerf_gain_db = (int)g; bladerf_gain_val = (int)g;
             rtl_gain_tenths_db = (int)(g * 10.0);
             sdrplay_gain_val = (int)g;
             airspy_lin_gain = (int)g;
