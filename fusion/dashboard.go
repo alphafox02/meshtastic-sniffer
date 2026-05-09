@@ -202,6 +202,29 @@ button.danger:hover{background:#991b1b}
 </div>
 
 <script>
+// Auth: pick up the bearer token from a one-shot ?token=... query
+// param on first load, store it in sessionStorage, and use it on every
+// /api/* fetch and the /events EventSource. Strip it from the URL bar
+// once captured so it doesn't get bookmarked or screenshotted.
+(function(){
+  const url = new URL(window.location.href);
+  const t = url.searchParams.get('token');
+  if (t) {
+    sessionStorage.setItem('fusionToken', t);
+    url.searchParams.delete('token');
+    history.replaceState({}, '', url.toString());
+  }
+})();
+const FUSION_TOKEN = sessionStorage.getItem('fusionToken') || '';
+function authHeaders(extra){
+  const h = Object.assign({}, extra||{});
+  if (FUSION_TOKEN) h['Authorization'] = 'Bearer ' + FUSION_TOKEN;
+  return h;
+}
+function authUrl(path){
+  if (!FUSION_TOKEN) return path;
+  return path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(FUSION_TOKEN);
+}
 function showTab(name){
   for(const t of ['live','activity','topology','sensors','config']){
     document.getElementById(t).classList.toggle('active',t===name);
@@ -641,7 +664,7 @@ topoCanvas.addEventListener('mousemove', e=>{
 });
 topoCanvas.addEventListener('mouseleave', ()=>{ topoHover = null; topoCanvas.classList.remove('hovering'); });
 
-const es=new EventSource('/events');
+const es=new EventSource(authUrl('/events'));
 es.onopen=()=>{const s=document.getElementById('status');s.textContent='connected';s.style.color=''};
 es.onerror=()=>{const s=document.getElementById('status');s.textContent='disconnected';s.style.color='#f87171'};
 es.onmessage=(e)=>{
@@ -688,11 +711,23 @@ es.onmessage=(e)=>{
   refreshActivity();
 };
 
+// dealerStats[identity] = {heartbeats, last_seen_ago_sec, ...} -- updated
+// alongside the sensor list refresh; rendered into the DEALER badge tooltip.
+const dealerStats = {};
 async function refreshSensors(){
   try{
-    const r=await fetch('/api/sensors');
-    const list=await r.json();
+    const [r1, r2] = await Promise.all([
+      fetch('/api/sensors',{headers:authHeaders()}),
+      fetch('/api/dealer-stats',{headers:authHeaders()}).catch(()=>null),
+    ]);
+    const list=await r1.json();
     setStat('st-sensors', list.length);
+    if (r2 && r2.ok) {
+      const j = await r2.json();
+      // Reset so removed sessions disappear from the cache.
+      for (const k of Object.keys(dealerStats)) delete dealerStats[k];
+      for (const s of (j.sessions||[])) dealerStats[s.identity] = s;
+    }
     renderSensorsTable(list);
   }catch(err){
     console.error('refreshSensors',err);
@@ -722,8 +757,17 @@ function renderSensorsTable(list){
     const dot = '<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:'+
       stationColor(s.name)+';margin-right:6px;vertical-align:middle"></span>';
     const tr = document.createElement('tr');
+    const ds = dealerStats[s.name];
+    let dealerTip = 'DEALER session active; commands route via ZMQ';
+    if (ds) {
+      const hbAge = ds.last_seen_ago_sec ? ds.last_seen_ago_sec.toFixed(1)+'s ago' : 'fresh';
+      dealerTip = 'DEALER session\n'+
+        ds.heartbeats+' heartbeats (last '+hbAge+')\n'+
+        ds.commands_sent+' cmds sent  '+ds.commands_replied+' replied  '+ds.commands_timed_out+' timeout\n'+
+        'cmd latency: p50='+ds.cmd_latency_p50_ms+'ms  p95='+ds.cmd_latency_p95_ms+'ms';
+    }
     const c2Badge = s.dealer
-      ? '<span class="status-ok" title="DEALER session active; commands route via ZMQ">DEALER</span>'
+      ? '<span class="status-ok" title="'+escHtml(dealerTip)+'">DEALER</span>'
       : (s.api ? '<span class="muted" title="HTTP fan-out to '+escHtml(s.api)+'">HTTP</span>'
                : '<span class="status-err" title="no command transport configured">--</span>');
     tr.innerHTML = '<td>'+dot+escHtml(s.name)+'</td>'+
@@ -758,7 +802,7 @@ async function addSensor(){
   if(api) body.api=api;
   if(tok) body.api_token=tok;
   try{
-    const r=await fetch('/api/sensors',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const r=await fetch('/api/sensors',{method:'POST',headers:authHeaders({'Content-Type':'application/json'}),body:JSON.stringify(body)});
     const j=await r.json();
     if(r.ok){
       setStatus('add-status','added '+j.added,true);
@@ -776,7 +820,7 @@ async function addSensor(){
 }
 async function removeSensor(name){
   try{
-    const r=await fetch('/api/sensors/'+encodeURIComponent(name),{method:'DELETE'});
+    const r=await fetch('/api/sensors/'+encodeURIComponent(name),{method:'DELETE',headers:authHeaders()});
     if(r.ok) refreshSensors();
   }catch(_){}
 }
@@ -786,7 +830,7 @@ async function fanout(endpoint,inputId){
   out.style.display='block';
   out.textContent='sending...';
   try{
-    const r=await fetch('/api/fanout/'+endpoint,{method:'POST',body:body});
+    const r=await fetch('/api/fanout/'+endpoint,{method:'POST',headers:authHeaders(),body:body});
     const j=await r.json();
     out.textContent=JSON.stringify(j,null,2);
   }catch(err){

@@ -171,6 +171,10 @@ func main() {
 		"Path to persistent sensor registry JSON. Empty = CLI-args only.")
 	c2Router := flag.String("c2-router", "",
 		"ZMQ ROUTER bind address (e.g. tcp://*:7009) for DEALER C2 from sensors. Empty = HTTP fan-out only.")
+	apiToken := flag.String("api-token", "",
+		"Bearer token required for /events and /api/* (Authorization: Bearer <T>, or ?token=<T> on EventSource). Empty = no auth.")
+	stateDB := flag.String("state-db", "",
+		"Path to bbolt file for SSE replay-ring persistence (e.g. ~/.config/meshtastic-fusion/state.db). Empty = memory-only; ring is lost on restart.")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr,
 			"Usage: %s [flags] tcp://host1:7008 tcp://host2:7008 ...\n\n"+
@@ -201,8 +205,23 @@ func main() {
 	}()
 
 	var hub *SSEHub
+	var store *EventStore
 	if *listen != "" {
 		hub = newSSEHub()
+		if *stateDB != "" {
+			s, err := OpenEventStore(*stateDB, 0)
+			if err != nil {
+				log.Fatalf("state-db: %v", err)
+			}
+			store = s
+			defer store.Close()
+			if err := hub.HydrateFromStore(store); err != nil {
+				log.Printf("state-db: hydrate: %v", err)
+			}
+			n, _ := store.Count()
+			log.Printf("state-db: %s opened, %d events on disk", *stateDB, n)
+			hub.AttachStore(store)
+		}
 	}
 
 	// Sensor registry + subscriber pool. Pool starts subscribers on
@@ -223,7 +242,7 @@ func main() {
 
 	if *listen != "" {
 		go func() {
-			if err := startWebServer(ctx, *listen, hub, registry); err != nil {
+			if err := startWebServer(ctx, *listen, hub, registry, *apiToken); err != nil {
 				log.Printf("web: %v", err)
 				cancel()
 			}

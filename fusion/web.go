@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -40,6 +41,7 @@ type SSEHub struct {
 	history  [][]byte
 	histHead int // index of next slot to write
 	histLen  int // total entries currently stored, capped at sseHistorySize
+	store    *EventStore // optional: durable mirror of history
 }
 
 func newSSEHub() *SSEHub {
@@ -47,6 +49,40 @@ func newSSEHub() *SSEHub {
 		clients: map[chan []byte]struct{}{},
 		history: make([][]byte, sseHistorySize),
 	}
+}
+
+// AttachStore connects a durable EventStore to the hub. After attach,
+// every Publish() also appends to the store. Optionally call
+// HydrateFromStore() once to preload the in-memory ring with persisted
+// events from a previous fusion run.
+func (h *SSEHub) AttachStore(s *EventStore) {
+	h.mu.Lock()
+	h.store = s
+	h.mu.Unlock()
+}
+
+// HydrateFromStore preloads the ring from `store` so a browser that
+// reconnects right after fusion startup sees the same recent history
+// it would have seen had fusion never restarted. Called once at
+// startup, before any new events flow.
+func (h *SSEHub) HydrateFromStore(store *EventStore) error {
+	if store == nil {
+		return nil
+	}
+	recent, err := store.Recent(sseHistorySize)
+	if err != nil {
+		return err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, ev := range recent {
+		h.history[h.histHead] = ev
+		h.histHead = (h.histHead + 1) % sseHistorySize
+		if h.histLen < sseHistorySize {
+			h.histLen++
+		}
+	}
+	return nil
 }
 
 // Publish sends `event` to every connected client and records it in the
@@ -57,7 +93,6 @@ func (h *SSEHub) Publish(event []byte) {
 	cp := make([]byte, len(event))
 	copy(cp, event)
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	for ch := range h.clients {
 		select {
 		case ch <- cp:
@@ -70,6 +105,17 @@ func (h *SSEHub) Publish(event []byte) {
 	h.histHead = (h.histHead + 1) % sseHistorySize
 	if h.histLen < sseHistorySize {
 		h.histLen++
+	}
+	store := h.store
+	h.mu.Unlock()
+	// Mirror to disk outside the lock so a slow disk doesn't stall
+	// live broadcast. Errors are logged once per occurrence via store
+	// itself; here we silently continue so the publisher path is
+	// uninterruptible.
+	if store != nil {
+		if err := store.Append(cp); err != nil {
+			log.Printf("eventstore: append: %v", err)
+		}
 	}
 }
 
@@ -120,10 +166,50 @@ func jsonOK(w http.ResponseWriter, body map[string]string) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// authWrap returns a handler that requires the bearer token on every
+// request. If `token` is empty, returns the inner handler unwrapped --
+// no auth, matching the sniffer's `--api-token` semantics.
+//
+// Two ways to authenticate:
+//   - Authorization: Bearer <token>  -- preferred, works for fetch()
+//   - ?token=<token>                  -- needed for EventSource which
+//                                        cannot set custom headers
+//
+// On failure: 401 with a JSON error. crypto/subtle constant-time compare
+// so the check itself doesn't leak token length via timing.
+func authWrap(next http.Handler, token string) http.Handler {
+	if token == "" {
+		return next
+	}
+	want := []byte(token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var got string
+		if h := r.Header.Get("Authorization"); h != "" {
+			const p = "Bearer "
+			if len(h) > len(p) && h[:len(p)] == p {
+				got = h[len(p):]
+			}
+		}
+		if got == "" {
+			got = r.URL.Query().Get("token")
+		}
+		if got == "" || subtle.ConstantTimeCompare([]byte(got), want) != 1 {
+			jsonError(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // startWebServer runs an HTTP server on `listen` that serves the placeholder
 // index, /events SSE endpoint, and /api/sensors registry endpoints.
 // Returns when ctx is cancelled.
-func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *Registry) error {
+//
+// `apiToken` (when non-empty) is required on /events and /api/* routes;
+// the dashboard HTML at / is always served without auth so the operator
+// can land on the page and the JS can pick up the token from a
+// `?token=<T>` query param.
+func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *Registry, apiToken string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -133,7 +219,8 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(dashboardHTML))
 	})
-	mux.HandleFunc("/api/sensors", func(w http.ResponseWriter, r *http.Request) {
+	apiMux := http.NewServeMux()
+	apiMux.HandleFunc("/api/sensors", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			w.Header().Set("Content-Type", "application/json")
@@ -154,8 +241,21 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 		}
 	})
 	// Command fan-out endpoints: /api/fanout/keys, share-url, etc.
-	installFanoutHandlers(mux, registry)
-	mux.HandleFunc("/api/sensors/", func(w http.ResponseWriter, r *http.Request) {
+	installFanoutHandlers(apiMux, registry)
+	apiMux.HandleFunc("/api/dealer-stats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		dealer := registry.DealerHub()
+		var stats []DealerStats
+		if dealer != nil {
+			stats = dealer.Stats()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"sessions": stats})
+	})
+	apiMux.HandleFunc("/api/sensors/", func(w http.ResponseWriter, r *http.Request) {
 		// Path: /api/sensors/<name> (DELETE only).
 		if r.Method != http.MethodDelete {
 			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -172,7 +272,7 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 		}
 		jsonOK(w, map[string]string{"removed": name})
 	})
-	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+	apiMux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -226,6 +326,14 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 			}
 		}
 	})
+
+	// Mount the auth-gated handlers under /api/ and /events. authWrap is
+	// a no-op when apiToken is empty so unauthenticated mode behaves as
+	// before. The wrap is applied once at mount, not per-route, so
+	// adding a new /api/* handler doesn't risk forgetting the wrap.
+	wrapped := authWrap(apiMux, apiToken)
+	mux.Handle("/api/", wrapped)
+	mux.Handle("/events", wrapped)
 
 	srv := &http.Server{
 		Addr:              listen,

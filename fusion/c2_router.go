@@ -31,8 +31,41 @@ import (
 
 // dealerSession is the fusion-side view of one connected DEALER sensor.
 type dealerSession struct {
-	Identity string
-	LastSeen time.Time
+	Identity   string
+	LastSeen   time.Time
+	Heartbeats uint64
+	// hbGapsMs is a ring of the last N inter-heartbeat gaps, in
+	// milliseconds. Used to surface "is this sensor's heartbeat steady
+	// or jittery" in the dashboard. Newest at the end after rotation.
+	hbGapsMs    []int64
+	hbGapsHead  int
+	// Commands sent + replied + timed-out for this identity. Round-trip
+	// latency of the last N replies in milliseconds, ring-buffered.
+	CommandsSent     uint64
+	CommandsReplied  uint64
+	CommandsTimedOut uint64
+	cmdLatMs         []int64
+	cmdLatHead       int
+}
+
+// dealerHistorySize bounds the per-session heartbeat/latency rings.
+// Keeps memory flat at ~16 ints per session even with chatty sensors.
+const dealerHistorySize = 16
+
+// DealerStats is the marshalable per-identity view returned over HTTP.
+// Public field names match the dashboard JS access patterns; rings are
+// returned as int slices oldest-to-newest for client-side rendering.
+type DealerStats struct {
+	Identity         string  `json:"identity"`
+	LastSeenAgoSec   float64 `json:"last_seen_ago_sec"`
+	Heartbeats       uint64  `json:"heartbeats"`
+	HBGapsMs         []int64 `json:"hb_gaps_ms"`
+	CommandsSent     uint64  `json:"commands_sent"`
+	CommandsReplied  uint64  `json:"commands_replied"`
+	CommandsTimedOut uint64  `json:"commands_timed_out"`
+	CmdLatencyMs     []int64 `json:"cmd_latency_ms"`
+	CmdLatencyP50    int64   `json:"cmd_latency_p50_ms"`
+	CmdLatencyP95    int64   `json:"cmd_latency_p95_ms"`
 }
 
 // DealerHub owns the ROUTER socket plus per-identity state. Safe for
@@ -132,13 +165,16 @@ func (d *DealerHub) SendCommand(identity, cmd, body string, timeout time.Duratio
 	}
 
 	msg := zmq4.NewMsgFrom([]byte(identity), envelope)
+	sentAt := time.Now()
 	if err := d.sck.SendMulti(msg); err != nil {
 		return 0, "", fmt.Errorf("dealer send: %w", err)
 	}
 	select {
 	case r := <-ch:
+		d.recordCommandLatency(identity, time.Since(sentAt).Milliseconds(), true)
 		return r.Status, string(r.Body), nil
 	case <-time.After(timeout):
+		d.recordCommandLatency(identity, time.Since(sentAt).Milliseconds(), false)
 		return 0, "", ErrTimeout
 	}
 }
@@ -218,13 +254,109 @@ func (d *DealerHub) readLoop(ctx context.Context) {
 func (d *DealerHub) touchSession(identity string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	now := time.Now()
 	s, ok := d.sessions[identity]
 	if !ok {
-		s = &dealerSession{Identity: identity}
+		s = &dealerSession{
+			Identity: identity,
+			hbGapsMs: make([]int64, dealerHistorySize),
+			cmdLatMs: make([]int64, dealerHistorySize),
+		}
 		d.sessions[identity] = s
 		log.Printf("c2-router: DEALER session opened: %s", identity)
+	} else if !s.LastSeen.IsZero() {
+		gap := now.Sub(s.LastSeen).Milliseconds()
+		s.hbGapsMs[s.hbGapsHead] = gap
+		s.hbGapsHead = (s.hbGapsHead + 1) % len(s.hbGapsMs)
 	}
-	s.LastSeen = time.Now()
+	s.Heartbeats++
+	s.LastSeen = now
+}
+
+// recordCommandLatency stores the round-trip ms for a completed
+// command exchange. Called from SendCommand on either reply or timeout
+// so both code paths feed the histogram.
+func (d *DealerHub) recordCommandLatency(identity string, latMs int64, replied bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s, ok := d.sessions[identity]
+	if !ok {
+		return
+	}
+	s.CommandsSent++
+	if replied {
+		s.CommandsReplied++
+		s.cmdLatMs[s.cmdLatHead] = latMs
+		s.cmdLatHead = (s.cmdLatHead + 1) % len(s.cmdLatMs)
+	} else {
+		s.CommandsTimedOut++
+	}
+}
+
+// Stats returns per-identity DEALER telemetry sorted by identity.
+// Snapshotted under the lock then formatted outside it. Ring buffers
+// are returned oldest-to-newest with empty (zero) slots filtered out.
+func (d *DealerHub) Stats() []DealerStats {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	out := make([]DealerStats, 0, len(d.sessions))
+	for _, s := range d.sessions {
+		st := DealerStats{
+			Identity:         s.Identity,
+			Heartbeats:       s.Heartbeats,
+			CommandsSent:     s.CommandsSent,
+			CommandsReplied:  s.CommandsReplied,
+			CommandsTimedOut: s.CommandsTimedOut,
+		}
+		if !s.LastSeen.IsZero() {
+			st.LastSeenAgoSec = now.Sub(s.LastSeen).Seconds()
+		}
+		st.HBGapsMs = ringSnapshot(s.hbGapsMs, s.hbGapsHead)
+		st.CmdLatencyMs = ringSnapshot(s.cmdLatMs, s.cmdLatHead)
+		st.CmdLatencyP50, st.CmdLatencyP95 = percentiles(st.CmdLatencyMs)
+		out = append(out, st)
+	}
+	return out
+}
+
+// ringSnapshot returns the ring contents oldest-to-newest, dropping
+// uninitialized (zero) slots. The ring writes head-forward, so
+// oldest = current head.
+func ringSnapshot(buf []int64, head int) []int64 {
+	if len(buf) == 0 {
+		return nil
+	}
+	out := make([]int64, 0, len(buf))
+	for i := 0; i < len(buf); i++ {
+		v := buf[(head+i)%len(buf)]
+		if v == 0 {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// percentiles computes p50 and p95 of a sample slice. Sorts a copy so
+// the caller's slice is unmodified. Returns (0, 0) for empty input.
+func percentiles(xs []int64) (p50, p95 int64) {
+	if len(xs) == 0 {
+		return 0, 0
+	}
+	sorted := make([]int64, len(xs))
+	copy(sorted, xs)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j-1] > sorted[j]; j-- {
+			sorted[j-1], sorted[j] = sorted[j], sorted[j-1]
+		}
+	}
+	idx50 := len(sorted) / 2
+	idx95 := (len(sorted) * 95) / 100
+	if idx95 >= len(sorted) {
+		idx95 = len(sorted) - 1
+	}
+	return sorted[idx50], sorted[idx95]
 }
 
 // containsKey is a fast-path check that doesn't allocate; sufficient for
