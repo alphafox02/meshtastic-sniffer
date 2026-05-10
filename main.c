@@ -901,8 +901,8 @@ static uint32_t backend_default_rate(sdr_backend_t b)
     case SDR_BACKEND_USRP:     return 20000000;
     case SDR_BACKEND_AIRSPY:   return 10000000;   /* Airspy R2 native */
     case SDR_BACKEND_SDRPLAY:  return 10000000;   /* RSP1A/RSPdx comfortable */
-    case SDR_BACKEND_RTLSDR:   return  2400000;   /* R820T2 max */
-    case SDR_BACKEND_SOAPYSDR: return  2400000;   /* assume RTL-class via Soapy */
+    case SDR_BACKEND_RTLSDR:   return  2000000;   /* R820T2: rock-solid 2.0 Msps, integer 8x 250 kHz preset BW */
+    case SDR_BACKEND_SOAPYSDR: return  2000000;   /* assume RTL-class via Soapy; safe default for 250 kHz alignment */
     case SDR_BACKEND_VITA49:   return        0;   /* set from VRT context packets */
     case SDR_BACKEND_FILE:     return        0;   /* set from SigMF or user --rate */
     default:                   return 10000000;
@@ -1335,6 +1335,25 @@ static int run_live(void)
     if (opt_op_mode != OP_MODE_SCAN && n <= 0) {
         fprintf(stderr, "no channels configured (region=%s presets=%s); nothing to decode.\n",
                 opt_region, opt_preset_csv);
+        /* Common gotcha on RTL-class SDRs: --rate is not a multiple of any
+         * preset's LoRa channel bandwidth (125 / 250 / 500 kHz), so the
+         * polyphase channelizer rejects every preset slot. Surface a
+         * concrete hint with the next two integer-aligned rates the user
+         * could try, instead of leaving them to guess. */
+        const uint32_t rate = (uint32_t)samp_rate;
+        const uint32_t bws[] = { 125000U, 250000U, 500000U };
+        int any_aligned = 0;
+        for (size_t i = 0; i < sizeof(bws)/sizeof(bws[0]); ++i)
+            if (rate % bws[i] == 0) { any_aligned = 1; break; }
+        if (!any_aligned) {
+            uint32_t down = (rate / 250000U) * 250000U;
+            uint32_t up   = down + 250000U;
+            fprintf(stderr,
+                "  hint: --rate=%u is not a multiple of any preset's LoRa BW\n"
+                "        (125 / 250 / 500 kHz). Try --rate=%u or --rate=%u\n"
+                "        (or omit --rate to take the backend default).\n",
+                rate, down, up);
+        }
         return 1;
     }
     if (n > 0)
