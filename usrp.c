@@ -26,7 +26,6 @@ extern volatile sig_atomic_t running;
 extern pid_t self_pid;
 extern double samp_rate;
 extern double center_freq;
-extern int usrp_gain_val;
 extern int verbose;
 
 extern void push_samples(sample_buf_t *buf);

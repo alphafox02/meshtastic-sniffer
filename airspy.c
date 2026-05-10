@@ -15,6 +15,7 @@
 
 #include <libairspy/airspy.h>
 
+#include "options.h"
 #include "airspy.h"
 #include "sdr.h"
 
@@ -127,7 +128,6 @@ void *airspy_backend_setup(uint64_t serial) {
      * Issue #15: previously the default was unreachable because the
      * global soapy_gain_val starts at 40, so the dB-mapping branch
      * always fired and produced 17 even when nothing was passed. */
-    extern int airspy_gain_val;
     extern int soapy_gain_explicit;
     int lg = 19;
     if (airspy_gain_val >= 0) {

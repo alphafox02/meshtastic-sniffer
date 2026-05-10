@@ -19,6 +19,7 @@
 
 #include <libbladeRF.h>
 
+#include "options.h"
 #include "sdr.h"
 #include "bladerf.h"
 
@@ -29,7 +30,6 @@ extern volatile sig_atomic_t running;
 extern pid_t self_pid;
 extern double samp_rate;
 extern double center_freq;
-extern int bladerf_gain_val;
 extern int bias_tee;
 extern int verbose;
 

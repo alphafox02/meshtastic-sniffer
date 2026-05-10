@@ -60,13 +60,11 @@ iq_format_t iq_format      = FMT_CI8;
 int   hackrf_lna_gain   = 0;
 int   hackrf_vga_gain   = 30;
 int   hackrf_amp_enable = 0;
-int   bladerf_gain_db   = 30;
-int   bladerf_gain_val  = 30;       /* alias used by bladerf.c */
+int   bladerf_gain_val  = 30;
 int   rtl_dev_index     = 0;
 int   rtl_gain_tenths_db = -1;
 int   agc_enabled       = 0;        /* used by rtlsdr.c */
-int   airspy_lin_gain   = -1;
-int   airspy_gain_val   = -1;       /* alias used by airspy.c */
+int   airspy_gain_val   = -1;
 char *sdrplay_serial    = NULL;
 int   sdrplay_gain_val  = 40;
 int   soapy_num         = -1;
@@ -80,8 +78,7 @@ char *soapy_setting_keys[SOAPY_SETTINGS_MAX];
 char *soapy_setting_vals[SOAPY_SETTINGS_MAX];
 int    soapy_setting_count = 0;
 char  *uhd_args         = NULL;
-double uhd_gain_db      = 40.0;
-int    usrp_gain_val    = 40;       /* alias used by usrp.c */
+int    usrp_gain_val    = 40;
 int    vita49_enabled   = 0;
 char  *vita49_endpoint  = NULL;
 
@@ -401,10 +398,10 @@ int options_parse(int argc, char **argv)
         case O_RATE:    opt_sample_rate    = (uint32_t)strtoul(optarg, NULL, 10); break;
         case O_GAIN: {
             double g = strtod(optarg, NULL);
-            soapy_gain_val = g; uhd_gain_db = g; bladerf_gain_db = (int)g;
+            soapy_gain_val = g; bladerf_gain_val = (int)g; usrp_gain_val = (int)g;
             rtl_gain_tenths_db = (int)(g * 10.0);
             sdrplay_gain_val = (int)g;
-            airspy_lin_gain = (int)g;
+            airspy_gain_val = (int)g;
             /* HackRF: VGA covers 0..62 dB in 2 dB steps; LNA covers 0..40
              * in 8 dB steps. Map a single --gain knob across both, then
              * enable the 14 dB front-end amp above ~70 dB total. */
