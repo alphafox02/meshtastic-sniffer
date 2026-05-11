@@ -53,12 +53,9 @@ iq_format_t iq_format      = FMT_CI8;
 
 /* Per-backend gain controls.
  *
- * HackRF default for Meshtastic: a node a few feet away saturates the
- * front-end if LNA is up. Default to LNA=0 + modest VGA -- works for
- * close traffic out of the box. Bump --gain to 40 (LNA=0 VGA=40),
- * 60 (LNA=24 VGA=40), 70+ (LNA=40 VGA=62 +amp) for distant captures. */
-int   hackrf_lna_gain   = 0;
-int   hackrf_vga_gain   = 30;
+ * HackRF defaults: LNA=24 sets the noise figure; VGA=20 fills behind. */
+int   hackrf_lna_gain   = 24;
+int   hackrf_vga_gain   = 20;
 int   hackrf_amp_enable = 0;
 int   bladerf_gain_val  = 30;
 int   rtl_dev_index     = 0;
@@ -402,15 +399,30 @@ int options_parse(int argc, char **argv)
             rtl_gain_tenths_db = (int)(g * 10.0);
             sdrplay_gain_val = (int)g;
             airspy_gain_val = (int)g;
-            /* HackRF: VGA covers 0..62 dB in 2 dB steps; LNA covers 0..40
-             * in 8 dB steps. Map a single --gain knob across both, then
-             * enable the 14 dB front-end amp above ~70 dB total. */
-            if (g <= 0)        { hackrf_lna_gain = 0;  hackrf_vga_gain = 0;  hackrf_amp_enable = 0; }
-            else if (g <= 40)  { hackrf_lna_gain = 0;  hackrf_vga_gain = (int)g; hackrf_amp_enable = 0; }
-            else if (g <= 60)  { hackrf_lna_gain = ((int)((g-40)/8))*8;
-                                 hackrf_vga_gain = 40; hackrf_amp_enable = 0; }
-            else               { hackrf_lna_gain = 40; hackrf_vga_gain = 62;
-                                 hackrf_amp_enable = (g >= 70) ? 1 : 0; }
+            /* HackRF: fill LNA (sets noise figure) first, then VGA, then
+             * more LNA, then the 14 dB front-end amp at the top. */
+            if (g <= 0) {
+                hackrf_lna_gain = 0;  hackrf_vga_gain = 0;
+                hackrf_amp_enable = 0;
+            } else if (g <= 24) {
+                int lna = ((int)g / 8) * 8;       /* 0/8/16/24 */
+                hackrf_lna_gain = lna;
+                hackrf_vga_gain = (int)g - lna;
+                hackrf_amp_enable = 0;
+            } else if (g <= 56) {
+                hackrf_lna_gain = 24;
+                hackrf_vga_gain = (int)g - 24;
+                hackrf_amp_enable = 0;
+            } else if (g <= 72) {
+                int lna = (g <= 64) ? 32 : 40;
+                hackrf_lna_gain = lna;
+                hackrf_vga_gain = (int)g - lna;
+                hackrf_amp_enable = 0;
+            } else {
+                hackrf_lna_gain = 40;
+                hackrf_vga_gain = 62;
+                hackrf_amp_enable = 1;
+            }
             break;
         }
         case O_BIAS:    bias_tee = 1; break;
