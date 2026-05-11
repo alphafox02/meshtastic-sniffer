@@ -349,6 +349,7 @@ void *vita49_thread(void *arg)
         case FMT_CF32: {
             num_samples = payload_bytes / 8;
             if (num_samples == 0) continue;
+            if (num_samples > (SIZE_MAX - sizeof(*s)) / 8) { skipped_pkts++; continue; }
             s = malloc(sizeof(*s) + num_samples * 8);
             s->format = SAMPLE_FMT_FLOAT;
             const uint32_t *src32 = (const uint32_t *)payload;
@@ -361,6 +362,7 @@ void *vita49_thread(void *arg)
         case FMT_CI16: {
             num_samples = payload_bytes / 4;
             if (num_samples == 0) continue;
+            if (num_samples > (SIZE_MAX - sizeof(*s)) / 2) { skipped_pkts++; continue; }
             s = malloc(sizeof(*s) + num_samples * 2);
             s->format = SAMPLE_FMT_INT8;
             const int16_t *src = (const int16_t *)payload;
@@ -373,6 +375,7 @@ void *vita49_thread(void *arg)
         default:
             num_samples = payload_bytes / 2;
             if (num_samples == 0) continue;
+            if (num_samples > (SIZE_MAX - sizeof(*s)) / 2) { skipped_pkts++; continue; }
             s = malloc(sizeof(*s) + num_samples * 2);
             s->format = SAMPLE_FMT_INT8;
             memcpy(s->samples, payload, num_samples * 2);
