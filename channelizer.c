@@ -190,12 +190,14 @@ int channelizer_add_channel(channelizer_t *c, const channel_cfg_t *cfg)
     int b_signed = (int)round(offset / (double)cfg->bw_hz);
     int bin = ((b_signed % M) + M) % M;
 
-    /* Sanity: the channel must actually land within the FFT's frequency
-     * window; channels outside would alias. The PFB's output bin spans
-     * ±samp_rate/2 around bin_0_freq, so any channel within that range
-     * is reachable. */
-    if (offset < -((double)c->samp_rate * 0.5) ||
-        offset >  ((double)c->samp_rate * 0.5)) {
+    /* Sanity: require the channel center to fall inside the SDR RF window.
+     * offset above is relative to bin_0_freq for bin assignment, not relative
+     * to the SDR center, so do not compare it to +/- samp_rate/2 here. */
+
+    double rf_lo = (double)c->f_center - (double)c->samp_rate * 0.5;
+    double rf_hi = (double)c->f_center + (double)c->samp_rate * 0.5;
+
+    if ((double)cfg->f_hz < rf_lo || (double)cfg->f_hz > rf_hi) {
         if (verbose)
             fprintf(stderr, "channelizer: channel %.3f MHz outside Nyquist window\n",
                     (double)cfg->f_hz / 1e6);
