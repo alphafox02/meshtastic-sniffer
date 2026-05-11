@@ -257,11 +257,6 @@ typedef struct {
 static void on_mesh_event(const mesh_event_t *ev, void *user) {
     const frame_emit_ctx_t *ctx = (const frame_emit_ctx_t *)user;
     int channel_id = ctx ? ctx->channel_id : -1;
-    if (ev->decrypted) {
-        __atomic_add_fetch(&g_decrypts_total, 1, __ATOMIC_RELAXED);
-        if (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS)
-            __atomic_add_fetch(&g_chan_stats[channel_id].decrypted, 1, __ATOMIC_RELAXED);
-    }
     /* Stamp slot id + RF-quality telemetry onto the event copy so
      * feed.c can surface them in JSON without touching the decoder. */
     mesh_event_t stamped = *ev;
@@ -283,6 +278,17 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
         if (stamped.has_crc && !stamped.payload_crc_ok) {
             stamped.decrypted = false;
         }
+    }
+    /* Count after the CRC-fail override so the stats counter agrees
+     * with what the JSON output reports. A channel-hash-matched but
+     * payload-CRC-failed frame isn't a successful decrypt -- AES-CTR
+     * ran but produced garbage -- and surfacing it as "decrypted" in
+     * stats but "decrypted:false" in JSON had operators wondering why
+     * the numbers disagreed. */
+    if (stamped.decrypted) {
+        __atomic_add_fetch(&g_decrypts_total, 1, __ATOMIC_RELAXED);
+        if (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS)
+            __atomic_add_fetch(&g_chan_stats[channel_id].decrypted, 1, __ATOMIC_RELAXED);
     }
     replay_check(&stamped);
     feed_publish_event(&stamped);
