@@ -101,6 +101,7 @@ include_directories(${PROJECT_SOURCE_DIR})
 
 set(SOURCES
     ${PROJECT_SOURCE_DIR}/main.c
+    ${PROJECT_SOURCE_DIR}/dedup.c
     ${PROJECT_SOURCE_DIR}/options.c
     ${PROJECT_SOURCE_DIR}/meshtastic.c
     ${PROJECT_SOURCE_DIR}/file_src.c

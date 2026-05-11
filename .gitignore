@@ -25,6 +25,7 @@ compile_commands.json
 
 # Compiled test binaries / Python caches
 tests/test_lora_stages
+tests/test_dedup_slot
 __pycache__/
 
 # Internal planning notes -- not for the public repo.

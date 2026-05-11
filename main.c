@@ -17,6 +17,7 @@
 #include "announce.h"
 #include "archive.h"
 #include "c2_dealer.h"
+#include "dedup.h"
 #include "feed.h"
 #include "geofence.h"
 #include "gpsd.h"
@@ -175,7 +176,8 @@ static void on_off_grid_discovery(const scanner_discovery_t *disc, void *user)
 
 /* ---- Pipeline glue: channelizer -> lora demod -> mesh packet -> feed ---- */
 
-static uint64_t monotonic_us(void); /* defined below near the dedup ring */
+/* monotonic_us / realtime_ns / payload_fingerprint / dedup_entry_t / dedup_buffer
+ * live in dedup.c (see dedup.h). */
 
 /* Replay-attack flagging.
  *
@@ -209,7 +211,7 @@ static void replay_check(const mesh_event_t *ev)
 {
     const uint32_t from = ev->header.from;
     const uint32_t pid  = ev->header.packet_id;
-    const uint64_t now  = monotonic_us();
+    const uint64_t now  = dedup_monotonic_us();
     /* Linear scan; ring is small, hot in cache, single-writer. */
     for (size_t i = 0; i < REPLAY_RING_SIZE; ++i) {
         replay_entry_t *e = &g_replay_ring[i];
@@ -293,170 +295,6 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
     replay_check(&stamped);
     feed_publish_event(&stamped);
 }
-
-/* Delayed best-pick dedup of PFB bin-leakage copies.
- *
- * Each LoRa transmission produces ~30 leakage replicas across adjacent
- * PFB output bins. Per-replica bit errors are independent across bins;
- * the cleanest decode is whichever bin had the highest SNR. Picking
- * the FIRST replica that arrives (eager emit) is random; picking the
- * highest-SNR replica is deterministically the best-quality copy.
- *
- * Algorithm:
- *   1. New replica arrives -> compute payload fingerprint.
- *   2. Find an existing cluster within Hamming distance 14 (real
- *      transmissions have fingerprint distance ~32; bit-error replicas
- *      ~1-5).
- *   3. If found and this replica's SNR is higher: replace the cluster's
- *      stored best.
- *   4. If not found: open a new cluster with this replica as best,
- *      schedule emit at now + DEDUP_WINDOW_US.
- *   5. Drainer thread polls every few ms; when a cluster's emit time
- *      passes, hand its best-stored replica to mesh_packet_decode_with_radio
- *      (single attempt, gets the cleanest SNR copy = best decrypt odds).
- *
- * One JSON line per real transmission, regardless of PFB leakage count.
- * Density-safe: 100 simultaneous distinct transmissions create 100
- * distinct clusters (random fingerprints don't collide within 14
- * Hamming bits). 30 ms window swallows leakage cluster from a single
- * chirp without merging adjacent unrelated transmissions. */
-#define DEDUP_RING_SIZE         512
-#define DEDUP_WINDOW_US         30000   /* 30 ms is well past leakage spread */
-#define DEDUP_FP_HAMMING_THRESH 14      /* clean replicas: ~5 bit-flip differences */
-/* When the new replica's payload CRC is bad, byte-level corruption pushes
- * the XOR-fold fingerprint far away from the clean cluster's fingerprint.
- * Loosen the match threshold so 8-15 bit errors per replica still fold.
- * The probability of an unrelated frame pair landing within Hamming 22 of
- * each other on uniformly random 64-bit fingerprints is ~0.6%, well below
- * the false-merge cost (one bogus extra observation in a 30 ms cluster) of
- * the alternative (15 phantom replicas as separate clusters). */
-#define DEDUP_FP_HAMMING_THRESH_CRCFAIL 22
-#define DEDUP_MAX_PAYLOAD       256
-
-/* 64-bit XOR-fold fingerprint of the payload bytes. Two near-identical
- * byte arrays produce near-identical fingerprints; a single bit error
- * flips a single bit in the fingerprint. */
-static uint64_t payload_fingerprint(const uint8_t *p, size_t n)
-{
-    uint64_t h = 0;
-    for (size_t i = 0; i + 8 <= n; i += 8) {
-        uint64_t w;
-        memcpy(&w, p + i, sizeof(w));
-        h ^= w;
-        h = (h << 1) | (h >> 63);
-    }
-    uint64_t tail = 0;
-    for (size_t i = (n & ~7ULL); i < n; ++i)
-        tail |= (uint64_t)p[i] << ((i - (n & ~7ULL)) * 8);
-    return h ^ tail;
-}
-
-typedef struct {
-    bool                in_use;
-    uint64_t            fp;
-    int                 sf;
-    int                 bw_hz;
-    uint64_t            emit_at_us;     /* now_us + window when first opened */
-    uint64_t            first_seen_t_ns;/* CLOCK_REALTIME ns at first-replica arrival */
-    /* Highest-SNR replica seen so far for this cluster. */
-    float               best_snr_db;
-    size_t              best_payload_len;
-    uint8_t             best_payload[DEDUP_MAX_PAYLOAD];
-    lora_frame_meta_t   best_meta;
-    intptr_t            best_user;
-    int                 replica_count;  /* for telemetry / debug */
-} dedup_entry_t;
-
-static dedup_entry_t   g_dedup[DEDUP_RING_SIZE];
-static pthread_mutex_t g_dedup_mu = PTHREAD_MUTEX_INITIALIZER;
-
-static uint64_t monotonic_us(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
-}
-
-/* CLOCK_REALTIME nanoseconds since the Unix epoch -- the value the mlat
- * solver consumes as `station_t_ns`. Accuracy is whatever your host
- * clock is disciplined to (NTP / chrony+PPS / GPSDO); reported by the
- * sniffer via `station_t_acc_ns` so the solver can weight observations. */
-static uint64_t realtime_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
-
-/* Buffer the replica into its cluster (matched by fingerprint), keeping
- * the highest-SNR copy seen so far. Returns true if a new cluster was
- * opened (= caller can stop here; the drainer will emit). */
-static void dedup_buffer(const uint8_t *payload, size_t payload_len,
-                         const lora_frame_meta_t *meta, intptr_t user)
-{
-    if (!payload || payload_len < 14 || payload_len > DEDUP_MAX_PAYLOAD) return;
-    int sf = meta ? meta->sf    : 0;
-    int bw = meta ? meta->bw_hz : 0;
-    float snr = meta ? meta->snr_db : 0.0f;
-    bool crc_bad = meta && meta->has_crc && !meta->payload_crc_ok;
-    uint64_t fp = payload_fingerprint(payload, payload_len);
-    uint64_t now_us = monotonic_us();
-
-    /* Pick the matching threshold up-front: clean replicas use the tight
-     * 14-bit window; CRC-failed replicas use the looser 22-bit window so
-     * heavy byte-level corruption still folds into the right cluster
-     * instead of forking 15 phantom siblings. */
-    const int thresh = crc_bad ? DEDUP_FP_HAMMING_THRESH_CRCFAIL
-                               : DEDUP_FP_HAMMING_THRESH;
-
-    pthread_mutex_lock(&g_dedup_mu);
-    dedup_entry_t *match = NULL;
-    int free_slot = -1;
-    for (int i = 0; i < DEDUP_RING_SIZE; ++i) {
-        dedup_entry_t *e = &g_dedup[i];
-        if (!e->in_use) {
-            if (free_slot < 0) free_slot = i;
-            continue;
-        }
-        if (e->sf != sf || e->bw_hz != bw) continue;
-        int hd = __builtin_popcountll(e->fp ^ fp);
-        if (hd <= thresh) { match = e; break; }
-    }
-    if (match) {
-        match->replica_count++;
-        if (snr > match->best_snr_db) {
-            match->best_snr_db      = snr;
-            match->best_payload_len = payload_len;
-            memcpy(match->best_payload, payload, payload_len);
-            if (meta) match->best_meta = *meta;
-            match->best_user        = user;
-            match->fp               = fp;   /* update to cleaner fp */
-        }
-    } else if (free_slot >= 0) {
-        dedup_entry_t *e = &g_dedup[free_slot];
-        e->in_use           = true;
-        e->fp               = fp;
-        e->sf               = sf;
-        e->bw_hz            = bw;
-        e->emit_at_us       = now_us + DEDUP_WINDOW_US;
-        /* Realtime snapshot of FIRST replica arrival -- the closest we
-         * can come to the actual on-air RX moment, modulo demod latency.
-         * Subsequent higher-SNR replicas of the same cluster don't
-         * update this; mlat wants a stable per-frame timestamp. */
-        e->first_seen_t_ns  = realtime_ns();
-        e->best_snr_db      = snr;
-        e->best_payload_len = payload_len;
-        memcpy(e->best_payload, payload, payload_len);
-        if (meta) e->best_meta = *meta;
-        e->best_user        = user;
-        e->replica_count    = 1;
-    }
-    /* else: ring full -- silently drop. With RING_SIZE=512 and 30 ms
-     * window, this would require ~17000 distinct clusters/sec, far
-     * above any realistic urban Meshtastic load. */
-    pthread_mutex_unlock(&g_dedup_mu);
-}
-
 /* Drainer thread: every few ms, emit any cluster whose window has
  * expired by handing its best-SNR replica to mesh_packet_decode_with_radio.
  * The decode runs OUTSIDE the dedup mutex so the decrypt + publish
@@ -525,7 +363,7 @@ static void *dedup_drainer_thread(void *arg)
     dedup_entry_t batch[DEDUP_DRAIN_BATCH];
     while (g_dedup_drainer_run) {
         usleep(5000); /* 5 ms tick = ~6 ticks per window */
-        uint64_t now_us = monotonic_us();
+        uint64_t now_us = dedup_monotonic_us();
         atomic_store_explicit(&g_drainer_last_tick_us, now_us, memory_order_relaxed);
         int n = 0;
         pthread_mutex_lock(&g_dedup_mu);
@@ -655,7 +493,7 @@ static void *stats_thread(void *arg)
             /* Drainer liveness: if the dedup tick hasn't moved in 5x its
              * window (150 ms), the thread has died or is wedged. Log
              * once per stats heartbeat so it surfaces but doesn't spam. */
-            uint64_t now_us = monotonic_us();
+            uint64_t now_us = dedup_monotonic_us();
             uint64_t last_tick = atomic_load_explicit(&g_drainer_last_tick_us,
                                                      memory_order_relaxed);
             if (last_tick && now_us - last_tick > 5ULL * DEDUP_WINDOW_US) {
