@@ -132,7 +132,51 @@ typedef struct {
 } chan_stat_t;
 static chan_stat_t g_chan_stats[CHANNELIZER_MAX_CHANNELS];
 
-void push_samples(sample_buf_t *buf)
+/* ---- Sample pump: decouple SDR recv from DSP -------------------------
+ *
+ * SDR backends call push_samples() from their receive callback/thread. For
+ * high-rate USRP capture, doing channelizer work inline means UHD cannot
+ * return to uhd_rx_streamer_recv() quickly enough and the device FIFO can
+ * overrun. The pump makes push_samples() enqueue and return; one processing
+ * thread owns the original channelizer/scanner path.
+ */
+/* Default 256: gives the UHD recv thread enough burst cushion to clear 26 Msps
+ * on B205 without overruns while DSP threads ride the steady-state limit.
+ * 64 was enough for the bench but live USRP needed the extra slack to clear
+ * the OOO storm. Override via MESHTASTIC_SAMPLE_QUEUE=N. */
+#define SAMPLE_QUEUE_DEFAULT_CAP 256
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  not_empty;
+    pthread_cond_t  not_full;
+    pthread_cond_t  drained;
+    sample_buf_t  **ring;
+    size_t          cap;
+    size_t          head, tail, size;
+    int             active;      /* processor currently owns one buffer */
+    int             started;
+    int             closing;
+    pthread_t       tid;
+    _Atomic uint64_t submitted;
+    _Atomic uint64_t processed;
+    _Atomic uint64_t queue_waits;
+} sample_pump_t;
+
+static sample_pump_t g_sample_pump = {
+    .mu = PTHREAD_MUTEX_INITIALIZER,
+    .not_empty = PTHREAD_COND_INITIALIZER,
+    .not_full = PTHREAD_COND_INITIALIZER,
+    .drained = PTHREAD_COND_INITIALIZER,
+};
+
+static int sample_pump_stats_enabled(void)
+{
+    const char *e = getenv("MESHTASTIC_PFB_STATS");
+    return e && *e && *e != '0';
+}
+
+static void process_sample_buf(sample_buf_t *buf)
 {
     if (!buf) return;
     __atomic_add_fetch(&g_samples_total, buf->num, __ATOMIC_RELAXED);
@@ -157,6 +201,144 @@ void push_samples(sample_buf_t *buf)
                                (const float complex *)buf->samples, buf->num);
     }
     free(buf);
+}
+
+static void *sample_pump_thread(void *arg)
+{
+    (void)arg;
+#ifdef _GNU_SOURCE
+    pthread_setname_np(pthread_self(), "sample-pump");
+#endif
+    for (;;) {
+        pthread_mutex_lock(&g_sample_pump.mu);
+        while (g_sample_pump.size == 0 && !g_sample_pump.closing)
+            pthread_cond_wait(&g_sample_pump.not_empty, &g_sample_pump.mu);
+        if (g_sample_pump.size == 0 && g_sample_pump.closing) {
+            pthread_mutex_unlock(&g_sample_pump.mu);
+            break;
+        }
+        sample_buf_t *buf = g_sample_pump.ring[g_sample_pump.head];
+        g_sample_pump.head = (g_sample_pump.head + 1) % g_sample_pump.cap;
+        g_sample_pump.size--;
+        g_sample_pump.active = 1;
+        pthread_cond_signal(&g_sample_pump.not_full);
+        pthread_mutex_unlock(&g_sample_pump.mu);
+
+        process_sample_buf(buf);
+        atomic_fetch_add(&g_sample_pump.processed, 1);
+
+        pthread_mutex_lock(&g_sample_pump.mu);
+        g_sample_pump.active = 0;
+        if (g_sample_pump.size == 0)
+            pthread_cond_broadcast(&g_sample_pump.drained);
+        pthread_mutex_unlock(&g_sample_pump.mu);
+    }
+    return NULL;
+}
+
+static int sample_pipeline_start(void)
+{
+    int cap = SAMPLE_QUEUE_DEFAULT_CAP;
+    const char *env = getenv("MESHTASTIC_SAMPLE_QUEUE");
+    if (env && *env) {
+        int v = atoi(env);
+        if (v >= 1 && v <= 4096) cap = v;
+    }
+    pthread_mutex_lock(&g_sample_pump.mu);
+    if (g_sample_pump.started) {
+        pthread_mutex_unlock(&g_sample_pump.mu);
+        return 0;
+    }
+    g_sample_pump.ring = calloc((size_t)cap, sizeof(*g_sample_pump.ring));
+    if (!g_sample_pump.ring) {
+        pthread_mutex_unlock(&g_sample_pump.mu);
+        return -1;
+    }
+    g_sample_pump.cap = (size_t)cap;
+    g_sample_pump.head = g_sample_pump.tail = g_sample_pump.size = 0;
+    g_sample_pump.active = 0;
+    g_sample_pump.closing = 0;
+    atomic_store(&g_sample_pump.submitted, 0);
+    atomic_store(&g_sample_pump.processed, 0);
+    atomic_store(&g_sample_pump.queue_waits, 0);
+    if (pthread_create(&g_sample_pump.tid, NULL, sample_pump_thread, NULL) != 0) {
+        free(g_sample_pump.ring);
+        g_sample_pump.ring = NULL;
+        g_sample_pump.cap = 0;
+        pthread_mutex_unlock(&g_sample_pump.mu);
+        return -1;
+    }
+    g_sample_pump.started = 1;
+    pthread_mutex_unlock(&g_sample_pump.mu);
+    fprintf(stderr, "sample-pump: queue capacity %d buffers\n", cap);
+    return 0;
+}
+
+void sample_pipeline_drain(void)
+{
+    pthread_mutex_lock(&g_sample_pump.mu);
+    while (g_sample_pump.started &&
+           (g_sample_pump.size > 0 || g_sample_pump.active))
+        pthread_cond_wait(&g_sample_pump.drained, &g_sample_pump.mu);
+    pthread_mutex_unlock(&g_sample_pump.mu);
+}
+
+static void sample_pipeline_stop(void)
+{
+    pthread_mutex_lock(&g_sample_pump.mu);
+    if (!g_sample_pump.started) {
+        pthread_mutex_unlock(&g_sample_pump.mu);
+        return;
+    }
+    g_sample_pump.closing = 1;
+    pthread_cond_broadcast(&g_sample_pump.not_empty);
+    pthread_cond_broadcast(&g_sample_pump.not_full);
+    pthread_mutex_unlock(&g_sample_pump.mu);
+
+    pthread_join(g_sample_pump.tid, NULL);
+
+    if (sample_pump_stats_enabled()) {
+        fprintf(stderr, "sample-pump: submitted=%llu processed=%llu queue_waits=%llu\n",
+                (unsigned long long)atomic_load(&g_sample_pump.submitted),
+                (unsigned long long)atomic_load(&g_sample_pump.processed),
+                (unsigned long long)atomic_load(&g_sample_pump.queue_waits));
+    }
+
+    pthread_mutex_lock(&g_sample_pump.mu);
+    free(g_sample_pump.ring);
+    g_sample_pump.ring = NULL;
+    g_sample_pump.cap = 0;
+    g_sample_pump.head = g_sample_pump.tail = g_sample_pump.size = 0;
+    g_sample_pump.active = 0;
+    g_sample_pump.started = 0;
+    g_sample_pump.closing = 0;
+    pthread_mutex_unlock(&g_sample_pump.mu);
+}
+
+void push_samples(sample_buf_t *buf)
+{
+    if (!buf) return;
+    pthread_mutex_lock(&g_sample_pump.mu);
+    if (!g_sample_pump.started || g_sample_pump.closing) {
+        pthread_mutex_unlock(&g_sample_pump.mu);
+        process_sample_buf(buf);
+        return;
+    }
+    while (g_sample_pump.size == g_sample_pump.cap && !g_sample_pump.closing) {
+        atomic_fetch_add(&g_sample_pump.queue_waits, 1);
+        pthread_cond_wait(&g_sample_pump.not_full, &g_sample_pump.mu);
+    }
+    if (g_sample_pump.closing) {
+        pthread_mutex_unlock(&g_sample_pump.mu);
+        free(buf);
+        return;
+    }
+    g_sample_pump.ring[g_sample_pump.tail] = buf;
+    g_sample_pump.tail = (g_sample_pump.tail + 1) % g_sample_pump.cap;
+    g_sample_pump.size++;
+    atomic_fetch_add(&g_sample_pump.submitted, 1);
+    pthread_cond_signal(&g_sample_pump.not_empty);
+    pthread_mutex_unlock(&g_sample_pump.mu);
 }
 
 static void on_off_grid_discovery(const scanner_discovery_t *disc, void *user)
@@ -1264,6 +1446,12 @@ static int run_live(void)
           "(no dashboard. add --web=8888 for a Leaflet map + Activity + Config tabs.)\n");
     }
 
+    if (sample_pipeline_start() != 0) {
+        fprintf(stderr, "sample-pump: failed to start\n");
+        feed_shutdown();
+        return 1;
+    }
+
     /* 5s stats heartbeat thread + 2s/30s friendly watchdogs. */
     pthread_t stats_tid, wd_tid;
     pthread_create(&stats_tid, NULL, stats_thread, NULL);
@@ -1278,6 +1466,7 @@ static int run_live(void)
     if (vita_started) {
         input_tid = vita_tid;
     } else if (start_input(&input_tid) < 0) {
+        sample_pipeline_stop();
         feed_shutdown();
         return 1;
     }
@@ -1289,6 +1478,7 @@ static int run_live(void)
         usleep(100000);
 
     pthread_join(input_tid, NULL);
+    sample_pipeline_stop();
     pthread_join(stats_tid, NULL);
     pthread_join(wd_tid, NULL);
 

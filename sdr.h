@@ -34,4 +34,9 @@ typedef struct _sample_buf_t {
 
 void push_samples(sample_buf_t *buf);
 
+/* Wait until every sample buffer submitted via push_samples() has been
+ * processed. Backends that need to flush downstream DSP at EOF should call
+ * this first so queued samples cannot race the flush. */
+void sample_pipeline_drain(void);
+
 #endif
