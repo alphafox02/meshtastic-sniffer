@@ -121,8 +121,13 @@ void *usrp_backend_setup(const char *serial)
     uhd_tune_result_t tune_result;
     char arg[128];
 
-    snprintf(arg, sizeof(arg), "serial=%s,num_recv_frames=1024",
-             serial ? serial : "");
+    /* UHD's device-args parser treats serial= (empty value) as "match
+     * a device with empty serial" -- which matches nothing. To open the
+     * first available device, omit the serial= key entirely. */
+    if (serial && serial[0])
+        snprintf(arg, sizeof(arg), "serial=%s,num_recv_frames=1024", serial);
+    else
+        snprintf(arg, sizeof(arg), "num_recv_frames=1024");
 
     if (uhd_usrp_make(&usrp, arg) != UHD_ERROR_NONE)
         errx(1, "USRP make failed (serial=%s)", serial ? serial : "(any)");
