@@ -1292,6 +1292,12 @@ static int run_live(void)
     pthread_join(stats_tid, NULL);
     pthread_join(wd_tid, NULL);
 
+    /* Async PFB sink workers may still hold full or partial baseband
+     * buffers after live SDR input stops. Drain them before stopping the
+     * dedup drainer or destroying g_demods; file replay already does this
+     * at EOF, but live backends need the same quiescence point here. */
+    if (g_channelizer) channelizer_flush(g_channelizer);
+
     /* Stop the dedup drainer last; it flushes any pending clusters
      * before returning so the JSON stream gets the tail. */
     dedup_drainer_stop();

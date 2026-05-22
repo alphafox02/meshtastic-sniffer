@@ -296,11 +296,14 @@ void channelizer_flush(channelizer_t *c)
 void channelizer_destroy(channelizer_t *c)
 {
     if (!c) return;
-    for (int i = 0; i < c->n_channels; ++i) {
-        if (c->channels[i]) free(c->channels[i]);
-    }
+    /* pfb_destroy() drains async sink workers, whose callback user pointers
+     * reference chan_state_t. Keep channel state alive until after all PFB
+     * sinks have flushed and no worker can call pfb_emit_adapter anymore. */
     for (int g = 0; g < c->n_groups; ++g) {
         if (c->groups[g].pfb) pfb_destroy(c->groups[g].pfb);
+    }
+    for (int i = 0; i < c->n_channels; ++i) {
+        if (c->channels[i]) free(c->channels[i]);
     }
     free(c->workbuf);
     free(c);
