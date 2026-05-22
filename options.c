@@ -376,7 +376,10 @@ int options_parse(int argc, char **argv)
         case O_SDRPLAY: if (set_backend(SDR_BACKEND_SDRPLAY, optarg) < 0) return 2; break;
         case O_AIRSPY:  if (set_backend(SDR_BACKEND_AIRSPY,  optarg) < 0) return 2; break;
         case O_USRP:    if (set_backend(SDR_BACKEND_USRP,    optarg) < 0) return 2;
-                        uhd_args = strdup(optarg); break;
+                        /* optarg may be NULL when --usrp is passed without
+                         * an explicit serial; downstream strdup(NULL) would
+                         * crash. Treat absent serial as empty string. */
+                        uhd_args = strdup(optarg ? optarg : ""); break;
         case O_VITA49:  if (set_backend(SDR_BACKEND_VITA49,  optarg) < 0) return 2;
                         vita49_endpoint = strdup(optarg);
                         vita49_enabled = 1;
