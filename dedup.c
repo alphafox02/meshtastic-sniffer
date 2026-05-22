@@ -114,7 +114,24 @@ void dedup_buffer(const uint8_t *payload, size_t payload_len,
     }
     if (match) {
         match->replica_count++;
-        if (snr > match->best_snr_db) {
+        /* Tournament: prefer "good" (CRC-pass OR no-CRC) over CRC-fail
+         * unconditionally; tiebreak on SNR within the same class. The old
+         * SNR-only rule let a high-SNR CRC-FAIL phantom replace a CRC-PASS
+         * true frame in the same cluster -- benign under serial dispatch
+         * (the CRC-pass usually arrived first and won the SNR slot before
+         * phantoms surfaced), but non-deterministic under the async sink
+         * worker pool where replicas arrive in arbitrary order.
+         *
+         * lora.c sets payload_crc_ok=true for frames with no CRC field, so
+         * `payload_crc_ok` alone is the right "good" predicate (avoids
+         * treating implicit-header frames as CRC-fail). */
+        bool new_good = meta && meta->payload_crc_ok;
+        bool cur_good = match->best_meta.payload_crc_ok;
+        bool replace;
+        if (new_good && !cur_good)      replace = true;
+        else if (!new_good && cur_good) replace = false;
+        else                            replace = (snr > match->best_snr_db);
+        if (replace) {
             match->best_snr_db      = snr;
             match->best_payload_len = payload_len;
             memcpy(match->best_payload, payload, payload_len);
