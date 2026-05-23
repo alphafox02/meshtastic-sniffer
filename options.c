@@ -248,6 +248,8 @@ void options_print_help(const char *prog)
         "                         strong tone in A + weak tone in B; measure B's recovered power with/without A; CSV to /tmp\n"
         "  --selftest-rejection-offbin\n"
         "                         sweep tone offset from channel center in fractional-bin steps; CSV to /tmp\n"
+        "  --selftest-rejection-procgain\n"
+        "                         wideband-noise processing-gain test: input vs output SNR vs 10*log10(M); CSV to /tmp\n"
         "  --list                 enumerate all available SDR devices and exit\n"
         "  --schema               print JSON Schema for the event format and exit\n"
         "  -v, --verbose          INFO+WARN diagnostics (-vv DEBUG, -vvv TRACE)\n"
@@ -310,6 +312,7 @@ int options_parse(int argc, char **argv)
         O_DECODE, O_SCAN, O_SCAN_DEC, O_ALERT_OFF_GRID,
         O_SIMD_GEN, O_SELFTEST, O_SELFTEST_REJECTION, O_SELFTEST_REJECTION_AMP,
         O_SELFTEST_REJECTION_TWOTONE, O_SELFTEST_REJECTION_OFFBIN,
+        O_SELFTEST_REJECTION_PROCGAIN,
         O_LIST, O_SCHEMA,
     };
     static const struct option longopts[] = {
@@ -371,6 +374,7 @@ int options_parse(int argc, char **argv)
         { "selftest-rejection-amplitude", no_argument, NULL, O_SELFTEST_REJECTION_AMP },
         { "selftest-rejection-twotone",   no_argument, NULL, O_SELFTEST_REJECTION_TWOTONE },
         { "selftest-rejection-offbin",    no_argument, NULL, O_SELFTEST_REJECTION_OFFBIN },
+        { "selftest-rejection-procgain",  no_argument, NULL, O_SELFTEST_REJECTION_PROCGAIN },
         { "list",       no_argument,       NULL, O_LIST },
         { "schema",     no_argument,       NULL, O_SCHEMA },
         { "help",       no_argument,       NULL, 'h' },
@@ -523,6 +527,7 @@ int options_parse(int argc, char **argv)
         case O_SELFTEST_REJECTION_AMP: return 102;
         case O_SELFTEST_REJECTION_TWOTONE: return 103;
         case O_SELFTEST_REJECTION_OFFBIN: return 104;
+        case O_SELFTEST_REJECTION_PROCGAIN: return 105;
         case O_LIST:     opt_list_devices = true; break;
         case O_SCHEMA:   opt_print_schema = true; break;
 

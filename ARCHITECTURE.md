@@ -153,6 +153,16 @@ Two-tone test (`--selftest-rejection-twotone`, strong tone in slot N, weak tone 
 
 Off-bin sweep (`--selftest-rejection-offbin`, tone at source+δ*BW for δ ∈ {0, 1/8, 1/4, 3/8, 1/2}): at δ=0.5 the energy distributes equally between source bin and source+1 bin (both at ~-9 dBFS while a single on-bin tone peaks at ~-3 dBFS), with non-adjacent bins ≤ -63 dB. Practical consequence: an emitter drifted to the half-bin point between channel centers lights up both adjacent grid channels simultaneously. The off-grid scanner thresholds should expect this split.
 
+Processing-gain / dynamic-range sweep (`--selftest-rejection-procgain`, AWGN added at the cs8 ingest, full-band input SNR vs per-bin output SNR):
+
+| BW (kHz) | M | 10·log10(M) (dB) | measured mean (dB) | residual (dB) |
+|---|---|---|---|---|
+| 500 |  40 | 16.02 | 17.17 | +1.15 |
+| 250 |  80 | 19.03 | 20.12 | +1.09 |
+| 125 | 160 | 22.04 | 23.14 | +1.10 |
+
+Per-bin output SNR exceeds input full-band SNR by `10·log10(M)` plus a consistent ~+1 dB offset across all three BW groups. The offset is attributable to the Hamming-windowed sinc prototype's equivalent-noise bandwidth — a real but small filter property, not a bug. Sigma=0.5 LSB rows in the CSV are below the cs8 quantization step and have unreliable statistics; sigma ≥ 1.0 LSB rows give the stable measurement.
+
 ### Async sink dispatch
 
 The PFB writes FFT outputs into per-sink ring buffers (`SINK_RING_N = 4`, 1024 samples each). When a buffer fills, ownership passes to a worker in a shared pool sharded by `channel_id % n_workers` (default `min(nproc-1, 16)`). Each LoRa decoder is touched by exactly one worker, so per-channel state stays single-threaded without locks. The PFB thread blocks on a full free pool rather than dropping samples; this is the only backpressure path in the pipeline.

@@ -1944,6 +1944,332 @@ int run_selftest_rejection_offbin(void)
     return 0;
 }
 
+/* ---- Wideband-noise processing-gain sweep -----------------------------
+ *
+ * Inject cs8 AWGN (and optionally a CW tone added to it) at the channelizer
+ * input. Measure target-bin noise power both alone and combined with the
+ * tone; derive output SNR and compare to the input full-band SNR. For an
+ * FFT-based decimator-by-M the per-bin noise bandwidth shrinks by ~M, so
+ * the per-bin output SNR exceeds the full-band input SNR by ~10*log10(M)
+ * (modulo the prototype filter's ENBW, which we don't analytically
+ * subtract here -- a small constant residual is expected).
+ *
+ * The signal-power estimate uses a two-pass form to avoid biasing the noise estimate: signal = max(target_with_tone - target_noise_only, eps).
+ * Off-source bins are written to the CSV as diagnostics only, not used
+ * in the primary SNR calculation, because finite-filter leakage biases
+ * the noise estimate.
+ *
+ * Deterministic PRNG seed so the CSV is reproducible across runs.
+ */
+
+static uint64_t g_procgain_rng_state = 0x243f6a8885a308d3ULL;
+
+static inline double procgain_uniform(void)
+{
+    /* xorshift64*; not cryptographically secure but reproducible and fast. */
+    uint64_t s = g_procgain_rng_state;
+    s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
+    g_procgain_rng_state = s;
+    uint64_t r = s * 2685821657736338717ULL;
+    /* Map upper 53 bits to (0, 1) -- excludes 0 to be safe for log(). */
+    double u = (double)((r >> 11) | 1) / (double)((uint64_t)1 << 53);
+    return u;
+}
+
+static inline void procgain_box_muller(double *z0, double *z1)
+{
+    double u1 = procgain_uniform();
+    double u2 = procgain_uniform();
+    double r  = sqrt(-2.0 * log(u1));
+    double th = 2.0 * M_PI * u2;
+    *z0 = r * cos(th);
+    *z1 = r * sin(th);
+}
+
+/* Run the channelizer once at this (BW, source, noise_sigma_lsb,
+ * tone_amp_lsb) configuration. Returns per-sink mean power in
+ * dBFS (relative to full-scale ±1 after the cs8 -> float scale by
+ * 1/127). out_power_dbfs[] is sized to n_fit; clip_fraction reports
+ * how many input cs8 samples saturated. */
+static int procgain_run_once(uint64_t f_center, uint32_t fs, int bw_hz,
+                             int n_fit, const int *fit,
+                             uint64_t f_tone, double tone_amp_lsb,
+                             double noise_sigma_lsb,
+                             double *out_power_dbfs,
+                             double *out_clip_fraction)
+{
+    channelizer_t *c = channelizer_create(f_center, fs);
+    if (!c) return -1;
+    chan_stats_t *stats = calloc((size_t)n_fit, sizeof(*stats));
+    if (!stats) { channelizer_destroy(c); return -1; }
+    for (int k = 0; k < n_fit; ++k) {
+        channel_cfg_t cfg = {
+            .f_hz = mesh_channel_freq_hz(mesh_lookup_region(opt_region ? opt_region : "US"),
+                                          bw_hz, fit[k]),
+            .bw_hz = bw_hz, .sf = 7, .cr = 5,
+            .on_baseband = selftest_cb, .user = stats,
+        };
+        channelizer_add_channel(c, &cfg);
+    }
+
+    double phase = 0.0;
+    double phase_inc = 2.0 * M_PI
+        * (double)((int64_t)f_tone - (int64_t)f_center) / (double)fs;
+    size_t total_samples = fs / 10;
+    const size_t block = 65536;
+    int8_t *buf = malloc(block * 2);
+    if (!buf) { channelizer_destroy(c); free(stats); return -1; }
+    uint64_t clips = 0;
+    for (size_t fed = 0; fed < total_samples; ) {
+        size_t n = total_samples - fed; if (n > block) n = block;
+        for (size_t i = 0; i < n; ++i) {
+            double ni, nq;
+            procgain_box_muller(&ni, &nq);
+            double ci = tone_amp_lsb * cos(phase) + noise_sigma_lsb * ni;
+            double si = tone_amp_lsb * sin(phase) + noise_sigma_lsb * nq;
+            phase += phase_inc;
+            if (ci >  127.0) { ci =  127.0; ++clips; }
+            else if (ci < -128.0) { ci = -128.0; ++clips; }
+            if (si >  127.0) { si =  127.0; ++clips; }
+            else if (si < -128.0) { si = -128.0; ++clips; }
+            buf[2*i]     = (int8_t)ci;
+            buf[2*i + 1] = (int8_t)si;
+        }
+        channelizer_process_int8(c, buf, n);
+        fed += n;
+    }
+    free(buf);
+
+    for (int k = 0; k < n_fit; ++k) {
+        double avg = stats[k].nsamples
+            ? stats[k].power_sum / (double)stats[k].nsamples
+            : 0.0;
+        out_power_dbfs[k] = avg > 0.0 ? 10.0 * log10(avg) : -200.0;
+    }
+    if (out_clip_fraction) {
+        /* 2 lanes per IQ sample -> 2 * total_samples comparisons. */
+        *out_clip_fraction = (double)clips / (2.0 * (double)total_samples);
+    }
+    channelizer_destroy(c);
+    free(stats);
+    return 0;
+}
+
+int run_selftest_rejection_procgain(void)
+{
+    const char *region_name = opt_region ? opt_region : "US";
+    const mesh_region_t *r = mesh_lookup_region(region_name);
+    if (!r) {
+        fprintf(stderr, "selftest-rejection-procgain: unknown region '%s'\n", region_name);
+        return 1;
+    }
+    uint32_t fs = samp_rate > 0.0 ? (uint32_t)samp_rate : 20000000u;
+    uint64_t f_center = center_freq > 0.0
+        ? (uint64_t)center_freq
+        : (uint64_t)((r->f_lo_mhz + r->f_hi_mhz) * 0.5 * 1e6);
+
+    int bw_set[8] = {0}; int n_bw = 0;
+    for (int p = 0; p < MESH_PRESET_COUNT; ++p) {
+        int bw = r->wide_lora ? MESH_PRESETS[p].bw_hz_wide
+                              : MESH_PRESETS[p].bw_hz_narrow;
+        int seen = 0;
+        for (int i = 0; i < n_bw; ++i) if (bw_set[i] == bw) { seen = 1; break; }
+        if (!seen && n_bw < (int)(sizeof(bw_set)/sizeof(bw_set[0])))
+            bw_set[n_bw++] = bw;
+    }
+    for (int i = 0; i < n_bw; ++i)
+        for (int j = i + 1; j < n_bw; ++j)
+            if (bw_set[j] < bw_set[i]) { int t = bw_set[i]; bw_set[i] = bw_set[j]; bw_set[j] = t; }
+
+    /* Sweeps. */
+    static const double noise_sigmas_lsb[] = { 0.5, 1.0, 2.0, 3.0 };
+    static const double input_snrs_db[]    = { -10.0, 0.0, 10.0, 20.0 };
+    const int n_sigmas = (int)(sizeof(noise_sigmas_lsb) / sizeof(noise_sigmas_lsb[0]));
+    const int n_snrs   = (int)(sizeof(input_snrs_db) / sizeof(input_snrs_db[0]));
+
+    char ts[32], csvpath[256];
+    time_t now = time(NULL); struct tm tmv; gmtime_r(&now, &tmv);
+    strftime(ts, sizeof(ts), "%Y%m%dT%H%M%SZ", &tmv);
+    snprintf(csvpath, sizeof(csvpath),
+             "/tmp/meshtastic-pfb-rejection-procgain-%s.csv", ts);
+    FILE *csv = fopen(csvpath, "w");
+    if (!csv) {
+        fprintf(stderr, "selftest-rejection-procgain: cannot open %s: %s\n",
+                csvpath, strerror(errno));
+        return 1;
+    }
+    fprintf(csv,
+            "rate_hz,bw_hz,M,source_ch,noise_sigma_lsb,input_snr_db,tone_amp_dbfs,"
+            "input_noise_dbfs,target_noise_only_dbfs,target_tone_noise_dbfs,"
+            "output_snr_db,processing_gain_db,expected_gain_db,gain_residual_db,"
+            "median_offbin_noise_dbfs,worst_offbin_noise_dbfs,clip_fraction\n");
+
+    fprintf(stderr,
+            "selftest-rejection-procgain: region=%s center=%.3f MHz rate=%u sps\n"
+            "selftest-rejection-procgain: noise sigmas (LSB): ", r->name, f_center / 1e6, fs);
+    for (int s = 0; s < n_sigmas; ++s) fprintf(stderr, "%.1f%s", noise_sigmas_lsb[s], s + 1 < n_sigmas ? ", " : "");
+    fprintf(stderr, "\nselftest-rejection-procgain: input full-band SNRs (dB): ");
+    for (int s = 0; s < n_snrs; ++s) fprintf(stderr, "%+.1f%s", input_snrs_db[s], s + 1 < n_snrs ? ", " : "");
+    fprintf(stderr, "\nselftest-rejection-procgain: writing %s\n", csvpath);
+
+    double rf_lo = (double)f_center - 0.5 * (double)fs;
+    double rf_hi = (double)f_center + 0.5 * (double)fs;
+
+    /* Track per-BW median gain residual for the summary. */
+    typedef struct { int bw; int M; int n_meas; double sum_gain; double sum_residual;
+                     double worst_residual; int worst_snr_idx; int worst_sigma_idx; } bw_summary_t;
+    bw_summary_t *bws = calloc((size_t)n_bw, sizeof(*bws));
+    if (!bws) { fclose(csv); return 1; }
+    for (int g = 0; g < n_bw; ++g) { bws[g].bw = bw_set[g]; }
+
+    double max_clip = 0.0;
+    g_procgain_rng_state = 0x243f6a8885a308d3ULL;  /* reset for determinism */
+
+    for (int g = 0; g < n_bw; ++g) {
+        int bw_hz = bw_set[g];
+        if (fs % (uint32_t)bw_hz != 0) continue;
+        int n_slots = mesh_channel_count(r, bw_hz);
+        int *fit = malloc(sizeof(int) * (size_t)(n_slots > 0 ? n_slots : 1));
+        if (!fit) { fclose(csv); free(bws); return 1; }
+        int n_fit = 0;
+        for (int s = 0; s < n_slots; ++s) {
+            double f = (double)mesh_channel_freq_hz(r, bw_hz, s);
+            if (f >= rf_lo && f <= rf_hi) fit[n_fit++] = s;
+        }
+        if (n_fit < 2) { free(fit); continue; }
+        int M = (int)(fs / (uint32_t)bw_hz);
+        bws[g].M = M;
+        double expected_gain_db = 10.0 * log10((double)M);
+
+        int src_idx  = n_fit / 2;
+        int src_slot = fit[src_idx];
+        uint64_t f_tone = mesh_channel_freq_hz(r, bw_hz, src_slot);
+
+        fprintf(stderr,
+                "selftest-rejection-procgain:  BW=%d kHz  M=%d  10*log10(M)=%.2f dB  source=slot%d\n",
+                bw_hz / 1000, M, expected_gain_db, src_slot);
+
+        double *powers = malloc(sizeof(double) * (size_t)n_fit);
+        if (!powers) { free(fit); fclose(csv); free(bws); return 1; }
+
+        for (int si = 0; si < n_sigmas; ++si) {
+            double sigma_lsb = noise_sigmas_lsb[si];
+
+            /* Noise-only run for this sigma. Used as the target-bin noise
+             * reference for every (SNR) at this sigma. */
+            double clipfrac_noise = 0.0;
+            if (procgain_run_once(f_center, fs, bw_hz, n_fit, fit,
+                                   f_tone, 0.0, sigma_lsb,
+                                   powers, &clipfrac_noise) < 0) {
+                free(powers); free(fit); fclose(csv); free(bws); return 1;
+            }
+            double target_noise_only = powers[src_idx];
+
+            /* Median + worst off-bin noise diagnostics. */
+            double *off = malloc(sizeof(double) * (size_t)(n_fit - 1));
+            int n_off = 0;
+            for (int k = 0; k < n_fit; ++k) if (k != src_idx) off[n_off++] = powers[k];
+            qsort(off, (size_t)n_off, sizeof(double), double_cmp);
+            double median_offbin = off[n_off / 2];
+            double worst_offbin  = off[n_off - 1];
+            free(off);
+
+            /* Analytic noise power on input: complex AWGN with per-component
+             * sigma (in LSB units), scaled by 1/127 by the cs8 ingest path
+             * before the channelizer sees it. E[|x|^2] = 2*(sigma/127)^2. */
+            double sigma_float = sigma_lsb / 127.0;
+            double input_noise_pw = 2.0 * sigma_float * sigma_float;
+            double input_noise_dbfs = 10.0 * log10(input_noise_pw);
+
+            for (int sni = 0; sni < n_snrs; ++sni) {
+                double snr_db = input_snrs_db[sni];
+
+                /* Tone power needed for this full-band SNR vs the noise power.
+                 * CW with peak amplitude A on each of I and Q (cos/sin) has
+                 * E[|x|^2] = A^2; in LSB units, A^2_lsb. So tone_amp_lsb
+                 * follows from: 10*log10(A^2 / input_noise_pw) = snr_db. */
+                double tone_pw_float = input_noise_pw * pow(10.0, snr_db / 10.0);
+                double tone_amp_float = sqrt(tone_pw_float);
+                double tone_amp_lsb = tone_amp_float * 127.0;
+                double tone_amp_dbfs = 10.0 * log10(tone_pw_float);
+
+                /* Skip if combined would clip too often. Rough budget:
+                 * tone peak excursion ±A, noise 3-sigma ±3*sigma. */
+                double peak = tone_amp_lsb + 3.0 * sigma_lsb;
+                if (peak > 124.0) {
+                    fprintf(stderr,
+                            "  sigma=%.1f LSB  in_SNR=%+.1f dB:  SKIP (would clip; peak ≈ %.0f LSB)\n",
+                            sigma_lsb, snr_db, peak);
+                    continue;
+                }
+
+                double clipfrac_run = 0.0;
+                if (procgain_run_once(f_center, fs, bw_hz, n_fit, fit,
+                                       f_tone, tone_amp_lsb, sigma_lsb,
+                                       powers, &clipfrac_run) < 0) {
+                    free(powers); free(fit); fclose(csv); free(bws); return 1;
+                }
+                if (clipfrac_run > max_clip) max_clip = clipfrac_run;
+                double target_tone_noise = powers[src_idx];
+
+                /* Output signal power = excess over noise-only.
+                 * powers are in dB; convert to linear before subtracting. */
+                double tn_lin = pow(10.0, target_tone_noise / 10.0);
+                double no_lin = pow(10.0, target_noise_only / 10.0);
+                double sig_lin = tn_lin - no_lin;
+                if (sig_lin < 1e-30) sig_lin = 1e-30;
+                double output_snr_db = 10.0 * log10(sig_lin / no_lin);
+                double proc_gain = output_snr_db - snr_db;
+                double residual  = proc_gain - expected_gain_db;
+
+                fprintf(csv,
+                        "%u,%d,%d,%d,%.3f,%+.3f,%+.3f,%+.3f,%+.3f,%+.3f,%+.3f,%+.3f,%+.3f,%+.3f,%+.3f,%+.3f,%.5f\n",
+                        fs, bw_hz, M, src_slot, sigma_lsb, snr_db, tone_amp_dbfs,
+                        input_noise_dbfs, target_noise_only, target_tone_noise,
+                        output_snr_db, proc_gain, expected_gain_db, residual,
+                        median_offbin, worst_offbin, clipfrac_run);
+
+                int first = (bws[g].n_meas == 0);
+                bws[g].n_meas++;
+                bws[g].sum_gain     += proc_gain;
+                bws[g].sum_residual += residual;
+                if (first || fabs(residual) > fabs(bws[g].worst_residual)) {
+                    bws[g].worst_residual = residual;
+                    bws[g].worst_snr_idx = sni;
+                    bws[g].worst_sigma_idx = si;
+                }
+
+                fprintf(stderr,
+                        "  sigma=%.1f LSB  in_SNR=%+5.1f dB  out_SNR=%+6.2f dB  gain=%+5.2f dB  resid=%+5.2f dB\n",
+                        sigma_lsb, snr_db, output_snr_db, proc_gain, residual);
+            }
+        }
+        free(powers);
+        free(fit);
+    }
+    fclose(csv);
+
+    fprintf(stderr,
+            "selftest-rejection-procgain: summary (mean processing gain vs 10*log10(M)):\n");
+    for (int g = 0; g < n_bw; ++g) {
+        if (bws[g].n_meas == 0) continue;
+        double mean_gain = bws[g].sum_gain     / (double)bws[g].n_meas;
+        double mean_res  = bws[g].sum_residual / (double)bws[g].n_meas;
+        double expected  = 10.0 * log10((double)bws[g].M);
+        fprintf(stderr,
+                "  BW=%4d kHz M=%-3d  expected %5.2f dB  measured mean %5.2f dB  residual mean %+5.2f dB  worst %+5.2f dB\n",
+                bws[g].bw / 1000, bws[g].M, expected, mean_gain, mean_res, bws[g].worst_residual);
+    }
+    fprintf(stderr, "selftest-rejection-procgain: max clip fraction observed = %.5f\n", max_clip);
+    fprintf(stderr,
+            "selftest-rejection-procgain: note: sigma=0.5 LSB rows are below the cs8 quantization\n"
+            "  step and have unreliable noise statistics; sigma >= 1.0 LSB rows show the\n"
+            "  stable measurement. Residuals < ~2 dB are within window-ENBW expectations.\n");
+    fprintf(stderr, "selftest-rejection-procgain: CSV: %s\n", csvpath);
+    free(bws);
+    return 0;
+}
+
 /* ---- AES + multi-key + protobuf end-to-end self-test ---- */
 
 typedef struct {
@@ -2322,7 +2648,7 @@ int main(int argc, char **argv)
 
     int rc = options_parse(argc, argv);
     if (rc == 1) return 0;        /* --help */
-    if (rc >= 2 && rc != 100 && rc != 101 && rc != 102 && rc != 103 && rc != 104) return rc;
+    if (rc >= 2 && rc != 100 && rc != 101 && rc != 102 && rc != 103 && rc != 104 && rc != 105) return rc;
 
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
@@ -2352,6 +2678,10 @@ int main(int argc, char **argv)
     if (rc == 104) {              /* --selftest-rejection-offbin */
         extern int run_selftest_rejection_offbin(void);
         return run_selftest_rejection_offbin();
+    }
+    if (rc == 105) {              /* --selftest-rejection-procgain */
+        extern int run_selftest_rejection_procgain(void);
+        return run_selftest_rejection_procgain();
     }
 
     fprintf(stderr,
