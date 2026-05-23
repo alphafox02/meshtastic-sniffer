@@ -15,6 +15,7 @@ Sister project to [iridium-sniffer](https://github.com/alphafox02/iridium-sniffe
 ## Features
 
 - Polyphase filterbank channelizer (AVX2/SSE4.2/NEON SIMD), one wide IQ stream into N parallel per-channel basebands at `Fs/M` each
+- Async DSP pipeline: SDR recv decoupled from channelizer by a sample-pump queue, per-channel LoRa demod dispatched to a sharded worker pool — keeps high-rate captures (USRP B205mini at 26 Msps, all 9 presets, 1024 concurrent channels) overflow-free on commodity 16-core hosts
 - All 26 Meshtastic regions selectable per run via `--region=`: US (902–928), EU_868, EU_433, CN, JP, ANZ, KR, TW, RU, IN, NZ_865, TH, UA_433, UA_868, MY_433, MY_919, SG_923, KZ_433, KZ_863, NP_865, BR_902, PH_433/868/915, LORA_24. **One region per binary invocation** — Meshtastic regions span 433 MHz to 2.4 GHz, well beyond any commodity SDR's instantaneous bandwidth, so multi-region monitoring is run as multiple sniffer instances on different SDRs, aggregated by `meshtastic-fusion`.
 - All 9 standard presets: ShortTurbo, ShortFast, ShortSlow, MediumFast, MediumSlow, LongFast, LongMod, LongSlow, LongTurbo
 - Multi-key AES-128 / AES-256-CTR with 1-byte channel-hash routing — adding more keys does not slow per-packet decode (steady state: 1 AES op per packet)
@@ -191,7 +192,7 @@ The number of channels the sniffer demodulates simultaneously is set by the SDR'
 |---|---|---|---|
 | HackRF One | 20 MHz | ~73-80 US LongFast slots + every other preset's grid that fits | Most common config. Full coverage in EU_868 / EU_433 / most non-US regions. |
 | BladeRF 2.0 | up to 56 MHz (AD9361) | All 104 US LongFast slots at ~26 Msps | Full US ISM coverage; headroom for adjacent-band scanning. |
-| USRP B210 | up to 56 MHz (AD9361) | All 104 US LongFast slots at ~26 Msps | UHD-driven; same headroom. |
+| USRP B205mini / B210 | up to 56 MHz (AD9361) | **All 9 presets, 1024 channels, full US 902-928 MHz at 26 Msps** | UHD-driven; pass `--usrp-otw=sc8` for sustained 26 Msps (see *USRP tuning notes* below). |
 | SDRplay (RSPdx, RSP1A) | 10 MHz | One BW group + adjacent presets | Native API v3. |
 | Airspy R2 / Mini | 10 MHz | One BW group + adjacent presets | |
 | RTL-SDR (R820T) | 2.0 MHz | One BW group, ~8 LongFast slots | Cheap entry point. Default rate is 2.0 Msps (multiple of 250 kHz BW); higher rates can desense the R820T tuner. |
@@ -215,6 +216,22 @@ The single `--gain=DB` knob maps across HackRF's three independent stages, with 
 - Knock LNA back: `--hackrf-lna=8` for close-range bench testing
 
 Distant signals decode cleanly even with a close node hammering the front end. `payload_crc_ok` is the diagnostic.
+
+### USRP tuning notes (B205mini / B210)
+
+Default UHD wire format is `sc16` (4 bytes/sample). At 26 Msps that's 104 MB/s over USB plus the host-side sc16→fc32 conversion UHD performs in the recv path. On a 16-core host that load occasionally pushes UHD's recv FIFO past its overflow threshold (`OOO` in stderr) — the channelizer can keep up, but `uhd_rx_streamer_recv()` falls behind for short bursts.
+
+**Use `--usrp-otw=sc8` for sustained 26 Msps.** sc8 halves both USB bandwidth (52 MB/s) and UHD's internal conversion work. The 4 LSBs of dynamic range are not visible to LoRa decoding — chirp demodulation is phase-based and routinely tolerates >20 dB of noise margin, so dropping the bottom 24 dB of headroom changes nothing in practice. HackRF runs 8-bit at the ADC by default; sc8 brings the B-series to the same precision floor.
+
+```bash
+./meshtastic-sniffer --usrp --rate=26000000 --center=915000000 \
+                    --region=US --presets=all --keys=default \
+                    --usrp-otw=sc8 --gain=40 --web=8888
+```
+
+Validated end-to-end: **stable 26.02-26.03 Msps with `--presets=all`, zero `OOO`, all 1024 channels live.**
+
+If you still see `OOO` after enabling sc8, the sample-pump queue depth knob is `MESHTASTIC_SAMPLE_QUEUE=N` (default 256). Bumping higher gives UHD more recv slack at the cost of slightly higher peak memory.
 
 ## Outputs
 
@@ -269,6 +286,24 @@ Every 5 seconds the binary prints a one-line summary to stderr:
 ```
 
 `off-grid hits` is appended only when the scanner is enabled (`--scan*` or `--alert-off-grid`).
+
+### Pipeline diagnostics
+
+Set `MESHTASTIC_PFB_STATS=1` to dump async-pipeline counters to stderr at shutdown:
+
+```
+sample-pump:    submitted=147624 processed=147624 queue_waits=14841
+pfb sink pool:  submitted=5113024 completed=5113024 queue_bp=0 freebuf_waits=0
+```
+
+What to look for:
+
+- **`submitted == processed`** (sample-pump) and **`submitted == completed`** (sink pool): clean drain, every sample reached the demod
+- **`queue_waits`** (sample-pump): producer blocked on a full queue. Non-zero is fine; means the recv side burst faster than DSP for a moment and the queue absorbed it. Sustained high values suggest you need a larger `MESHTASTIC_SAMPLE_QUEUE=N` (default 256)
+- **`queue_bp`** (sink pool): per-worker queue ran full. Should be zero in normal operation
+- **`freebuf_waits`** (sink pool): channelizer waited for a LoRa worker to free a buffer. Non-zero means a worker fell behind sample rate — usually a slow CPU or too many channels for the host
+
+Worker count defaults to `min(nproc-1, 16)`; override with `MESHTASTIC_SINK_WORKERS=N`.
 
 ## Offline PSK recovery
 
