@@ -161,7 +161,7 @@ Processing-gain / dynamic-range sweep (`--selftest-rejection-procgain`, AWGN add
 | 250 |  80 | 19.03 | 20.12 | +1.09 |
 | 125 | 160 | 22.04 | 23.14 | +1.10 |
 
-Per-bin output SNR exceeds input full-band SNR by `10·log10(M)` plus a consistent ~+1 dB offset across all three BW groups. The offset is attributable to the Hamming-windowed sinc prototype's equivalent-noise bandwidth — a real but small filter property, not a bug. Sigma=0.5 LSB rows in the CSV are below the cs8 quantization step and have unreliable statistics; sigma ≥ 1.0 LSB rows give the stable measurement.
+Per-bin output SNR exceeds input full-band SNR by `10·log10(M)` plus a consistent ~+1 dB offset across all three BW groups. That small residual is consistent with the prototype filter's actual bin/noise bandwidth and normalization, but has not been analytically subtracted from the measurement. Sigma=0.5 LSB rows in the CSV are below the cs8 quantization step and have unreliable statistics; sigma ≥ 1.0 LSB rows give the stable measurement.
 
 ### Async sink dispatch
 

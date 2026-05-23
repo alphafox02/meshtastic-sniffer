@@ -7,8 +7,7 @@
  * Replaces the old per-channel cascade DDC with one polyphase filterbank
  * per unique channel BW. The PFB processes the SDR stream once at full
  * rate and produces M = SDR_rate / BW critically-sampled outputs in
- * parallel, with adjacent channels isolated by the prototype filter
- * (Hamming-windowed sinc, ~-43 dB sidelobes).
+ * parallel, with adjacent channels isolated by the prototype filter.
  *
  * For Meshtastic on the US ISM band at 20 Msps:
  *   500 kHz BW -> M=40, supports SHORT_TURBO + LONG_TURBO
@@ -46,8 +45,8 @@
 
 #define MAX_PFB_GROUPS    8     /* one PFB per unique BW; far more than the
                                  * 3 BWs Meshtastic uses, leaves headroom. */
-#define PFB_TAPS_PER_BR   12    /* L taps per polyphase branch. 12 gives
-                                 * ~-43 dB worst-case adjacent leakage. */
+#define PFB_TAPS_PER_BR   12    /* L taps per polyphase branch. End-to-end
+                                 * ACR is measured by --selftest-rejection. */
 
 /* PFB pre-shift policy: pre-shift = (first_channel_freq - sdr_center).
  * That puts the first channel registered for this BW on bin 0; every
