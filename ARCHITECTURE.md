@@ -107,15 +107,26 @@ Build is warning-free with `-Wall -Wextra -Werror=implicit-function-declaration`
 
 ## Polyphase channelizer
 
-The channelizer in `pfb.c` is a textbook critically-sampled decimator-by-M PFB:
+`pfb.c` implements a critically-sampled decimator-by-M polyphase filterbank. One PFB is created per unique LoRa bandwidth (500 / 250 / 125 kHz on US `--presets=all`), so the wide IQ stream is filtered once per bandwidth and split into FFT bins that feed the per-channel LoRa decoders.
 
-1. Design a prototype lowpass `h[0..L*M-1]` with cutoff `1/(2M)` (Hamming-windowed sinc, L = 12 typical, ~-43 dB sidelobes)
-2. Decompose into M branches: `h_p[i][k] = h[k*M + i]`
-3. Per cycle of M input samples: forward commutator distributes across branches, each branch FIRs against its polyphase row, then a single M-point FFT produces all M output bins at `Fs/M` rate
+At a high level:
 
-Per-input-sample cost is `O(L + log M)` ops, vs `O(M)` for the per-channel-cascade DDC alternative. At M=80, that's ~7 ops/sample vs 80 -- the source of the wideband throughput. AVX2 SIMD on the FIR + OpenMP parallel-for over PFB groups (one per `(bw_hz, os_factor)` combination) lets the binary process 30+ Msps real-time on a single i7 core.
+1. Build a Hamming-windowed sinc prototype lowpass (length `L*M`, cutoff `1/(2M)`, L=12 by default — roughly -40 dB-class sidelobe suppression from the window)
+2. Decompose into M polyphase branches: `h_p[i][k] = h[k*M + i]`
+3. Per cycle of M input samples: forward commutator distributes across branches, each branch FIRs against its polyphase row, then one M-point FFT produces all M output bins at `Fs/M` rate
+4. Dispatch each output bin to its registered sinks (the per-channel LoRa decoders)
 
-Channels are bound to PFB output bins via `pfb_register_bin` -- multiple decoders may bind to the same bin (a bin's callback list is a tiny linked list). The pre-shift NCO multiplies input by `exp(-j*2*pi*pre_shift_hz/Fs * n)` so the FFT's bin-0 lines up exactly with the configured channel grid.
+This replaces a per-channel-cascade DDC approach. The structural win: filtering cost scales with the number of unique bandwidths, not with every configured Meshtastic channel. The inner FIR is `L` complex MACs per branch per output cycle, plus the M-point FFT — qualitatively much cheaper than running an independent DDC per channel.
+
+The reverse-ring delay layout in `pfb_t.dly` (each branch's window stored newest-to-oldest, duplicated) keeps the dot product contiguous so the compiler can auto-vectorise it under `-march=native`. There is no hand-written AVX2 polyphase kernel today; the cost reduction is mostly architectural, not SIMD.
+
+Channels are bound to PFB output bins via `pfb_register_bin` — multiple decoders may bind to the same bin (a bin's callback list is a tiny linked list). The pre-shift NCO multiplies input by `exp(-j*2*pi*pre_shift_hz/Fs * n)` so the FFT's bin 0 lines up exactly with the configured channel grid.
+
+### Async sink dispatch
+
+The PFB writes FFT outputs into per-sink ring buffers (`SINK_RING_N = 4`, 1024 samples each). When a buffer fills, ownership passes to a worker in a shared pool sharded by `channel_id % n_workers` (default `min(nproc-1, 16)`). Each LoRa decoder is touched by exactly one worker, so per-channel state stays single-threaded without locks. The PFB thread blocks on a full free pool rather than dropping samples; this is the only backpressure path in the pipeline.
+
+Combined with the sample-pump queue between the SDR recv thread and the channelizer thread (see *Live throughput* below), this keeps `lora_decoder_feed` off the channelizer hot path entirely.
 
 ## PFB bin-leakage dedup
 
@@ -213,7 +224,7 @@ What's verified:
 - **STATS SSE event**: arrives at the dashboard within one heartbeat
 - **AddressSanitizer + UndefinedBehaviorSanitizer**: zero findings on the smoke-test suite (selftest, file replay, web API hits, key adds)
 - **ThreadSanitizer**: zero data races under concurrent `/api/keys` POSTs hitting while the demod thread is in `keyset_lookup`
-- **Polyphase channelizer throughput**: 30+ Msps sustained on a single i7 core, with the full US `--presets=all` grid (409 channels at 20 MHz HackRF: 41 LongFast + 41 each of ShortFast/Slow/MediumFast/Slow + 81 each of LongModerate/LongSlow + 21 each of ShortTurbo/LongTurbo)
+- **Live throughput**: sustained 26.02-26.03 Msps on a USRP B205mini at `--presets=all` (1024 concurrent channels covering full US 902-928 MHz: 52 ShortTurbo + 104 each of ShortFast/Slow/MediumFast/Slow/LongFast + 208 each of LongModerate/LongSlow + 36 LongTurbo), zero `OOO` overflows, on a 16-core host. Requires `--usrp-otw=sc8` for B-series; without it the host carries the sc16→fc32 conversion and the recv thread occasionally falls behind. File-replay A/B harness (`tests/ab_replay.sh`) on a 4 GB lf.cs8 capture matches an 8-frame CRC-pass set bit-for-bit across runs.
 
 Known runtime concerns deliberately not blocked-on:
 
