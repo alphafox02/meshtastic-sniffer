@@ -205,10 +205,15 @@ input_thread:
   calls push_samples() in this thread.
 
 push_samples() (called from input_thread, not its own thread):
+  -- enqueue sample_buf_t into the sample-pump queue and return quickly
+
+sample-pump thread:
+  -- dequeue sample_buf_t and run the original DSP path:
   -- channelizer_process_int8/float
        -> pfb_process per group (parallel-for if multiple groups)
-            -> per-bin sink callbacks -> on_channel_baseband
-                 -> lora_decoder_feed -> state machine -> on_lora_frame
+            -> per-bin sink buffers submitted to sharded PFB workers
+                 -> on_channel_baseband -> lora_decoder_feed
+                 -> state machine -> on_lora_frame
                       -> dedup ring insert (under g_dedup_mu)
   -- scanner_feed_int8/float -> wideband FFT -> peakfind -> on_off_grid_discovery
 
@@ -265,7 +270,7 @@ What's verified:
 - **STATS SSE event**: arrives at the dashboard within one heartbeat
 - **AddressSanitizer + UndefinedBehaviorSanitizer**: zero findings on the smoke-test suite (selftest, file replay, web API hits, key adds)
 - **ThreadSanitizer**: zero data races under concurrent `/api/keys` POSTs hitting while the demod thread is in `keyset_lookup`
-- **Live throughput**: sustained 26.02-26.03 Msps on a USRP B205mini at `--presets=all` (1024 concurrent channels covering full US 902-928 MHz: 52 ShortTurbo + 104 each of ShortFast/Slow/MediumFast/Slow/LongFast + 208 each of LongModerate/LongSlow + 36 LongTurbo), zero `OOO` overflows, on a 16-core host. Requires `--usrp-otw=sc8` for B-series; without it the host carries the sc16→fc32 conversion and the recv thread occasionally falls behind. File-replay A/B harness (`tests/ab_replay.sh`) on a 4 GB lf.cs8 capture matches an 8-frame CRC-pass set bit-for-bit across runs.
+- **Live throughput**: short B205mini validation runs reached 26.02-26.03 Msps at `--presets=all` (1024 concurrent channels covering full US 902-928 MHz: 52 ShortTurbo + 104 each of ShortFast/Slow/MediumFast/Slow/LongFast + 208 each of LongModerate/LongSlow + 36 LongTurbo), zero `OOO` overflows, on a 16-core host with `--usrp-otw=sc8`. A later 7.8-hour soak was stable with clean worker/pump drains and no memory/FD/thread leak, but averaged 22.72 Msps with a steady trickle of UHD overflows; the remaining long-run bottleneck is sustained DSP throughput. File-replay A/B harness (`tests/ab_replay.sh`) on a 4 GB lf.cs8 capture matches an 8-frame CRC-pass set bit-for-bit across runs.
 
 Known runtime concerns deliberately not blocked-on:
 

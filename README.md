@@ -15,7 +15,7 @@ Sister project to [iridium-sniffer](https://github.com/alphafox02/iridium-sniffe
 ## Features
 
 - Polyphase filterbank channelizer (AVX2/SSE4.2/NEON SIMD), one wide IQ stream into N parallel per-channel basebands at `Fs/M` each
-- Async DSP pipeline: SDR recv decoupled from channelizer by a sample-pump queue, per-channel LoRa demod dispatched to a sharded worker pool — keeps high-rate captures (USRP B205mini at 26 Msps, all 9 presets, 1024 concurrent channels) overflow-free on commodity 16-core hosts
+- Async DSP pipeline: SDR recv decoupled from channelizer by a sample-pump queue, per-channel LoRa demod dispatched to a sharded worker pool; short B205mini runs can hit 26 Msps with all 1024 US preset channels, while long soaks expose the remaining DSP headroom honestly
 - All 26 Meshtastic regions selectable per run via `--region=`: US (902–928), EU_868, EU_433, CN, JP, ANZ, KR, TW, RU, IN, NZ_865, TH, UA_433, UA_868, MY_433, MY_919, SG_923, KZ_433, KZ_863, NP_865, BR_902, PH_433/868/915, LORA_24. **One region per binary invocation** — Meshtastic regions span 433 MHz to 2.4 GHz, well beyond any commodity SDR's instantaneous bandwidth, so multi-region monitoring is run as multiple sniffer instances on different SDRs, aggregated by `meshtastic-fusion`.
 - All 9 standard presets: ShortTurbo, ShortFast, ShortSlow, MediumFast, MediumSlow, LongFast, LongMod, LongSlow, LongTurbo
 - Multi-key AES-128 / AES-256-CTR with 1-byte channel-hash routing — adding more keys does not slow per-packet decode (steady state: 1 AES op per packet)
@@ -229,9 +229,9 @@ Default UHD wire format is `sc16` (4 bytes/sample). At 26 Msps that's 104 MB/s o
                     --usrp-otw=sc8 --gain=40 --web=8888
 ```
 
-Validated end-to-end: **stable 26.02-26.03 Msps with `--presets=all`, zero `OOO`, all 1024 channels live.**
+Short validation run: **26.02-26.03 Msps with `--presets=all`, zero `OOO`, all 1024 channels live.** A later 7.8-hour soak stayed stable with clean drains and no leak, but averaged **22.72 Msps** with a steady trickle of UHD overflows; the remaining long-run bottleneck is downstream DSP throughput, not worker-pool correctness.
 
-If you still see `OOO` after enabling sc8, the sample-pump queue depth knob is `MESHTASTIC_SAMPLE_QUEUE=N` (default 256). Bumping higher gives UHD more recv slack at the cost of slightly higher peak memory.
+If you still see occasional bursty `OOO` after enabling sc8, the sample-pump queue depth knob is `MESHTASTIC_SAMPLE_QUEUE=N` (default 256). Bumping higher gives UHD more recv slack at the cost of slightly higher peak memory. If `queue_waits` stays high over a long run, the issue is sustained DSP throughput rather than queue depth.
 
 ## Outputs
 
@@ -261,7 +261,7 @@ Equivalent endpoints at `POST /api/keys`, `POST /api/share-url`, `POST /api/extr
 **Per-frame fields:** `from`, `to`, `packet_id`, `channel_hash` (1-byte routing hash from the radio header), optional `slot_id` (which polyphase channelizer slot caught the frame), `hop_limit`/`hop_start`, `rssi_db`/`snr_db`.
 
 **Quality telemetry — silent when healthy, present when actionable:**
-- `payload_crc_ok: false` — CRC was present and failed (frame bytes are corrupt; absence implies CRC passed)
+- `payload_crc_ok: false` — CRC was present and failed (frame bytes are corrupt; absence means no explicit CRC failure was reported: CRC passed, or no CRC was present on the wire)
 - `cfo_hz` — only when |drift| > 100 Hz (radio is well-tuned otherwise)
 
 **Multilateration timing:** `station_t_ns` (host-realtime ns at first-replica receive) + `station_t_acc_ns` (operator-self-reported clock-discipline class). Set `--station-t-acc-ns=N` per station: 100 for GPSDO+1PPS, 1000 for chrony+PPS, 1000000 (default) for NTP-class. The fusion-side mlat solver weights observations by this value.
