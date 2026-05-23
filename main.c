@@ -1362,8 +1362,16 @@ int run_selftest_rejection(void)
             best.acr,   best.bw / 1000,   best.src,   best.leak,
             mean, csvpath);
 
+    /* CI gate: worst ACR must stay >= 40 dB. Intentionally loose; measured
+     * is ~50 dB so 40 dB catches a real regression without firing on
+     * normal measurement noise. */
+    const double acr_floor_db = 40.0;
+    int gate_failed = (worst.acr < acr_floor_db);
+    fprintf(stderr, "selftest-rejection: regression gate (worst ACR >= %.0f dB): %s\n",
+            acr_floor_db, gate_failed ? "FAIL" : "PASS");
+
     free(records);
-    return 0;
+    return gate_failed ? 1 : 0;
 }
 
 /* ---- Channelizer ACR vs source amplitude sweep ------------------------
@@ -2229,14 +2237,21 @@ int run_selftest_rejection_procgain(void)
                         output_snr_db, proc_gain, expected_gain_db, residual,
                         median_offbin, worst_offbin, clipfrac_run);
 
-                int first = (bws[g].n_meas == 0);
-                bws[g].n_meas++;
-                bws[g].sum_gain     += proc_gain;
-                bws[g].sum_residual += residual;
-                if (first || fabs(residual) > fabs(bws[g].worst_residual)) {
-                    bws[g].worst_residual = residual;
-                    bws[g].worst_snr_idx = sni;
-                    bws[g].worst_sigma_idx = si;
+                /* Accumulate only sigma >= 1 LSB rows for the CI gate;
+                 * sigma=0.5 LSB is below the cs8 quantization step and
+                 * has unreliable noise statistics. The sigma<1 rows still
+                 * print to stderr and land in the CSV. */
+                int gate_eligible = (sigma_lsb >= 1.0);
+                if (gate_eligible) {
+                    int first = (bws[g].n_meas == 0);
+                    bws[g].n_meas++;
+                    bws[g].sum_gain     += proc_gain;
+                    bws[g].sum_residual += residual;
+                    if (first || fabs(residual) > fabs(bws[g].worst_residual)) {
+                        bws[g].worst_residual = residual;
+                        bws[g].worst_snr_idx = sni;
+                        bws[g].worst_sigma_idx = si;
+                    }
                 }
 
                 fprintf(stderr,
@@ -2263,11 +2278,31 @@ int run_selftest_rejection_procgain(void)
     fprintf(stderr, "selftest-rejection-procgain: max clip fraction observed = %.5f\n", max_clip);
     fprintf(stderr,
             "selftest-rejection-procgain: note: sigma=0.5 LSB rows are below the cs8 quantization\n"
-            "  step and have unreliable noise statistics; sigma >= 1.0 LSB rows show the\n"
-            "  stable measurement. Residuals < ~2 dB are within window-ENBW expectations.\n");
+            "  step and excluded from the regression gate; sigma >= 1.0 LSB rows show the\n"
+            "  stable measurement and feed the gate below.\n");
     fprintf(stderr, "selftest-rejection-procgain: CSV: %s\n", csvpath);
+
+    /* CI gate: per-BW mean processing-gain residual (sigma >= 1 LSB only)
+     * must stay within +/- 4 dB of 10*log10(M). Measured is ~+1 dB across
+     * all three BW groups; 4 dB catches a structural break without firing
+     * on measurement noise or the small window-related residual we already
+     * understand. */
+    const double residual_window_db = 4.0;
+    int gate_failed = 0;
+    for (int g = 0; g < n_bw; ++g) {
+        if (bws[g].n_meas == 0) continue;
+        double mean_res = bws[g].sum_residual / (double)bws[g].n_meas;
+        if (fabs(mean_res) > residual_window_db) {
+            fprintf(stderr,
+                    "selftest-rejection-procgain: GATE FAIL  BW=%d kHz  mean residual %+.2f dB outside +/-%.1f dB\n",
+                    bws[g].bw / 1000, mean_res, residual_window_db);
+            gate_failed = 1;
+        }
+    }
+    fprintf(stderr, "selftest-rejection-procgain: regression gate (per-BW mean residual within +/-%.0f dB): %s\n",
+            residual_window_db, gate_failed ? "FAIL" : "PASS");
     free(bws);
-    return 0;
+    return gate_failed ? 1 : 0;
 }
 
 /* ---- AES + multi-key + protobuf end-to-end self-test ---- */
