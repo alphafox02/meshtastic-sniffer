@@ -111,7 +111,7 @@ Build is warning-free with `-Wall -Wextra -Werror=implicit-function-declaration`
 
 At a high level:
 
-1. Build a Hamming-windowed sinc prototype lowpass (length `L*M`, cutoff `1/(2M)`, L=12 by default — roughly -40 dB-class sidelobe suppression from the window)
+1. Build a Hamming-windowed sinc prototype lowpass (length `L*M`, cutoff `1/(2M)`, L=12 by default)
 2. Decompose into M polyphase branches: `h_p[i][k] = h[k*M + i]`
 3. Per cycle of M input samples: forward commutator distributes across branches, each branch FIRs against its polyphase row, then one M-point FFT produces all M output bins at `Fs/M` rate
 4. Dispatch each output bin to its registered sinks (the per-channel LoRa decoders)
@@ -121,6 +121,21 @@ This replaces a per-channel-cascade DDC approach. The structural win: filtering 
 The reverse-ring delay layout in `pfb_t.dly` (each branch's window stored newest-to-oldest, duplicated) keeps the dot product contiguous so the compiler can auto-vectorise it under `-march=native`. There is no hand-written AVX2 polyphase kernel today; the cost reduction is mostly architectural, not SIMD.
 
 Channels are bound to PFB output bins via `pfb_register_bin` — multiple decoders may bind to the same bin (a bin's callback list is a tiny linked list). The pre-shift NCO multiplies input by `exp(-j*2*pi*pre_shift_hz/Fs * n)` so the FFT's bin 0 lines up exactly with the configured channel grid.
+
+### Measured adjacent-channel rejection
+
+Sweeping a CW tone across every grid slot in each US bandwidth group (`--selftest-rejection`, 20 Msps, 33,320 source/leak pairs across 125/250/500 kHz groups) yields:
+
+| metric | dB | location |
+|---|---|---|
+| worst   | 49.94  | 250 kHz, source slot 52, leak slot 50 |
+| median  | 100.42 | 250 kHz, source slot 64, leak slot 45 |
+| best    | 134.63 | 125 kHz, source slot 141, leak slot 56 |
+| mean    | 92.66  | — |
+
+Reproduce: `./meshtastic-sniffer --selftest-rejection` (override `--region=` / `--rate=` / `--center=` to characterize a different grid). CSV written to `/tmp/meshtastic-pfb-rejection-<timestamp>.csv` with columns `rate_hz,bw_hz,source_ch,leak_ch,target_dbfs,leak_dbfs,acr_db,n_samples`.
+
+The 49.94 dB worst-case is the system's actual adjacent-channel floor — measured end-to-end through the cs8 ingest path, polyphase FIR, FFT, and bin dispatch — not an asymptotic window property. Real-world leakage will additionally include SDR front-end and quantization contributions outside the channelizer.
 
 ### Async sink dispatch
 

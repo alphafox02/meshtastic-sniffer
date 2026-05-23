@@ -38,6 +38,7 @@
 #include "web.h"
 
 #include <complex.h>
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -1142,6 +1143,229 @@ static int run_selftest(void)
     return 0;
 }
 
+/* ---- Channelizer adjacent-channel-rejection sweep ----------------------
+ *
+ * For each unique LoRa bandwidth in the configured region, sweep a CW
+ * tone across every channel grid slot that fits inside the SDR window,
+ * register a sink on every slot, and accumulate per-sink mean power.
+ * Reports each (source, leak) pair's absolute power + relative rejection
+ * to a CSV under /tmp and an aggregate worst/median/best summary to
+ * stderr. This is the bench-side answer to "how much does an in-band
+ * emitter leak into adjacent grid channels," replacing the window-
+ * function handwave that used to be in ARCHITECTURE.md.
+ *
+ * Float-IQ noise floor would be cleaner but the existing selftest path
+ * uses int8 + scale-100 CW because that exercises the same cs8 ingest
+ * we use on HackRF/B205 captures; staying consistent keeps the apples
+ * apples and surfaces any cs8-specific quantization in the same number.
+ */
+
+typedef struct { double acr; int bw; int src; int leak; } acr_record_t;
+
+static int acr_record_cmp(const void *a, const void *b)
+{
+    double da = ((const acr_record_t *)a)->acr;
+    double db = ((const acr_record_t *)b)->acr;
+    return (da < db) ? -1 : (da > db) ? 1 : 0;
+}
+
+int run_selftest_rejection(void)
+{
+    const char *region_name = opt_region ? opt_region : "US";
+    const mesh_region_t *r = mesh_lookup_region(region_name);
+    if (!r) {
+        fprintf(stderr, "selftest-rejection: unknown region '%s'\n", region_name);
+        return 1;
+    }
+    /* Default 20 Msps if --rate wasn't given; default center to region mid. */
+    uint32_t fs = samp_rate > 0.0 ? (uint32_t)samp_rate : 20000000u;
+    uint64_t f_center = center_freq > 0.0
+        ? (uint64_t)center_freq
+        : (uint64_t)((r->f_lo_mhz + r->f_hi_mhz) * 0.5 * 1e6);
+
+    /* Collect the unique bandwidths used by this region. */
+    int bw_set[8] = {0}; int n_bw = 0;
+    for (int p = 0; p < MESH_PRESET_COUNT; ++p) {
+        int bw = r->wide_lora ? MESH_PRESETS[p].bw_hz_wide
+                              : MESH_PRESETS[p].bw_hz_narrow;
+        int seen = 0;
+        for (int i = 0; i < n_bw; ++i) if (bw_set[i] == bw) { seen = 1; break; }
+        if (!seen && n_bw < (int)(sizeof(bw_set)/sizeof(bw_set[0])))
+            bw_set[n_bw++] = bw;
+    }
+    /* Sort smallest-to-largest just for readable output. */
+    for (int i = 0; i < n_bw; ++i)
+        for (int j = i + 1; j < n_bw; ++j)
+            if (bw_set[j] < bw_set[i]) { int t = bw_set[i]; bw_set[i] = bw_set[j]; bw_set[j] = t; }
+
+    /* Open output CSV under /tmp -- never under tests/results/, to keep the
+     * repo working tree clean across runs. */
+    char ts[32], csvpath[256];
+    time_t now = time(NULL); struct tm tmv; gmtime_r(&now, &tmv);
+    strftime(ts, sizeof(ts), "%Y%m%dT%H%M%SZ", &tmv);
+    snprintf(csvpath, sizeof(csvpath),
+             "/tmp/meshtastic-pfb-rejection-%s.csv", ts);
+    FILE *csv = fopen(csvpath, "w");
+    if (!csv) {
+        fprintf(stderr, "selftest-rejection: cannot open %s: %s\n",
+                csvpath, strerror(errno));
+        return 1;
+    }
+    fprintf(csv,
+            "rate_hz,bw_hz,source_ch,leak_ch,target_dbfs,leak_dbfs,acr_db,n_samples\n");
+
+    fprintf(stderr,
+            "selftest-rejection: region=%s center=%.3f MHz rate=%u sps\n"
+            "selftest-rejection: writing %s\n",
+            r->name, f_center / 1e6, fs, csvpath);
+
+    int total_records = 0, records_cap = 0;
+    acr_record_t *records = NULL;
+
+    double rf_lo = (double)f_center - 0.5 * (double)fs;
+    double rf_hi = (double)f_center + 0.5 * (double)fs;
+
+    for (int g = 0; g < n_bw; ++g) {
+        int bw_hz = bw_set[g];
+        if (fs % (uint32_t)bw_hz != 0) {
+            fprintf(stderr, "selftest-rejection:  BW=%d kHz skipped (rate %u not a multiple)\n",
+                    bw_hz / 1000, fs);
+            continue;
+        }
+        /* Which grid slots fit inside the SDR window? */
+        int n_slots = mesh_channel_count(r, bw_hz);
+        int *fit = malloc(sizeof(int) * (size_t)(n_slots > 0 ? n_slots : 1));
+        if (!fit) { fclose(csv); free(records); return 1; }
+        int n_fit = 0;
+        for (int s = 0; s < n_slots; ++s) {
+            double f = (double)mesh_channel_freq_hz(r, bw_hz, s);
+            if (f >= rf_lo && f <= rf_hi) fit[n_fit++] = s;
+        }
+        if (n_fit < 2) {
+            fprintf(stderr, "selftest-rejection:  BW=%d kHz has only %d slots in window; skipped\n",
+                    bw_hz / 1000, n_fit);
+            free(fit);
+            continue;
+        }
+        int M = (int)(fs / (uint32_t)bw_hz);
+        fprintf(stderr,
+                "selftest-rejection:  BW=%d kHz  M=%d  %d slots in window\n",
+                bw_hz / 1000, M, n_fit);
+
+        /* For each source position: fresh channelizer, register every
+         * in-window slot as a sink, inject CW at source, dump powers. */
+        for (int src_idx = 0; src_idx < n_fit; ++src_idx) {
+            int src_slot = fit[src_idx];
+            uint64_t f_tone = mesh_channel_freq_hz(r, bw_hz, src_slot);
+            channelizer_t *c = channelizer_create(f_center, fs);
+            if (!c) { fprintf(stderr, "selftest-rejection: channelizer_create failed\n"); free(fit); fclose(csv); free(records); return 1; }
+
+            chan_stats_t *stats = calloc((size_t)n_fit, sizeof(*stats));
+            if (!stats) { channelizer_destroy(c); free(fit); fclose(csv); free(records); return 1; }
+
+            for (int k = 0; k < n_fit; ++k) {
+                channel_cfg_t cfg = {
+                    .f_hz = mesh_channel_freq_hz(r, bw_hz, fit[k]),
+                    .bw_hz = bw_hz, .sf = 7, .cr = 5,
+                    .on_baseband = selftest_cb, .user = stats,
+                };
+                channelizer_add_channel(c, &cfg);
+            }
+
+            /* Synthesize 0.1 s of CW at the source slot's center frequency. */
+            double phase_inc = 2.0 * M_PI
+                * (double)((int64_t)f_tone - (int64_t)f_center) / (double)fs;
+            size_t total_samples = fs / 10;
+            const size_t block = 65536;
+            int8_t *buf = malloc(block * 2);
+            if (!buf) { channelizer_destroy(c); free(stats); free(fit); fclose(csv); free(records); return 1; }
+            double phase = 0.0;
+            const double amp = 100.0;       /* matches run_selftest()'s scale */
+            for (size_t fed = 0; fed < total_samples; ) {
+                size_t n = total_samples - fed;
+                if (n > block) n = block;
+                for (size_t i = 0; i < n; ++i) {
+                    buf[2*i]     = (int8_t)(cos(phase) * amp);
+                    buf[2*i + 1] = (int8_t)(sin(phase) * amp);
+                    phase += phase_inc;
+                }
+                channelizer_process_int8(c, buf, n);
+                fed += n;
+            }
+            free(buf);
+
+            /* Read out per-sink mean power and write CSV rows. */
+            double target_avg = stats[src_idx].nsamples
+                ? stats[src_idx].power_sum / (double)stats[src_idx].nsamples
+                : 0.0;
+            double target_db = target_avg > 0.0 ? 10.0 * log10(target_avg) : -200.0;
+
+            for (int k = 0; k < n_fit; ++k) {
+                if (k == src_idx) continue;
+                double leak_avg = stats[k].nsamples
+                    ? stats[k].power_sum / (double)stats[k].nsamples
+                    : 0.0;
+                double leak_db = leak_avg > 0.0 ? 10.0 * log10(leak_avg) : -200.0;
+                double acr = target_db - leak_db;
+                fprintf(csv, "%u,%d,%d,%d,%.3f,%.3f,%.3f,%zu\n",
+                        fs, bw_hz, src_slot, fit[k],
+                        target_db, leak_db, acr, stats[k].nsamples);
+
+                if (total_records >= records_cap) {
+                    int new_cap = records_cap ? records_cap * 2 : 1024;
+                    acr_record_t *nr = realloc(records, sizeof(*nr) * (size_t)new_cap);
+                    if (!nr) { channelizer_destroy(c); free(stats); free(fit); fclose(csv); free(records); return 1; }
+                    records = nr;
+                    records_cap = new_cap;
+                }
+                records[total_records++] = (acr_record_t){
+                    .acr = acr, .bw = bw_hz, .src = src_slot, .leak = fit[k] };
+            }
+
+            /* IMPORTANT: destroy channelizer FIRST -- pfb_flush() inside
+             * waits for any worker that still holds a reference to stats
+             * via the sink's user pointer. Freeing stats earlier would
+             * be a use-after-free in the worker's last callback. */
+            channelizer_destroy(c);
+            free(stats);
+        }
+        free(fit);
+    }
+    fclose(csv);
+
+    if (total_records == 0) {
+        fprintf(stderr,
+                "selftest-rejection: no measurements taken (window too narrow for the grid?)\n");
+        free(records);
+        return 1;
+    }
+
+    /* Sort ascending so records[0] is worst (smallest ACR). */
+    qsort(records, (size_t)total_records, sizeof(*records), acr_record_cmp);
+    acr_record_t worst = records[0];
+    acr_record_t best  = records[total_records - 1];
+    acr_record_t median = records[total_records / 2];
+    double sum = 0.0;
+    for (int i = 0; i < total_records; ++i) sum += records[i].acr;
+    double mean = sum / (double)total_records;
+
+    fprintf(stderr,
+            "selftest-rejection: %d (source,leak) pairs measured\n"
+            "  worst  ACR %.2f dB  BW=%d kHz  source=%d  leak=%d\n"
+            "  median ACR %.2f dB  BW=%d kHz  source=%d  leak=%d\n"
+            "  best   ACR %.2f dB  BW=%d kHz  source=%d  leak=%d\n"
+            "  mean   ACR %.2f dB\n"
+            "  CSV: %s\n",
+            total_records,
+            worst.acr,  worst.bw / 1000,  worst.src,  worst.leak,
+            median.acr, median.bw / 1000, median.src, median.leak,
+            best.acr,   best.bw / 1000,   best.src,   best.leak,
+            mean, csvpath);
+
+    free(records);
+    return 0;
+}
+
 /* ---- AES + multi-key + protobuf end-to-end self-test ---- */
 
 typedef struct {
@@ -1520,7 +1744,7 @@ int main(int argc, char **argv)
 
     int rc = options_parse(argc, argv);
     if (rc == 1) return 0;        /* --help */
-    if (rc >= 2 && rc != 100) return rc;
+    if (rc >= 2 && rc != 100 && rc != 101) return rc;
 
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
@@ -1534,6 +1758,10 @@ int main(int argc, char **argv)
         int b = run_aes_selftest();
         feed_shutdown();
         return a | b;
+    }
+    if (rc == 101) {              /* --selftest-rejection */
+        extern int run_selftest_rejection(void);
+        return run_selftest_rejection();
     }
 
     fprintf(stderr,

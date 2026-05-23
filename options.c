@@ -241,6 +241,7 @@ void options_print_help(const char *prog)
         "Misc:\n"
         "  --simd-generic         force scalar SIMD (debug)\n"
         "  --selftest             run self-tests (channelizer + AES end-to-end)\n"
+        "  --selftest-rejection   measure channelizer ACR across the grid; CSV to /tmp/meshtastic-pfb-rejection-<ts>.csv\n"
         "  --list                 enumerate all available SDR devices and exit\n"
         "  --schema               print JSON Schema for the event format and exit\n"
         "  -v, --verbose          INFO+WARN diagnostics (-vv DEBUG, -vvv TRACE)\n"
@@ -301,7 +302,7 @@ int options_parse(int argc, char **argv)
         O_ZMQ_CURVE_SECRET, O_ZMQ_CURVE_KEYGEN, O_STATION_T_ACC_NS,
         O_HACKRF_LNA, O_HACKRF_VGA, O_HACKRF_AMP, O_HACKRF_AMP_OFF, O_USRP_OTW,
         O_DECODE, O_SCAN, O_SCAN_DEC, O_ALERT_OFF_GRID,
-        O_SIMD_GEN, O_SELFTEST, O_LIST, O_SCHEMA,
+        O_SIMD_GEN, O_SELFTEST, O_SELFTEST_REJECTION, O_LIST, O_SCHEMA,
     };
     static const struct option longopts[] = {
         { "hackrf",     optional_argument, NULL, O_HACKRF },
@@ -358,6 +359,7 @@ int options_parse(int argc, char **argv)
         { "alert-off-grid",  no_argument,  NULL, O_ALERT_OFF_GRID },
         { "simd-generic", no_argument,     NULL, O_SIMD_GEN },
         { "selftest",   no_argument,       NULL, O_SELFTEST },
+        { "selftest-rejection", no_argument, NULL, O_SELFTEST_REJECTION },
         { "list",       no_argument,       NULL, O_LIST },
         { "schema",     no_argument,       NULL, O_SCHEMA },
         { "help",       no_argument,       NULL, 'h' },
@@ -506,6 +508,7 @@ int options_parse(int argc, char **argv)
 
         case O_SIMD_GEN: opt_force_simd_generic = true; break;
         case O_SELFTEST: return 100;
+        case O_SELFTEST_REJECTION: return 101;
         case O_LIST:     opt_list_devices = true; break;
         case O_SCHEMA:   opt_print_schema = true; break;
 
