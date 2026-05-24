@@ -229,7 +229,7 @@ Default UHD wire format is `sc16` (4 bytes/sample). At 26 Msps that's 104 MB/s o
                     --usrp-otw=sc8 --gain=40 --web=8888
 ```
 
-Short validation run: **26.02-26.03 Msps with `--presets=all`, zero `OOO`, all 1024 channels live.** A later 7.8-hour soak stayed stable with clean drains and no leak, but averaged **22.72 Msps** with a steady trickle of UHD overflows; the remaining long-run bottleneck is downstream DSP throughput, not worker-pool correctness.
+Short validation run: **26.02-26.03 Msps with `--presets=all`, zero `OOO`, all 1024 channels live.** A later 7.8-hour soak stayed stable with clean drains and no leak, but averaged **22.72 Msps** with the old 15-worker default and a steady trickle of UHD overflows. A tuning matrix found 8 sink workers best on the 16-core B205mini host (**25.30 Msps** mean); that is now the default. The remaining long-run bottleneck is downstream DSP throughput, not worker-pool correctness.
 
 If you still see occasional bursty `OOO` after enabling sc8, the sample-pump queue depth knob is `MESHTASTIC_SAMPLE_QUEUE=N` (default 256). Bumping higher gives UHD more recv slack at the cost of slightly higher peak memory. If `queue_waits` stays high over a long run, the issue is sustained DSP throughput rather than queue depth.
 
@@ -299,11 +299,11 @@ pfb sink pool:  submitted=5113024 completed=5113024 queue_bp=0 freebuf_waits=0
 What to look for:
 
 - **`submitted == processed`** (sample-pump) and **`submitted == completed`** (sink pool): clean drain, every sample reached the demod
-- **`queue_waits`** (sample-pump): producer blocked on a full queue. Non-zero is fine; means the recv side burst faster than DSP for a moment and the queue absorbed it. Sustained high values suggest you need a larger `MESHTASTIC_SAMPLE_QUEUE=N` (default 256)
+- **`queue_waits`** (sample-pump): producer blocked on a full queue. Non-zero is fine; means the recv side burst faster than DSP for a moment and the queue absorbed it. Sustained high values mean DSP is behind; a larger `MESHTASTIC_SAMPLE_QUEUE=N` (default 256) only helps burst slack, not steady-state throughput
 - **`queue_bp`** (sink pool): per-worker queue ran full. Should be zero in normal operation
 - **`freebuf_waits`** (sink pool): channelizer waited for a LoRa worker to free a buffer. Non-zero means a worker fell behind sample rate — usually a slow CPU or too many channels for the host
 
-Worker count defaults to `min(nproc-1, 16)`; override with `MESHTASTIC_SINK_WORKERS=N`.
+Worker count defaults to `min(nproc-1, 8)`; override with `MESHTASTIC_SINK_WORKERS=N`.
 
 ## Offline PSK recovery
 

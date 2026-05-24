@@ -63,8 +63,7 @@
  * BW group's 400+ sinks all had to clear before the next FFT cycle.
  *
  * Design: a fixed-size pool of worker threads, channels sharded by
- *   channel_id % n_workers, MPSC queue per worker (multiple PFB groups
- *   can submit concurrently under OMP). Each channel's lora_decoder_t
+ *   channel_id % n_workers, MPSC queue per worker. Each channel's lora_decoder_t
  *   is touched by exactly one worker, preserving per-channel sample
  *   order without locking inside the decoder.
  *
@@ -197,7 +196,7 @@ static int g_pool_init_locked(void)
     int n = 1;
     long nproc = sysconf(_SC_NPROCESSORS_ONLN);
     if (nproc > 1) n = (int)(nproc - 1);
-    if (n > 16) n = 16;
+    if (n > 8) n = 8;
     const char *env = getenv("MESHTASTIC_SINK_WORKERS");
     if (env && *env) {
         int v = atoi(env);

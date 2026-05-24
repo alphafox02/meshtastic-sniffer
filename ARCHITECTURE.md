@@ -165,7 +165,7 @@ Per-bin output SNR exceeds input full-band SNR by `10·log10(M)` plus a consiste
 
 ### Async sink dispatch
 
-The PFB writes FFT outputs into per-sink ring buffers (`SINK_RING_N = 4`, 1024 samples each). When a buffer fills, ownership passes to a worker in a shared pool sharded by `channel_id % n_workers` (default `min(nproc-1, 16)`). Each LoRa decoder is touched by exactly one worker, so per-channel state stays single-threaded without locks. The PFB thread blocks on a full free pool rather than dropping samples; this is the only backpressure path in the pipeline.
+The PFB writes FFT outputs into per-sink ring buffers (`SINK_RING_N = 4`, 1024 samples each). When a buffer fills, ownership passes to a worker in a shared pool sharded by `channel_id % n_workers` (default `min(nproc-1, 8)` after live tuning on the 16-core B205mini host). Each LoRa decoder is touched by exactly one worker, so per-channel state stays single-threaded without locks. The PFB thread blocks on a full free pool rather than dropping samples; this is the only backpressure path in the pipeline.
 
 Combined with the sample-pump queue between the SDR recv thread and the channelizer thread (see *Live throughput* below), this keeps `lora_decoder_feed` off the channelizer hot path entirely.
 
@@ -210,7 +210,7 @@ push_samples() (called from input_thread, not its own thread):
 sample-pump thread:
   -- dequeue sample_buf_t and run the original DSP path:
   -- channelizer_process_int8/float
-       -> pfb_process per group (parallel-for if multiple groups)
+       -> pfb_process per group (OpenMP fanout when available)
             -> per-bin sink buffers submitted to sharded PFB workers
                  -> on_channel_baseband -> lora_decoder_feed
                  -> state machine -> on_lora_frame
@@ -270,7 +270,7 @@ What's verified:
 - **STATS SSE event**: arrives at the dashboard within one heartbeat
 - **AddressSanitizer + UndefinedBehaviorSanitizer**: zero findings on the smoke-test suite (selftest, file replay, web API hits, key adds)
 - **ThreadSanitizer**: zero data races under concurrent `/api/keys` POSTs hitting while the demod thread is in `keyset_lookup`
-- **Live throughput**: short B205mini validation runs reached 26.02-26.03 Msps at `--presets=all` (1024 concurrent channels covering full US 902-928 MHz: 52 ShortTurbo + 104 each of ShortFast/Slow/MediumFast/Slow/LongFast + 208 each of LongModerate/LongSlow + 36 LongTurbo), zero `OOO` overflows, on a 16-core host with `--usrp-otw=sc8`. A later 7.8-hour soak was stable with clean worker/pump drains and no memory/FD/thread leak, but averaged 22.72 Msps with a steady trickle of UHD overflows; the remaining long-run bottleneck is sustained DSP throughput. File-replay A/B harness (`tests/ab_replay.sh`) on a 4 GB lf.cs8 capture matches an 8-frame CRC-pass set bit-for-bit across runs.
+- **Live throughput**: short B205mini validation runs reached 26.02-26.03 Msps at `--presets=all` (1024 concurrent channels covering full US 902-928 MHz: 52 ShortTurbo + 104 each of ShortFast/Slow/MediumFast/Slow/LongFast + 208 each of LongModerate/LongSlow + 36 LongTurbo), zero `OOO` overflows, on a 16-core host with `--usrp-otw=sc8`. A later 7.8-hour soak was stable with clean worker/pump drains and no memory/FD/thread leak, but averaged 22.72 Msps with the old 15-worker default and a steady trickle of UHD overflows. A tuning matrix found 8 sink workers best on that host (25.30 Msps mean); that is now the default. The remaining long-run bottleneck is sustained DSP throughput. File-replay A/B harness (`tests/ab_replay.sh`) on a 4 GB lf.cs8 capture matches an 8-frame CRC-pass set bit-for-bit across runs.
 
 Known runtime concerns deliberately not blocked-on:
 
