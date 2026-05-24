@@ -180,12 +180,13 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
     if (ev->via_mqtt) jw_field_bool(j, "via_mqtt", true);
     if (ev->rssi_db != 0.0f) jw_field_f32(j, "rssi_db", ev->rssi_db);
     if (ev->snr_db  != 0.0f) jw_field_f32(j, "snr_db",  ev->snr_db);
-    /* RF-quality telemetry. payload_crc_ok only emitted when a CRC was
-     * actually present and FAILED -- the success-path stays quiet to
-     * keep the JSON tight. cfo only when |cfo| > 100 Hz so well-tuned
-     * radios don't spam noise. */
-    if (ev->has_crc && !ev->payload_crc_ok)
-        jw_field_bool(j, "payload_crc_ok", false);
+    /* RF-quality telemetry. payload_crc_ok is emitted whenever a CRC
+     * was present on the wire -- true if it passed, false if it failed.
+     * Absent means no CRC field on the wire (implicit-header frame),
+     * which is distinct from "checked and passed." cfo only when
+     * |cfo| > 100 Hz so well-tuned radios don't spam noise. */
+    if (ev->has_crc)
+        jw_field_bool(j, "payload_crc_ok", ev->payload_crc_ok);
     if (ev->cfo_hz > 100.0f || ev->cfo_hz < -100.0f)
         jw_field_f32(j, "cfo_hz", ev->cfo_hz);
     /* Multilateration timestamp + accuracy class. Only emit when we

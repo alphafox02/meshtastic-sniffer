@@ -108,6 +108,11 @@ const int      *app_grid_bws  (void) { return g_grid_bws;   }
 static uint64_t g_samples_total = 0;
 static uint64_t g_frames_total  = 0;
 static uint64_t g_decrypts_total = 0;
+/* CRC tallies. Only frames with an explicit CRC on the wire (has_crc=true)
+ * contribute; implicit-header frames are excluded from both buckets, so
+ * g_crc_pass_total + g_crc_fail_total <= g_frames_total. */
+static uint64_t g_crc_pass_total = 0;
+static uint64_t g_crc_fail_total = 0;
 static uint64_t g_offgrid_total = 0;
 
 /* Optional IQ record sink: tees raw bytes from push_samples() to disk
@@ -489,6 +494,12 @@ static void dedup_emit_locked(const dedup_entry_t *e)
 {
     intptr_t channel_id = e->best_user;
     __atomic_add_fetch(&g_frames_total, 1, __ATOMIC_RELAXED);
+    if (e->best_meta.has_crc) {
+        if (e->best_meta.payload_crc_ok)
+            __atomic_add_fetch(&g_crc_pass_total, 1, __ATOMIC_RELAXED);
+        else
+            __atomic_add_fetch(&g_crc_fail_total, 1, __ATOMIC_RELAXED);
+    }
     if (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS) {
         __atomic_add_fetch(&g_chan_stats[channel_id].frames, 1, __ATOMIC_RELAXED);
         __atomic_add_fetch(&g_chan_stats[channel_id].bytes,
@@ -671,6 +682,16 @@ static void *stats_thread(void *arg)
             uint64_t f   = __atomic_load_n(&g_frames_total,   __ATOMIC_RELAXED);
             uint64_t d   = __atomic_load_n(&g_decrypts_total, __ATOMIC_RELAXED);
             uint64_t og  = __atomic_load_n(&g_offgrid_total,  __ATOMIC_RELAXED);
+            uint64_t cp  = __atomic_load_n(&g_crc_pass_total, __ATOMIC_RELAXED);
+            uint64_t cf  = __atomic_load_n(&g_crc_fail_total, __ATOMIC_RELAXED);
+            uint64_t ct  = cp + cf;
+            char crc_buf[48];
+            if (ct > 0)
+                snprintf(crc_buf, sizeof(crc_buf), "CRC %.1f%% (%llu/%llu)",
+                         100.0 * (double)cp / (double)ct,
+                         (unsigned long long)cp, (unsigned long long)ct);
+            else
+                snprintf(crc_buf, sizeof(crc_buf), "CRC -- (0/0)");
             double rate_msps = (double)(s - prev_samples) / 5.0e6;
             prev_samples = s;
             /* Drainer liveness: if the dedup tick hasn't moved in 5x its
@@ -688,12 +709,13 @@ static void *stats_thread(void *arg)
              * everywhere it's surfaced rather than print a misleading zero. */
             const int scanner_on = (g_scanner != NULL);
             if (scanner_on)
-                fprintf(stderr, "[stats] %.2f Msps in, %llu LoRa frames, %llu decrypted, %llu off-grid hits\n",
-                        rate_msps, (unsigned long long)f, (unsigned long long)d,
-                        (unsigned long long)og);
+                fprintf(stderr, "[stats] %.2f Msps in, %llu LoRa frames, %s, %llu decrypted, %llu off-grid hits\n",
+                        rate_msps, (unsigned long long)f, crc_buf,
+                        (unsigned long long)d, (unsigned long long)og);
             else
-                fprintf(stderr, "[stats] %.2f Msps in, %llu LoRa frames, %llu decrypted\n",
-                        rate_msps, (unsigned long long)f, (unsigned long long)d);
+                fprintf(stderr, "[stats] %.2f Msps in, %llu LoRa frames, %s, %llu decrypted\n",
+                        rate_msps, (unsigned long long)f, crc_buf,
+                        (unsigned long long)d);
 
             /* STATS heartbeat fan-out: web SSE for the local dashboard,
              * ZMQ PUB so meshtastic-fusion can populate per-sensor

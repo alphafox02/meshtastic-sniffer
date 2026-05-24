@@ -260,8 +260,8 @@ Equivalent endpoints at `POST /api/keys`, `POST /api/share-url`, `POST /api/extr
 
 **Per-frame fields:** `from`, `to`, `packet_id`, `channel_hash` (1-byte routing hash from the radio header), optional `slot_id` (which polyphase channelizer slot caught the frame), `hop_limit`/`hop_start`, `rssi_db`/`snr_db`.
 
-**Quality telemetry — silent when healthy, present when actionable:**
-- `payload_crc_ok: false` — CRC was present and failed (frame bytes are corrupt; absence means no explicit CRC failure was reported: CRC passed, or no CRC was present on the wire)
+**Quality telemetry:**
+- `payload_crc_ok: true` / `false` — emitted whenever a CRC was present on the wire (explicit-header frames). `true` = checked and passed; `false` = checked and failed. Field absent means no CRC field on the wire (implicit-header frame), which is distinct from "checked and passed."
 - `cfo_hz` — only when |drift| > 100 Hz (radio is well-tuned otherwise)
 
 **Multilateration timing:** `station_t_ns` (host-realtime ns at first-replica receive) + `station_t_acc_ns` (operator-self-reported clock-discipline class). Set `--station-t-acc-ns=N` per station: 100 for GPSDO+1PPS, 1000 for chrony+PPS, 1000000 (default) for NTP-class. The fusion-side mlat solver weights observations by this value.
@@ -282,8 +282,10 @@ Equivalent endpoints at `POST /api/keys`, `POST /api/share-url`, `POST /api/extr
 Every 5 seconds the binary prints a one-line summary to stderr:
 
 ```
-[stats] 18.45 Msps in, 12 LoRa frames, 9 decrypted
+[stats] 18.45 Msps in, 12 LoRa frames, CRC 75.0% (6/8), 9 decrypted
 ```
+
+`CRC X.X% (P/T)` reports the running pass rate against `T = pass + fail` frames that had an explicit CRC on the wire; implicit-header frames are excluded from both buckets. When no frames have carried a CRC yet, the field reads `CRC -- (0/0)`.
 
 `off-grid hits` is appended only when the scanner is enabled (`--scan*` or `--alert-off-grid`).
 
