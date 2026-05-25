@@ -95,4 +95,18 @@ uint16_t lora_crc16(const uint8_t *data, size_t len);
 void lora_deinterleave(const uint16_t *symbols, int sf_app, int cr_use,
                        uint8_t *codewords);
 
+/* ---- Demod state-machine instrumentation -------------------------------
+ *
+ * Always-on lock-free atomic counters that record what the demodulator
+ * did across every decoder instance in the process. The wideband channelizer
+ * fans baseband to up to N decoders in parallel; without these counters
+ * it's hard to tell whether a "no frames decoded" result means we're not
+ * locking preambles, locking but failing header checksum, or sailing
+ * through to bogus payloads. Dump prints a per-SF table plus three SNR
+ * histograms (at preamble lock, header checksum pass, and CRC pass).
+ * Output is short enough to leave in production. */
+#include <stdio.h>
+void lora_demod_stats_reset(void);
+void lora_demod_stats_dump(FILE *fp);
+
 #endif /* LORA_H */

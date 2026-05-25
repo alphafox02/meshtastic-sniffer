@@ -2688,6 +2688,11 @@ static int run_live(void)
     psk_dict_shutdown();
     archive_shutdown();
     geofence_shutdown();
+    /* Print the demod state-machine summary before tearing down decoders.
+     * Critical at-a-glance signal for false-positive sync detection (lots
+     * of preamble_locks with ~0 crc_pass) vs the healthy case (steady
+     * pyramid down to crc_pass at a sane SNR). */
+    lora_demod_stats_dump(stderr);
     for (int i = 0; i < CHANNELIZER_MAX_CHANNELS; ++i) {
         if (g_demods[i]) { lora_decoder_destroy(g_demods[i]); g_demods[i] = NULL; }
     }

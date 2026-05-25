@@ -32,6 +32,7 @@
 #include <fftw3.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,158 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/* ---- Demod state-machine instrumentation ------------------------------
+ *
+ * Each decoder reports per-SF counters and (signal/noise) ratios into a
+ * single process-global table, accumulated lock-free with atomics. The
+ * cost is one atomic_fetch_add per state transition, which is negligible
+ * relative to a full N-point FFT per symbol. Dump fires from main.c at
+ * shutdown so a soak run produces a self-contained summary on stderr.
+ *
+ * "Pyramid view": every preamble candidate either decays back to IDLE,
+ * locks, or sails through to a sync byte; every sync either fails the
+ * 5-bit header checksum or proceeds to payload decode; every payload
+ * either has its CRC validated or is published with payload_no_crc.
+ * The ratios between adjacent rows are the diagnostic. A healthy real-
+ * radio capture has preamble_locks >> sync_seen >> header_pass, and a
+ * meaningful crc_pass / crc_fail ratio. A false-positive flood shows
+ * many candidates -> few locks, narrow SNR clusters, and ~0 crc_pass.
+ */
+#define LORA_STATS_SF_MIN     7
+#define LORA_STATS_SF_MAX    12
+#define LORA_STATS_SF_COUNT  (LORA_STATS_SF_MAX - LORA_STATS_SF_MIN + 1)
+/* 2dB-wide buckets from -10..+38 dB plus underflow (bucket 0) / overflow
+ * (bucket 25). Anything below -10 or above +38 dB is exotic enough that
+ * a single overflow column is fine. */
+#define LORA_STATS_SNR_LO_DB  (-10)
+#define LORA_STATS_SNR_STEP    2
+#define LORA_STATS_SNR_BUCKETS 26
+
+typedef struct {
+    atomic_uint_fast64_t preamble_candidates [LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t preamble_locks      [LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t sync_seen           [LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t header_attempts     [LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t header_checksum_pass[LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t header_checksum_fail[LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t payload_attempts    [LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t payload_crc_present [LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t payload_crc_pass    [LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t payload_crc_fail    [LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t payload_no_crc      [LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t published_frames    [LORA_STATS_SF_COUNT];
+    atomic_uint_fast64_t snr_hist_preamble [LORA_STATS_SNR_BUCKETS];
+    atomic_uint_fast64_t snr_hist_header   [LORA_STATS_SNR_BUCKETS];
+    atomic_uint_fast64_t snr_hist_crc_pass [LORA_STATS_SNR_BUCKETS];
+} lora_demod_stats_t;
+
+static lora_demod_stats_t g_demod_stats;
+
+static inline int stats_sf_idx(int sf)
+{
+    if (sf < LORA_STATS_SF_MIN) return -1;
+    if (sf > LORA_STATS_SF_MAX) return -1;
+    return sf - LORA_STATS_SF_MIN;
+}
+
+static inline int stats_snr_bucket(double snr_db)
+{
+    if (!isfinite(snr_db)) return 0;
+    int b = (int)floor((snr_db - LORA_STATS_SNR_LO_DB) / (double)LORA_STATS_SNR_STEP) + 1;
+    if (b < 0) b = 0;
+    if (b > LORA_STATS_SNR_BUCKETS - 1) b = LORA_STATS_SNR_BUCKETS - 1;
+    return b;
+}
+
+#define STATS_BUMP(field, sf) do { \
+        int _i = stats_sf_idx(sf); \
+        if (_i >= 0) \
+            atomic_fetch_add_explicit(&g_demod_stats.field[_i], 1, memory_order_relaxed); \
+    } while (0)
+
+#define STATS_SNR(hist, snr_db) do { \
+        int _b = stats_snr_bucket(snr_db); \
+        atomic_fetch_add_explicit(&g_demod_stats.hist[_b], 1, memory_order_relaxed); \
+    } while (0)
+
+void lora_demod_stats_reset(void)
+{
+    memset(&g_demod_stats, 0, sizeof(g_demod_stats));
+}
+
+static void stats_dump_hist(FILE *fp, const char *label,
+                            const atomic_uint_fast64_t *hist)
+{
+    uint64_t total = 0;
+    for (int i = 0; i < LORA_STATS_SNR_BUCKETS; ++i)
+        total += atomic_load_explicit(&hist[i], memory_order_relaxed);
+    fprintf(fp, "  %-12s n=%-10llu", label, (unsigned long long)total);
+    if (total == 0) { fprintf(fp, "  (empty)\n"); return; }
+    fprintf(fp, "  [<-10");
+    for (int i = 0; i < LORA_STATS_SNR_BUCKETS; ++i) {
+        unsigned long long v =
+            (unsigned long long)atomic_load_explicit(&hist[i],
+                                                     memory_order_relaxed);
+        if (i == 0)                          fprintf(fp, " %llu", v);
+        else if (i == LORA_STATS_SNR_BUCKETS - 1)
+                                             fprintf(fp, " >%d:%llu",
+                                                     LORA_STATS_SNR_LO_DB +
+                                                     LORA_STATS_SNR_STEP *
+                                                     (LORA_STATS_SNR_BUCKETS - 2),
+                                                     v);
+        else                                 fprintf(fp, " %d:%llu",
+                                                     LORA_STATS_SNR_LO_DB +
+                                                     LORA_STATS_SNR_STEP * (i - 1),
+                                                     v);
+    }
+    fprintf(fp, "]\n");
+}
+
+void lora_demod_stats_dump(FILE *fp)
+{
+    if (!fp) return;
+    /* Sum to detect "nothing ran at all" so we don't spam an empty table.
+     * Anything observed (even just preamble candidates above the floor)
+     * is worth printing. */
+    uint64_t total_candidates = 0;
+    for (int i = 0; i < LORA_STATS_SF_COUNT; ++i)
+        total_candidates += atomic_load_explicit(
+            &g_demod_stats.preamble_candidates[i], memory_order_relaxed);
+    if (total_candidates == 0) {
+        fprintf(fp, "[demod-stats] no preamble candidates observed.\n");
+        return;
+    }
+    fprintf(fp, "[demod-stats] per-SF counters:\n");
+    fprintf(fp, "  %-22s %10s %10s %10s %10s %10s %10s\n",
+            "stage", "SF7", "SF8", "SF9", "SF10", "SF11", "SF12");
+#define ROW(label, field) do { \
+        fprintf(fp, "  %-22s", label); \
+        for (int _i = 0; _i < LORA_STATS_SF_COUNT; ++_i) { \
+            fprintf(fp, " %10llu", (unsigned long long)atomic_load_explicit( \
+                &g_demod_stats.field[_i], memory_order_relaxed)); \
+        } \
+        fprintf(fp, "\n"); \
+    } while (0)
+    ROW("preamble_candidates",  preamble_candidates);
+    ROW("preamble_locks",       preamble_locks);
+    ROW("sync_seen",            sync_seen);
+    ROW("header_attempts",      header_attempts);
+    ROW("header_checksum_pass", header_checksum_pass);
+    ROW("header_checksum_fail", header_checksum_fail);
+    ROW("payload_attempts",     payload_attempts);
+    ROW("payload_crc_present",  payload_crc_present);
+    ROW("payload_crc_pass",     payload_crc_pass);
+    ROW("payload_crc_fail",     payload_crc_fail);
+    ROW("payload_no_crc",       payload_no_crc);
+    ROW("published_frames",     published_frames);
+#undef ROW
+    fprintf(fp, "[demod-stats] SNR histograms (2dB buckets):\n");
+    stats_dump_hist(fp, "preamble",   g_demod_stats.snr_hist_preamble);
+    stats_dump_hist(fp, "header_pass",g_demod_stats.snr_hist_header);
+    stats_dump_hist(fp, "crc_pass",   g_demod_stats.snr_hist_crc_pass);
+    fflush(fp);
+}
 
 /* ---- LoRa whitening sequence (256 bytes) ---- */
 static const uint8_t LORA_WHITEN[256] = {
@@ -242,6 +395,11 @@ struct lora_decoder {
     /* State machine. */
     lora_state_t state;
     int          preamble_count;
+    /* Set the first time preamble_count crosses PREAMBLE_MIN within one
+     * STATE_PREAMBLE_OK run; cleared on every IDLE->PREAMBLE_OK entry.
+     * Lets the stats counter record one "lock" per preamble rather than
+     * one per symbol while we sit on the locked bin. */
+    int          preamble_locked_once;
     int          preamble_bin;       /* bin we're tracking; updated to mode on lock */
     /* Recent preamble bins captured during PREAMBLE_OK, used to compute the
      * mode at lock time (= gr-lora_sdr's `most_frequent(preamb_up_vals)`).
@@ -669,6 +827,7 @@ static void reset_to_idle(lora_decoder_t *d)
 {
     d->state              = STATE_IDLE;
     d->preamble_count     = 0;
+    d->preamble_locked_once = 0;
     d->preamble_fft_count = 0;
     d->preamble_bin_hist_count = 0;
     d->header_idx         = 0;
@@ -765,6 +924,8 @@ static void state_tick(lora_decoder_t *d)
         d->cfo_int         = 0;
         d->cfo_frac        = 0.0f;
         d->state           = STATE_PREAMBLE_OK;
+        d->preamble_locked_once = 0;
+        STATS_BUMP(preamble_candidates, d->sf);
         break;
     }
     case STATE_PREAMBLE_OK: {
@@ -786,6 +947,16 @@ static void state_tick(lora_decoder_t *d)
         if (diff <= 2) {
             /* Still on preamble. Cap count so we're ready to detect sync. */
             if (d->preamble_count < PREAMBLE_MIN + 4) d->preamble_count++;
+            /* First tick where we've collected PREAMBLE_MIN matching symbols
+             * is a "lock". Record only once per preamble run so the lock
+             * count is a per-preamble event, not a per-symbol event. */
+            if (d->preamble_count >= PREAMBLE_MIN && !d->preamble_locked_once) {
+                d->preamble_locked_once = 1;
+                STATS_BUMP(preamble_locks, d->sf);
+                if (peak > 0.0f && noise > 0.0f)
+                    STATS_SNR(snr_hist_preamble,
+                              20.0 * log10((double)peak / (double)noise));
+            }
             /* Snapshot the FFT bin value for cfo_frac estimation later. */
             int N_HIST = (int)(sizeof(d->preamble_fft_hist) / sizeof(d->preamble_fft_hist[0]));
             if (d->preamble_fft_count < N_HIST)
@@ -808,6 +979,8 @@ static void state_tick(lora_decoder_t *d)
              * because each window straddles two adjacent chirps. */
             d->header_idx = 0;
             d->state      = STATE_HEADER;
+            STATS_BUMP(sync_seen,       d->sf);
+            STATS_BUMP(header_attempts, d->sf);
             /* k_hat = mode of the captured preamble bins (gr-lora_sdr's
              * `most_frequent(preamb_up_vals, n_up_req)` form, frame_sync_impl.cc:534).
              * The IDLE-entry latch can be off by ±1 due to FFT peak landing
@@ -1001,6 +1174,7 @@ static void state_tick(lora_decoder_t *d)
             d->meta.has_crc        = d->payload_has_crc;
             d->meta.header_crc_ok  = (computed_chk == header_chk) && d->payload_len > 0;
             if (!d->meta.header_crc_ok) {
+                STATS_BUMP(header_checksum_fail, d->sf);
                 if (trace_on)
                     fprintf(stderr, "[lora] header CRC fail: got 0x%02x want 0x%02x "
                             "n=%x %x %x %x %x len=%d cr=%d crc=%d\n",
@@ -1010,6 +1184,16 @@ static void state_tick(lora_decoder_t *d)
                 reset_to_idle(d);
                 break;
             }
+            STATS_BUMP(header_checksum_pass, d->sf);
+            STATS_BUMP(payload_attempts,     d->sf);
+            /* SNR at header-pass uses the live FFT peak/noise at this
+             * symbol -- the running snr_db_sum is also updated for the
+             * 8 header symbols, but the per-symbol ratio at the moment
+             * of header validation is the most directly comparable to
+             * the preamble-lock SNR (same single-symbol time scale). */
+            if (peak > 0.0f && noise > 0.0f)
+                STATS_SNR(snr_hist_header,
+                          20.0 * log10((double)peak / (double)noise));
             /* Stash leftover header-block nibbles (positions 5..sf_app-1)
              * -- these are the first nibbles of the actual payload. */
             d->hdr_leftover_count = 0;
@@ -1053,7 +1237,12 @@ static void state_tick(lora_decoder_t *d)
                 d->meta.snr_db = (d->snr_db_count > 0)
                                ? (float)(d->snr_db_sum / (double)d->snr_db_count)
                                : 0.0f;
-                if (d->cb) d->cb(NULL, 0, &d->meta, d->user);
+                d->meta.payload_crc_ok = !d->payload_has_crc;
+                STATS_BUMP(payload_no_crc, d->sf);
+                if (d->cb) {
+                    d->cb(NULL, 0, &d->meta, d->user);
+                    STATS_BUMP(published_frames, d->sf);
+                }
                 reset_to_idle(d);
             }
         }
@@ -1147,8 +1336,15 @@ static void state_tick(lora_decoder_t *d)
                 want_crc ^= bytes[pay_len - 1];
                 want_crc ^= (uint16_t)bytes[pay_len - 2] << 8;
                 d->meta.payload_crc_ok = (got_crc == want_crc);
+                STATS_BUMP(payload_crc_present, d->sf);
+                if (d->meta.payload_crc_ok) {
+                    STATS_BUMP(payload_crc_pass, d->sf);
+                } else {
+                    STATS_BUMP(payload_crc_fail, d->sf);
+                }
             } else {
                 d->meta.payload_crc_ok = !d->payload_has_crc;
+                STATS_BUMP(payload_no_crc, d->sf);
             }
 
             /* Stash the running average SNR for this frame so callers
@@ -1156,13 +1352,18 @@ static void state_tick(lora_decoder_t *d)
             d->meta.snr_db = (d->snr_db_count > 0)
                            ? (float)(d->snr_db_sum / (double)d->snr_db_count)
                            : 0.0f;
+            if (d->meta.payload_crc_ok && d->payload_has_crc)
+                STATS_SNR(snr_hist_crc_pass, (double)d->meta.snr_db);
             if (trace_on)
                 fprintf(stderr, "[lora] DELIVER: %d payload bytes, crc_ok=%d, snr=%.1fdB, first 8: %02x %02x %02x %02x %02x %02x %02x %02x\n",
                         d->payload_len, d->meta.payload_crc_ok,
                         (double)d->meta.snr_db,
                         bytes[0], bytes[1], bytes[2], bytes[3],
                         bytes[4], bytes[5], bytes[6], bytes[7]);
-            if (d->cb) d->cb(bytes, (size_t)d->payload_len, &d->meta, d->user);
+            if (d->cb) {
+                d->cb(bytes, (size_t)d->payload_len, &d->meta, d->user);
+                STATS_BUMP(published_frames, d->sf);
+            }
             reset_to_idle(d);
         }
         break;
