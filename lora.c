@@ -1361,12 +1361,14 @@ static void state_tick(lora_decoder_t *d)
                         bytes[0], bytes[1], bytes[2], bytes[3],
                         bytes[4], bytes[5], bytes[6], bytes[7]);
                 if (d->payload_has_crc && byte_count >= 4) {
-                    /* Print got/want CRC + the last 6 raw bytes (last 4
-                     * payload bytes + 2 CRC bytes) so a single CRC mismatch
-                     * can be eyeballed: "is the corruption small (1-2 bits
-                     * flipped) or systematically shifted (wrong byte
-                     * positions)". Eyeballed corruption shape suggests
-                     * which payload-decode stage to inspect next. */
+                    /* CRC-present diagnostic. Compact dump aimed at a
+                     * single visual inspection on a fresh known-node
+                     * capture: "is the payload almost right (a few bit
+                     * flips near a decision boundary), byte-shifted (off-
+                     * by-one nibble packing or skipped header leftover),
+                     * whitened wrong (CRC bytes XORed, or wrong whitening
+                     * offset), or just broadly corrupted (CFO drift /
+                     * symbol timing collapse)". */
                     size_t pay_len = (size_t)byte_count - 2;
                     uint16_t got_crc = (uint16_t)(bytes[byte_count-2] |
                                                   ((uint16_t)bytes[byte_count-1] << 8));
@@ -1374,9 +1376,8 @@ static void state_tick(lora_decoder_t *d)
                     want_crc ^= bytes[pay_len - 1];
                     want_crc ^= (uint16_t)bytes[pay_len - 2] << 8;
                     fprintf(stderr,
-                        "[lora]   crc got=0x%04x want=0x%04x  tail: ... %02x %02x %02x %02x | crc %02x %02x\n",
-                        got_crc, want_crc,
-                        bytes[byte_count-6], bytes[byte_count-5],
+                        "[lora]   got_crc=0x%04x want_crc=0x%04x payload_len=%d byte_count=%d tail=%02x %02x %02x %02x\n",
+                        got_crc, want_crc, d->payload_len, byte_count,
                         bytes[byte_count-4], bytes[byte_count-3],
                         bytes[byte_count-2], bytes[byte_count-1]);
                 }
