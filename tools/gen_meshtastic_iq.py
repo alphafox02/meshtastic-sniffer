@@ -59,9 +59,17 @@ def build_data_envelope(port: int, payload: bytes) -> bytes:
         else:
             out.append(b)
             break
-    # field 2, wire 2 (length), payload
+    # field 2, wire 2 (length), payload (varint length, so >127 byte payloads work too)
     out.append((2 << 3) | 2)
-    out.append(len(payload))
+    L = len(payload)
+    while True:
+        b = L & 0x7f
+        L >>= 7
+        if L:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            break
     out += payload
     return bytes(out)
 
