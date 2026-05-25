@@ -1118,12 +1118,34 @@ static void state_tick(lora_decoder_t *d)
             }
             int total = d->payload_len + (d->payload_has_crc ? 2 : 0);
             if (byte_count > total) byte_count = total;
-            lora_dewhiten(bytes, (size_t)byte_count);
+            /* CRC bytes are NOT whitened on TX (see references/gr-lora_sdr
+             * dewhitening_impl.cc:100-105 -- the dewhitener explicitly
+             * passes the CRC tail through untouched). Dewhitening over
+             * those bytes here would corrupt the received CRC field
+             * before verify, and historically caused payload_crc_ok to
+             * always be false. Only dewhiten the payload portion. */
+            size_t pay_only = (size_t)d->payload_len;
+            if (pay_only > (size_t)byte_count) pay_only = (size_t)byte_count;
+            lora_dewhiten(bytes, pay_only);
 
-            if (d->payload_has_crc && byte_count >= 2) {
+            if (d->payload_has_crc && byte_count >= 4) {
+                /* LoRa's CRC-16 convention (see references/gr-lora_sdr's
+                 * add_crc_impl.cc:124-136 and crc_verif_impl.cc:120-123):
+                 *   - compute CRC-16/CCITT (poly 0x1021, init 0x0000)
+                 *     over payload[0 .. N-3]  (the first N-2 payload bytes)
+                 *   - XOR that with payload[N-1] (low byte) and
+                 *     payload[N-2] << 8 (high byte)
+                 *   - compare to the 2-byte CRC field that follows the payload
+                 * The XOR-with-the-last-2-payload-bytes step is what makes
+                 * LoRa's CRC different from "vanilla" CRC-16/CCITT verify,
+                 * and was missing here -- so every clean-decode frame
+                 * historically reported payload_crc_ok=false. */
+                size_t pay_len = (size_t)byte_count - 2;
                 uint16_t got_crc = (uint16_t)(bytes[byte_count-2] |
                                               ((uint16_t)bytes[byte_count-1] << 8));
-                uint16_t want_crc = lora_crc16(bytes, (size_t)(byte_count - 2));
+                uint16_t want_crc = lora_crc16(bytes, pay_len - 2);
+                want_crc ^= bytes[pay_len - 1];
+                want_crc ^= (uint16_t)bytes[pay_len - 2] << 8;
                 d->meta.payload_crc_ok = (got_crc == want_crc);
             } else {
                 d->meta.payload_crc_ok = !d->payload_has_crc;
