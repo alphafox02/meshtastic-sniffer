@@ -157,11 +157,14 @@ static chan_stat_t g_chan_stats[CHANNELIZER_MAX_CHANNELS];
  * overrun. The pump makes push_samples() enqueue and return; one processing
  * thread owns the original channelizer/scanner path.
  */
-/* Default 256: gives the UHD recv thread enough burst cushion to clear 26 Msps
- * on B205 without overruns while DSP threads ride the steady-state limit.
- * 64 was enough for the bench but live USRP needed the extra slack to clear
- * the OOO storm. Override via MESHTASTIC_SAMPLE_QUEUE=N. */
-#define SAMPLE_QUEUE_DEFAULT_CAP 256
+/* Base default: enough buffering for normal backends without hiding sustained
+ * DSP backpressure behind a large queue. High-rate USRP capture needs more
+ * burst cushion because UHD's recv thread must return quickly to keep the
+ * device FIFO from overrunning while DSP rides the steady-state limit.
+ * Override either default via MESHTASTIC_SAMPLE_QUEUE=N. */
+#define SAMPLE_QUEUE_DEFAULT_CAP 64
+#define SAMPLE_QUEUE_USRP_HIGH_RATE_CAP 256
+#define SAMPLE_QUEUE_USRP_HIGH_RATE_HZ 20000000.0
 
 typedef struct {
     pthread_mutex_t mu;
@@ -281,9 +284,17 @@ static void *sample_pump_thread(void *arg)
     return NULL;
 }
 
+static int sample_queue_default_cap(void)
+{
+    if (opt_sdr_backend == SDR_BACKEND_USRP &&
+        samp_rate >= SAMPLE_QUEUE_USRP_HIGH_RATE_HZ)
+        return SAMPLE_QUEUE_USRP_HIGH_RATE_CAP;
+    return SAMPLE_QUEUE_DEFAULT_CAP;
+}
+
 static int sample_pipeline_start(void)
 {
-    int cap = SAMPLE_QUEUE_DEFAULT_CAP;
+    int cap = sample_queue_default_cap();
     const char *env = getenv("MESHTASTIC_SAMPLE_QUEUE");
     if (env && *env) {
         int v = atoi(env);
