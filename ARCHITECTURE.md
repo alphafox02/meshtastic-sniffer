@@ -163,6 +163,28 @@ Processing-gain / dynamic-range sweep (`--selftest-rejection-procgain`, AWGN add
 
 Per-bin output SNR exceeds input full-band SNR by `10·log10(M)` plus a consistent ~+1 dB offset across all three BW groups. That small residual is consistent with the prototype filter's actual bin/noise bandwidth and normalization, but has not been analytically subtracted from the measurement. Sigma=0.5 LSB rows in the CSV are below the cs8 quantization step and have unreliable statistics; sigma ≥ 1.0 LSB rows give the stable measurement.
 
+### LoRa-chirp leakage, not CW
+
+The `--selftest-rejection*` numbers above were taken with a CW tone. A LoRa chirp is broadband — it sweeps the full channel BW every symbol and its instantaneous energy passes right through the channel boundary, where any real filter is at most -6 dB. So chirp leakage looks very different from tone leakage in the same PFB. `tests/test_pfb_bin_power.c` measures per-bin RMS for a synthetic LoRa frame injected at a known slot.
+
+Profile for the production config (M=80, L=12), one SF9/BW250 frame at slot 40 (915.125 MHz):
+
+| bin offset from target | noiseless | with AWGN at 15 dB in-bin SNR |
+|---|---|---|
+| 0 (target) | 0 dB ref | 0 dB ref |
+| ±1 | -3.6 dB | -3.2 dB (signal leakage still dominates) |
+| ±2 | -14.6 dB | -10 to -15 dB |
+| ±3 | -18.7 dB | (noise floor takes over) |
+| ±40 (band edges) | -37.7 dB | -12.2 dB (noise floor) |
+
+Reproduce: `tests/pfb_slot_leakage.sh` (counts decoder activity per slot) + `./build/test_pfb_bin_power --file=...` (per-bin RMS).
+
+The shape is a clean Hamming-windowed sinc rolloff — the filter math is doing what L=12 lets it do. The -3.6 dB adjacent number is set by two things: the chirp itself crosses the bin boundary at every symbol, and L=12 is a fairly short prototype. A longer L (say 24) would noticeably tighten the rolloff; you don't get to zero adjacent leakage but you can push it down. We haven't paid that 2× FIR cost yet because the real failure mode below has a cheaper fix.
+
+In practice: a strong nearby transmitter (close-range, modest attenuation) drops a -3 dB coherent copy into each adjacent slot and a -10 to -20 dB copy a few slots out. In a noiseless test that's enough for the LoRa preamble check (peak > 2× noise *inside* the dechirped FFT, not vs. RF thermal) to lock the state machine on the leaked copy. At realistic mesh-distance SNR (~15 dB in-bin), thermal noise drowns the far-bin leakage and only ±1/±2 adjacent slots still produce phantom decodes — those get folded into the CRC-pass cluster by the tier-3 dedup rule (`CRC-pass winner suppresses CRC-fail copies in same SF/BW within the emit window`) so the published feed sees one frame per TX.
+
+**Operational note for close-range deployments.** A 900 MHz transmitter within a few meters of the SDR antenna can light up same-SF phantom decoders across many slots. The published feed is protected, but demod CPU is still spent on the phantoms before they're suppressed. Attenuate the close transmitter or move it physically further if CPU headroom matters. A pre-demod energy gate (drop a channel's decoder feed when its RMS sits well below the group peak in a short window) is the next planned fix — much cheaper than redesigning the prototype filter.
+
 ### Async sink dispatch
 
 The PFB writes FFT outputs into per-sink ring buffers (`SINK_RING_N = 4`, 1024 samples each). When a buffer fills, ownership passes to a worker in a shared pool sharded by `channel_id % n_workers` (default `min(nproc-1, 8)` after live tuning on the 16-core B205mini host). Each LoRa decoder is touched by exactly one worker, so per-channel state stays single-threaded without locks. The PFB thread blocks on a full free pool rather than dropping samples; this is the only backpressure path in the pipeline.
