@@ -276,6 +276,24 @@ target_link_libraries(test_oversample_self PRIVATE
     m)
 set_property(TARGET test_oversample_self PROPERTY C_STANDARD 99)
 
+# test_pfb_bin_power: feed a wideband cs8 file through the same
+# channelizer the live pipeline uses, dump per-bin RMS power in
+# dB-relative-to-peak. Used to distinguish "PFB indexing bug"
+# vs "FIR sidelobes working as designed" vs "filter rejection
+# insufficient for strong-signal cases".
+add_executable(test_pfb_bin_power
+    ${PROJECT_SOURCE_DIR}/tests/test_pfb_bin_power.c
+    ${PROJECT_SOURCE_DIR}/channelizer.c
+    ${PROJECT_SOURCE_DIR}/pfb.c)
+target_link_libraries(test_pfb_bin_power PRIVATE
+    Threads::Threads
+    ${FFTW3F_LIB}
+    m)
+if(OpenMP_C_FOUND)
+    target_link_libraries(test_pfb_bin_power PRIVATE OpenMP::OpenMP_C)
+endif()
+set_property(TARGET test_pfb_bin_power PROPERTY C_STANDARD 99)
+
 # CPack
 set(CPACK_PACKAGE_NAME "meshtastic-sniffer")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Wideband Meshtastic LoRa receiver")

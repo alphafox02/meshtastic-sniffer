@@ -13,10 +13,22 @@
 # preamble detector's above_floor threshold.
 #
 # 2026-05-25 baseline: one synthetic frame at 915.125 MHz caused 79
-# of 80 MediumFast slot decoders to fire (lock + decode + publish
-# to dedup), spanning the entire 20 MHz band. That is two orders of
-# magnitude more cross-bin coupling than a normal PFB should produce.
-# This script reproduces that observation deterministically.
+# of 80 MediumFast slot decoders to fire on a noiseless input.
+# Important interpretation: this is NOT "PFB rejection is broken."
+# The companion test_pfb_bin_power probe measured an actual filter
+# rolloff -3.6 dB at adjacent bins down to -37 dB at the band edges
+# -- a clean, monotonic Hamming-windowed sinc shape, math correct.
+# What breaks is the LoRa decoder's preamble admission policy:
+# noiseless coherent leakage at -37 dB still produces a clean
+# peak-vs-bin-floor inside the dechirped FFT and locks the state
+# machine. With realistic AWGN at 15 dB target SNR, only 10 slots
+# fire (mostly bin-adjacent) and the feed has 0 CRC-fail phantoms.
+#
+# So the failure mode is strong-signal-close-range specific. The
+# right fix is a pre-demod energy gate (drop samples whose RMS is
+# well below the expected signal level), not a heavier PFB filter.
+# The Tier-3 dedup rule (b7c7e42) protects the published feed in
+# the meantime. This script reproduces the noiseless boundary case.
 #
 # Usage: tests/pfb_slot_leakage.sh
 #
