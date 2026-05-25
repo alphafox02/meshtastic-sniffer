@@ -187,6 +187,24 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
      * |cfo| > 100 Hz so well-tuned radios don't spam noise. */
     if (ev->has_crc)
         jw_field_bool(j, "payload_crc_ok", ev->payload_crc_ok);
+    /* fields_trusted is the honest answer to "should a consumer treat
+     * the decoded from/to/packet_id/etc. as factual?" It is true only
+     * when we have positive evidence the bytes were received intact:
+     *   - the LoRa CRC field was present and verified, OR
+     *   - the AES-CTR payload decrypted and parsed as a valid Data
+     *     envelope (portnum was populated).
+     * It is false for CRC-fail frames (bytes corrupted in transit, the
+     * decoded fields are bit-errored) and for no-CRC frames whose
+     * payload didn't decrypt (could be a real frame on an unknown PSK,
+     * could be a noise pattern that passed the 5-bit header checksum
+     * by luck -- 1/32 random chance -- and produced garbage bytes;
+     * we can't tell without more evidence). Downstream consumers
+     * displaying sightings on a map or counting unique nodes should
+     * filter on fields_trusted == true to avoid surfacing
+     * bit-corrupted phantoms as if they were real distinct nodes. */
+    bool fields_trusted = (ev->has_crc && ev->payload_crc_ok)
+                       || (!ev->has_crc && ev->decrypted);
+    jw_field_bool(j, "fields_trusted", fields_trusted);
     if (ev->cfo_hz > 100.0f || ev->cfo_hz < -100.0f)
         jw_field_f32(j, "cfo_hz", ev->cfo_hz);
     /* Multilateration timestamp + accuracy class. Only emit when we
