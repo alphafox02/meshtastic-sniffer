@@ -13,6 +13,7 @@
 #include "dedup.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -20,6 +21,21 @@
 
 dedup_entry_t   g_dedup[DEDUP_RING_SIZE];
 pthread_mutex_t g_dedup_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Tier-3 outcome counters. _near_pass: a CRC-fail replica was folded
+ * into a cluster whose winner is already CRC-pass (will not be
+ * published as a separate frame). _no_pass: a CRC-fail replica opened
+ * a new cluster (or matched another CRC-fail cluster) -- emitted at
+ * drain time because no nearby CRC-pass winner suppressed it. */
+static atomic_uint_fast64_t g_stat_crc_fail_suppressed_near_pass = 0;
+static atomic_uint_fast64_t g_stat_crc_fail_admitted_no_pass     = 0;
+
+uint64_t dedup_stat_crc_fail_suppressed_near_pass(void) {
+    return atomic_load_explicit(&g_stat_crc_fail_suppressed_near_pass, memory_order_relaxed);
+}
+uint64_t dedup_stat_crc_fail_admitted_no_pass(void) {
+    return atomic_load_explicit(&g_stat_crc_fail_admitted_no_pass, memory_order_relaxed);
+}
 
 /* Optional test clock. When non-NULL, dedup_buffer reads time from
  * here so tests can drive the time axis deterministically. */
@@ -112,6 +128,41 @@ void dedup_buffer(const uint8_t *payload, size_t payload_len,
             break;
         }
     }
+    /* Tier 3: "CRC-pass winner exists" wide-slot suppression. Triggers
+     * only when:
+     *   - the new replica failed CRC, AND
+     *   - a cluster with the same SF/BW already has a CRC-pass winner
+     *     within DEDUP_TIER3_WINDOW_US (200 us) of "now",
+     * regardless of slot or fingerprint. This catches the cross-slot
+     * phantom mechanism observed 2026-05-25 where a single RF event
+     * registers decodes on slot_id offsets up to +/-71 within 87 us
+     * (NOT adjacent-channel leakage; some deeper PFB/dispatch issue).
+     * Without Tier 3, those phantoms publish as bit-corrupted CRC-fail
+     * frames with garbage from/to/packet_id, drowning the real frame
+     * in the feed and inflating CRC-fail counts.
+     *
+     * Deliberately narrower than Tier 2 in two ways:
+     *   - only fires for CRC-fail new replicas (a CRC-pass new arrival
+     *     doesn't need wide-window suppression -- it would win Tier-1
+     *     or open a new cluster of its own),
+     *   - only matches clusters whose best is already CRC-pass (a
+     *     CRC-fail cluster doesn't suppress another CRC-fail; if no
+     *     winner exists, the fails are still useful diagnostics). */
+    if (!match && crc_bad) {
+        for (int i = 0; i < DEDUP_RING_SIZE; ++i) {
+            dedup_entry_t *e = &g_dedup[i];
+            if (!e->in_use) continue;
+            if (e->sf != sf || e->bw_hz != bw) continue;
+            if (!e->best_meta.payload_crc_ok) continue;
+            uint64_t cluster_open_us = e->emit_at_us - DEDUP_WINDOW_US;
+            if (now_us < cluster_open_us) continue;
+            if (now_us - cluster_open_us > DEDUP_TIER3_WINDOW_US) continue;
+            match = e;
+            atomic_fetch_add_explicit(&g_stat_crc_fail_suppressed_near_pass,
+                                      1, memory_order_relaxed);
+            break;
+        }
+    }
     if (match) {
         match->replica_count++;
         /* Tournament: prefer "good" (CRC-pass OR no-CRC) over CRC-fail
@@ -146,6 +197,28 @@ void dedup_buffer(const uint8_t *payload, size_t payload_len,
                 match->max_slot_id = slot_id;
         }
     } else if (free_slot >= 0) {
+        /* Tier-3 reverse direction: a CRC-pass new replica that didn't
+         * match any existing cluster retroactively suppresses any
+         * CRC-fail clusters opened in the last DEDUP_TIER3_WINDOW_US
+         * with the same SF/BW. Catches the case where async sink
+         * workers delivered the phantom CRC-fail replicas to dedup
+         * BEFORE the clean CRC-pass replica -- so the fails opened
+         * their own clusters first, and the forward Tier-3 (in the
+         * Tier-3 match block above) had no winner to attach to. */
+        if (!crc_bad) {
+            for (int i = 0; i < DEDUP_RING_SIZE; ++i) {
+                dedup_entry_t *e = &g_dedup[i];
+                if (!e->in_use) continue;
+                if (e->sf != sf || e->bw_hz != bw) continue;
+                if (e->best_meta.payload_crc_ok) continue;
+                uint64_t cluster_open_us = e->emit_at_us - DEDUP_WINDOW_US;
+                if (now_us < cluster_open_us) continue;
+                if (now_us - cluster_open_us > DEDUP_TIER3_WINDOW_US) continue;
+                e->in_use = false;
+                atomic_fetch_add_explicit(&g_stat_crc_fail_suppressed_near_pass,
+                                          1, memory_order_relaxed);
+            }
+        }
         dedup_entry_t *e = &g_dedup[free_slot];
         e->in_use           = true;
         e->fp               = fp;
@@ -161,6 +234,10 @@ void dedup_buffer(const uint8_t *payload, size_t payload_len,
         e->replica_count    = 1;
         e->min_slot_id      = slot_id_valid ? slot_id : INT16_MIN;
         e->max_slot_id      = slot_id_valid ? slot_id : INT16_MIN;
+        if (crc_bad) {
+            atomic_fetch_add_explicit(&g_stat_crc_fail_admitted_no_pass,
+                                      1, memory_order_relaxed);
+        }
     }
     /* else: ring full -- silently drop. */
     pthread_mutex_unlock(&g_dedup_mu);

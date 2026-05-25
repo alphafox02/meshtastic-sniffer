@@ -36,6 +36,15 @@
 #define DEDUP_MAX_PAYLOAD               256
 #define DEDUP_SLOT_ADJACENCY_US         500     /* Tier-2 time window */
 #define DEDUP_SLOT_PROXIMITY            3       /* Tier-2 slot distance */
+/* Tier-3 wide-slot window: set to the full DEDUP_WINDOW_US (30 ms)
+ * rather than the 200 us RF-event spacing observed in live captures.
+ * Reason: the async sink worker pool reorders replica arrivals at
+ * dedup_buffer relative to the original RF event order, so monotonic
+ * time at dedup_buffer call site can differ by several ms between the
+ * CRC-pass winner and its CRC-fail phantoms even when the RF events
+ * were 87 us apart. Tying Tier-3 to the existing dedup window keeps
+ * "same emission batch" as the semantic. */
+#define DEDUP_TIER3_WINDOW_US           DEDUP_WINDOW_US
 
 typedef struct {
     bool                in_use;
@@ -86,5 +95,10 @@ uint64_t dedup_realtime_ns(void);
 /* Payload fingerprint -- exposed for tests so synthetic inputs can
  * assert specific Hamming distances. */
 uint64_t dedup_payload_fingerprint(const uint8_t *p, size_t n);
+
+/* Stats counters. Bumped from dedup_buffer; read by main.c shutdown to
+ * print a summary. Thread-safe via atomic_uint_fast64_t in dedup.c. */
+uint64_t dedup_stat_crc_fail_suppressed_near_pass(void);
+uint64_t dedup_stat_crc_fail_admitted_no_pass(void);
 
 #endif /* DEDUP_H */
