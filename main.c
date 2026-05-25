@@ -2754,18 +2754,20 @@ static int run_live(void)
     psk_dict_shutdown();
     archive_shutdown();
     geofence_shutdown();
-    /* Print the demod state-machine summary before tearing down decoders.
-     * Critical at-a-glance signal for false-positive sync detection (lots
-     * of preamble_locks with ~0 crc_pass) vs the healthy case (steady
-     * pyramid down to crc_pass at a sane SNR). */
-    lora_demod_stats_dump(stderr);
-    /* Dedup Tier-3 outcome counters. _suppressed_near_pass shows the
-     * cross-slot phantom rate that the wide-window rule absorbed;
-     * _admitted_no_pass shows CRC-fail frames that the feed published
-     * because no CRC-pass winner appeared in the window. */
-    fprintf(stderr, "[dedup] tier3: crc_fail suppressed_near_pass=%llu admitted_no_pass=%llu\n",
-            (unsigned long long)dedup_stat_crc_fail_suppressed_near_pass(),
-            (unsigned long long)dedup_stat_crc_fail_admitted_no_pass());
+    if (sample_pump_stats_enabled()) {
+        /* Print the demod state-machine summary before tearing down decoders.
+         * Critical at-a-glance signal for false-positive sync detection (lots
+         * of preamble_locks with ~0 crc_pass) vs the healthy case (steady
+         * pyramid down to crc_pass at a sane SNR). */
+        lora_demod_stats_dump(stderr);
+        /* Dedup Tier-3 outcome counters. _suppressed_near_pass shows the
+         * cross-slot phantom rate that the wide-window rule absorbed;
+         * _admitted_no_pass shows CRC-fail frames that the feed published
+         * because no CRC-pass winner appeared in the window. */
+        fprintf(stderr, "[dedup] tier3: crc_fail suppressed_near_pass=%llu admitted_no_pass=%llu\n",
+                (unsigned long long)dedup_stat_crc_fail_suppressed_near_pass(),
+                (unsigned long long)dedup_stat_crc_fail_admitted_no_pass());
+    }
     for (int i = 0; i < CHANNELIZER_MAX_CHANNELS; ++i) {
         if (g_demods[i]) { lora_decoder_destroy(g_demods[i]); g_demods[i] = NULL; }
     }
