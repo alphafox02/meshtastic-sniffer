@@ -142,6 +142,41 @@ def parse_sniffer_output(text: str) -> set[tuple[str, int]]:
     return out
 
 
+def collect_slots_from_jsonl(text: str) -> dict[tuple[int, int, int], dict]:
+    """Group sniffer JSONL events by (freq_hz, bw_hz, sf). Each value is a dict
+    with pass / fail event counts and the distinct (from, packet_id) tuples
+    observed on that slot."""
+    slots: dict[tuple[int, int, int], dict] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] != "{":
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        freq = ev.get("freq_hz")
+        bw = ev.get("bw_hz")
+        sf = ev.get("sf")
+        if not freq or not bw or not sf:
+            continue
+        key = (int(freq), int(bw), int(sf))
+        s = slots.setdefault(key, {"pass": 0, "fail": 0, "pass_ids": set(), "fail_ids": set()})
+        frm = ev.get("from")
+        pid = ev.get("packet_id")
+        crc = ev.get("payload_crc_ok")
+        # Some events have no has_crc (implicit-header); skip those for this audit.
+        if crc is True:
+            s["pass"] += 1
+            if frm and pid is not None:
+                s["pass_ids"].add((frm, int(pid)))
+        elif crc is False:
+            s["fail"] += 1
+            if frm and pid is not None:
+                s["fail_ids"].add((frm, int(pid)))
+    return slots
+
+
 def run(cmd: list[str], stdout_path: Path, stderr_path: Path, timeout: float) -> int:
     """Run a subprocess with output redirected to files."""
     with open(stdout_path, "wb") as so, open(stderr_path, "wb") as se:
@@ -201,6 +236,66 @@ def fmt_set(s: set[tuple[str, int]]) -> str:
     return "\n".join(f"  {frm}  0x{pid:08x}  ({pid})" for frm, pid in sorted(s))
 
 
+def run_from_jsonl(args) -> int:
+    """For every (freq, bw, sf) slot that had at least one CRC-fail event in
+    the supplied sniffer JSONL, run gr-lora_sdr against the IQ recording at
+    that slot. Print what each side decoded."""
+    if not args.capture or not args.rate or not args.center:
+        print("--from-jsonl requires --capture, --rate, --center", file=sys.stderr)
+        return 2
+    jsonl_path = Path(args.from_jsonl)
+    if not jsonl_path.exists():
+        print(f"jsonl not found: {jsonl_path}", file=sys.stderr)
+        return 2
+    if not Path(args.capture).exists():
+        print(f"capture not found: {args.capture}", file=sys.stderr)
+        return 2
+    slots = collect_slots_from_jsonl(jsonl_path.read_text(errors="replace"))
+    fail_slots = sorted(
+        ((k, v) for k, v in slots.items() if v["fail"] > 0),
+        key=lambda kv: (-kv[1]["fail"], kv[0]),
+    )
+    if not fail_slots:
+        print("no CRC-fail slots found in jsonl")
+        return 0
+    workroot = Path(args.workdir or f"/tmp/gr_lora_diff_jsonl_{Path(args.capture).stem}")
+    workroot.mkdir(parents=True, exist_ok=True)
+    print(f"=== {len(fail_slots)} CRC-fail slot(s) from {jsonl_path} ===")
+    print(f"  capture       : {args.capture}")
+    print(f"  workroot      : {workroot}")
+    rc_total = 0
+    for (freq, bw, sf), counts in fail_slots:
+        fix = Fixture(
+            name=f"f{freq}_bw{bw}_sf{sf}",
+            capture=args.capture,
+            rate=args.rate, center=args.center,
+            channel_freq=freq, bw=bw, sf=sf,
+            os_factor=args.os_factor,
+        )
+        work = workroot / fix.name
+        work.mkdir(parents=True, exist_ok=True)
+        gr_set = run_gr_lora(fix, work, args.timeout)
+        print()
+        print(f"  slot {freq/1e6:.3f} MHz, BW {bw/1e3:g} kHz, SF{sf}")
+        print(f"    sniffer:  pass={counts['pass']} fail={counts['fail']}  "
+              f"distinct_pass={len(counts['pass_ids'])} distinct_fail={len(counts['fail_ids'])}")
+        print(f"    gr-lora:  distinct CRC-ok={len(gr_set)}")
+        sn_pass_set = counts["pass_ids"]
+        sn_fail_set = counts["fail_ids"]
+        missing = gr_set - sn_pass_set
+        recovered = gr_set & sn_fail_set
+        if missing:
+            print(f"    MISSING (gr-lora got CRC-ok we didn't decode):")
+            for frm, pid in sorted(missing):
+                tag = " (we had CRC-fail copy)" if (frm, pid) in recovered else ""
+                print(f"      {frm}  0x{pid:08x}{tag}")
+            rc_total = 1
+        else:
+            print(f"    OK: every gr-lora CRC-ok also CRC-passed our decoder")
+    print()
+    return rc_total
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("fixture", nargs="?", default=None,
@@ -224,7 +319,17 @@ def main() -> int:
                    help="Skip gr-lora_sdr (use cached gr_lora.txt in workdir)")
     p.add_argument("--skip-sniffer", action="store_true",
                    help="Skip meshtastic-sniffer (use cached sniffer.jsonl in workdir)")
+    p.add_argument("--from-jsonl",
+                   help="Path to a prior sniffer JSONL feed. The script reads every "
+                        "(freq_hz, bw_hz, sf) slot that produced at least one "
+                        "CRC-fail event, then runs gr-lora_sdr against the IQ "
+                        "recording at each such slot. Requires --capture, --rate, --center.")
+    p.add_argument("--os-factor", type=int, default=4,
+                   help="gr-lora_sdr oversample factor (default 4)")
     args = p.parse_args()
+
+    if args.from_jsonl:
+        return run_from_jsonl(args)
 
     if args.fixture and args.fixture in FIXTURES:
         fix = FIXTURES[args.fixture]
