@@ -67,12 +67,19 @@ class SynthTx(gr.top_block):
         self.msg_connect((self.strobe, "strobe"), (self.lora_tx, "in"))
         self.msg_connect((self.id_inc, "msg_out"), (self.strobe, "set_msg"))
 
-        # AWGN + optional CFO via channels.channel_model.
+        # AWGN + CFO + SFO via channels.channel_model.
+        # epsilon = receiver sample-clock rate / transmitter rate. 1.0 = locked.
+        # 1.0 + sfo_ppm * 1e-6 simulates a receiver crystal running fast by
+        # sfo_ppm parts-per-million; accumulated symbol-grid drift across a
+        # long payload is what payload-time AFC is supposed to track.
+        # Typical Meshtastic node TCXO drift is single-digit ppm, worst-case
+        # generic crystal up to ~50 ppm. LoRa spec tolerates ~25 ppm.
         freq_offset_norm = args.cfo_hz / self.channel_rate if args.cfo_hz else 0.0
+        epsilon = 1.0 + args.sfo_ppm * 1e-6
         self.chan = channels.channel_model(
             noise_voltage=noise_voltage,
             frequency_offset=freq_offset_norm,
-            epsilon=1.0,        # no SFO drift yet
+            epsilon=epsilon,
             taps=[1.0 + 0j],
             noise_seed=args.seed,
             block_tags=False,
@@ -108,6 +115,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bw", type=int, required=True)
     p.add_argument("--snr-db", type=float, default=20.0)
     p.add_argument("--cfo-hz", type=float, default=0.0)
+    p.add_argument("--sfo-ppm", type=float, default=0.0,
+                   help="Receiver sample-clock offset in ppm (0 = locked)")
     p.add_argument("--n-frames", type=int, default=10)
     p.add_argument("--payload-bytes", type=int, default=20)
     p.add_argument("--os-factor", type=int, default=4)
