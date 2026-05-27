@@ -302,4 +302,30 @@ Known runtime concerns deliberately not blocked-on:
 
 `./meshtastic-sniffer --selftest` runs two synthesized smoke checks (channelizer + AES end-to-end). `bash tests/test_smoke.sh` adds SigMF auto-config, `--list`, web `/api/*` round-trip, STATS SSE heartbeat, and stats heartbeat. Both run clean under sanitizers (`-fsanitize=address,undefined`).
 
+## Sensitivity benchmark + open soft-decode question
+
+`tests/sensitivity.py` synthesizes Meshtastic-shape LoRa frames (via `tests/sensitivity_synth.py` driving gr-lora_sdr's `lora_tx`), adds AWGN at a target SNR, and runs three decoders on the same `.cs8`:
+- our `meshtastic-sniffer --extra-freq=…`
+- gr-lora_sdr (`tools/gr_lora_usrp_rx.py`)
+- dxlaprs `lorarx` (set `LORARX_BIN`, GPL-2.0+, built externally)
+
+Each cell reports `ours_pass / gr_pass / lorarx_pass`. The baseline sweep (9 presets × 6 SNR cells) confirms our hard-decode path is within 0–2 frames of both references at every cell where they decode anything; gaps live at the cliff edge of each preset.
+
+**Open research question** (documented because two attempts in this direction failed and it would be tempting to retry without recording why):
+
+Soft decoding with a per-symbol confidence metric is a textbook ~2–3 dB sensitivity gain over hard. We tried two variants:
+
+1. Replace per-bin `|Y|^2` with envelope `|Y|` in `compute_symbol_llrs` so one strong FFT peak doesn't dwarf cross-symbol confidence integration.
+2. Port gr-lora_sdr's per-symbol `Ps_est/Pn_est` normalization from `fft_demod_impl.cc:148–225` exactly.
+
+Both improved the synthetic harness substantially (Long-* SNR=-15 dB cells went 0/3/3 hard → 3/3/3 soft). Both **regressed real captures** on `b205_cluster2.cs8`: variant 1 dropped a distinct CRC-pass packet ID in 2 of 3 replays, variant 2 lost 2 of 4 distinct IDs every run. Branch `soft-decode-envelope` keeps variant 1 as a documented dead-end.
+
+Working hypothesis: the soft confidence estimator assumes a single signal peak surrounded by Gaussian noise. Real wideband captures have PFB cross-bin leakage from adjacent slots and structured non-Gaussian interference, both of which violate that assumption and inflate the noise estimate. The pure-AWGN harness can't reproduce the failure mode.
+
+Acceptance bar for the next attempt:
+- An interference-aware noise estimator (e.g. order-statistic / trimmed-mean over non-peak bins, or excluding bins above a per-symbol percentile)
+- No regression in `tests/sensitivity.py` 3/3/3 cells
+- ≥ 4 distinct CRC-pass on `b205_cluster2.cs8` in 5 of 5 consecutive replays
+- Hard remains default; soft optional via env knob until consistent on real captures across all four `tests/gr_lora_diff.py` fixtures
+
 `MESHTASTIC_LORA_TRACE=1` enables a per-symbol state-machine trace on stderr, useful for debugging decode against a known-good reference.
