@@ -162,10 +162,19 @@ class GrLoraValidateRx(gr.top_block):
         )
         self.printer = PayloadPrinter()
 
+        # frame_sync inside lora_rx requires up to ~one-symbol of input
+        # samples per work() call (2^sf * os_factor at the channel rate).
+        # At SF11+ with low BW, the default GNU Radio buffer (8191 items)
+        # is smaller than one symbol and frame_sync errors out. Force the
+        # upstream block (DDC if present, else cs8_to_complex / file_source)
+        # to allocate a buffer that fits at least one symbol with margin.
+        min_buf = int(np.ceil((2 ** args.sf + 2) * args.os_factor))
         if self.ddc is not None:
+            self.ddc.set_min_output_buffer(min_buf)
             self.connect(source, self.ddc)
             self.connect(self.ddc, self.rx)
         else:
+            source.set_min_output_buffer(min_buf)
             self.connect(source, self.rx)
         self.connect(self.rx, self.printer)
 
