@@ -39,6 +39,11 @@ REPO = Path(__file__).resolve().parent.parent
 SYNTH = REPO / "tests" / "sensitivity_synth.py"
 SNIFFER = REPO / "build" / "meshtastic-sniffer"
 GR_LORA = REPO / "tools" / "gr_lora_usrp_rx.py"
+# dxlaprs `lorarx` -- third reference receiver. Built externally from
+# http://oe5dxl.hamspirit.at:8025/aprs/c/ (GPL-2.0+); we do not vendor it.
+# Set via env var LORARX_BIN; default to /tmp/dxlaprs/lorarx.
+import os as _os
+LORARX = Path(_os.environ.get("LORARX_BIN", "/tmp/dxlaprs/lorarx"))
 
 # Meshtastic preset table. (name, sf, bw_hz, cr_meshtastic, cr_gr)
 # cr_meshtastic is 5..8 = 4/5..4/8 (our sniffer's wire-format value).
@@ -70,7 +75,8 @@ class CellResult:
     cfo_hz: float
     n_frames: int       # synthesis budget (approximate; actual depends on strobe period)
     ours_pass: int
-    gr_pass: int        # treated as ground truth -- gr-lora_sdr is the reference
+    gr_pass: int        # gr-lora_sdr reference
+    lorarx_pass: int    # dxlaprs lorarx reference (0 if LORARX unavailable / not enabled)
 
     @property
     def relative_rate(self) -> float:
@@ -132,6 +138,57 @@ def count_ours(out_path: Path, preset_cfg: dict, os_factor: int) -> int:
     return n_pass
 
 
+# dxlaprs lorarx maps BW kHz -> -b enum. From its --help:
+#   0:7.8 1:10.4 2:15.6 3:20.8 4:31.25 5:41.7 6:62.5 7:125 8:250 9:500
+LORARX_BW_ENUM = {7800: 0, 10400: 1, 15600: 2, 20800: 3, 31250: 4,
+                  41700: 5, 62500: 6, 125000: 7, 250000: 8, 500000: 9}
+
+
+def count_lorarx(out_path: Path, preset_cfg: dict, os_factor: int) -> int:
+    """Run dxlaprs lorarx as a third reference. Pads the input with
+    zero samples so lorarx has stream slack at EOF (without padding it
+    drops the last frame mid-state-machine)."""
+    if not LORARX.exists():
+        return 0
+    bw_enum = LORARX_BW_ENUM.get(preset_cfg["bw"])
+    if bw_enum is None:
+        return 0
+    channel_rate = preset_cfg["bw"] * os_factor
+    padded = out_path.with_suffix(".lorarx.cs8")
+    # Append ~0.5s of zeros (= 2 frames worth of slack at the channel rate).
+    pad_bytes = 2 * channel_rate
+    with open(padded, "wb") as f:
+        f.write(out_path.read_bytes())
+        f.write(b"\x00" * pad_bytes)
+    cmd = [
+        str(LORARX),
+        "-i", str(padded),
+        "-f", "i8",
+        "-r", str(channel_rate),
+        "-b", str(bw_enum),
+        "-s", str(preset_cfg["sf"]),
+        "-j", "/dev/stdout",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=120)
+    try:
+        padded.unlink()
+    except OSError:
+        pass
+    n_ok = 0
+    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        # net=43 is Meshtastic sync (0x2b). Require crc=1 and matching sync.
+        if d.get("crc") == 1 and d.get("net") == 43:
+            n_ok += 1
+    return n_ok
+
+
 def count_gr(out_path: Path, preset_cfg: dict, os_factor: int) -> int:
     channel_rate = preset_cfg["bw"] * os_factor
     cmd = [
@@ -170,11 +227,13 @@ def run_cell(preset: str, snr_db: float, cfo_hz: float, n_frames: int,
     cfg = PRESETS[preset]
     ours_total = 0
     gr_total = 0
+    lorarx_total = 0
     for trial in range(n_frames):
         out = work / f"synth_{preset}_snr{snr_db:.0f}_cfo{cfo_hz:.0f}_t{trial}.cs8"
         synth_cell(cfg, snr_db, cfo_hz, 1, os_factor, seed + trial, out)
-        ours_total += count_ours(out, cfg, os_factor)
-        gr_total += count_gr(out, cfg, os_factor)
+        ours_total   += count_ours(out, cfg, os_factor)
+        gr_total     += count_gr(out, cfg, os_factor)
+        lorarx_total += count_lorarx(out, cfg, os_factor)
         try:
             out.unlink()
         except OSError:
@@ -182,7 +241,7 @@ def run_cell(preset: str, snr_db: float, cfo_hz: float, n_frames: int,
     return CellResult(
         preset=preset, sf=cfg["sf"], bw=cfg["bw"], cr_m=cfg["cr_m"],
         snr_db=snr_db, cfo_hz=cfo_hz, n_frames=n_frames,
-        ours_pass=ours_total, gr_pass=gr_total,
+        ours_pass=ours_total, gr_pass=gr_total, lorarx_pass=lorarx_total,
     )
 
 
@@ -228,7 +287,7 @@ def main() -> int:
                              args.os_factor, args.seed, work)
                 results.append(r)
                 print(f"ours={r.ours_pass:3d}  gr={r.gr_pass:3d}  "
-                      f"relative={r.relative_rate*100:5.1f}%",
+                      f"lorarx={r.lorarx_pass:3d}",
                       file=sys.stderr)
 
     # CSV
@@ -236,19 +295,23 @@ def main() -> int:
         w = csv.writer(f)
         w.writerow(["preset", "sf", "bw_hz", "cr_meshtastic",
                     "snr_db", "cfo_hz", "n_frames",
-                    "ours_pass", "gr_pass", "relative_rate"])
+                    "ours_pass", "gr_pass", "lorarx_pass"])
         for r in results:
             w.writerow([r.preset, r.sf, r.bw, r.cr_m,
                         r.snr_db, r.cfo_hz, r.n_frames,
-                        r.ours_pass, r.gr_pass,
-                        f"{r.relative_rate:.3f}"])
+                        r.ours_pass, r.gr_pass, r.lorarx_pass])
     print(f"\nCSV written: {args.csv}", file=sys.stderr)
 
     # Summary table by preset (averaged over CFO).
     # Each cell shows "ours_pass/gr_pass" so both counts are visible.
     # Parity = ours == gr. Loss = ours < gr.
-    print("\n## Sensitivity summary (ours_pass / gr_pass per SNR cell, averaged over CFO)\n",
-          file=sys.stderr)
+    have_lorarx = any(r.lorarx_pass > 0 for r in results) or LORARX.exists()
+    if have_lorarx:
+        print("\n## Sensitivity summary (ours / gr-lora / lorarx per SNR cell)\n",
+              file=sys.stderr)
+    else:
+        print("\n## Sensitivity summary (ours / gr-lora per SNR cell)\n",
+              file=sys.stderr)
     header = ["preset"] + [f"SNR{s:.0f}dB" for s in snrs]
     print("| " + " | ".join(header) + " |", file=sys.stderr)
     print("|" + "|".join(["------"] * len(header)) + "|", file=sys.stderr)
@@ -258,8 +321,11 @@ def main() -> int:
             cells = [r for r in results if r.preset == preset and r.snr_db == s]
             tot_ours = sum(c.ours_pass for c in cells)
             tot_gr   = sum(c.gr_pass for c in cells)
-            rel = (tot_ours / tot_gr) if tot_gr > 0 else 0.0
-            row.append(f"{tot_ours}/{tot_gr} ({rel*100:.0f}%)")
+            tot_lr   = sum(c.lorarx_pass for c in cells)
+            if have_lorarx:
+                row.append(f"{tot_ours}/{tot_gr}/{tot_lr}")
+            else:
+                row.append(f"{tot_ours}/{tot_gr}")
         print("| " + " | ".join(row) + " |", file=sys.stderr)
 
     return 0
