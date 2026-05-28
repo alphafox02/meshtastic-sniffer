@@ -61,6 +61,7 @@ extern op_mode_t     opt_op_mode;
 extern bool          opt_alert_off_grid;
 extern bool          opt_list_devices;
 extern bool          opt_print_schema;
+extern bool          opt_trusted_only;
 
 /* Meshtastic */
 extern char         *opt_region;          /* "US", "EU_868", ... */

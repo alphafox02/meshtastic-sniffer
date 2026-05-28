@@ -576,6 +576,16 @@ void feed_shutdown(void)
 void feed_publish_event(const mesh_event_t *ev)
 {
     if (!ev) return;
+    /* --trusted-only suppresses untrusted events from every publishing sink.
+     * Stats counters (in main.c) tally upstream of this so the heartbeat
+     * still shows the true LoRa frames / no-CRC count -- operators can see
+     * how much RF noise-admit is being filtered out. The decoder path is
+     * unchanged; only publication is gated. */
+    if (opt_trusted_only) {
+        bool trusted = (ev->has_crc && ev->payload_crc_ok)
+                    || (!ev->has_crc && ev->decrypted);
+        if (!trusted) return;
+    }
     char buf[2048];
     jw_t j;
     jw_init(&j, buf, sizeof(buf));

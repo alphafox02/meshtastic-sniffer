@@ -35,6 +35,7 @@ op_mode_t     opt_op_mode             = OP_MODE_DECODE;
 bool          opt_alert_off_grid      = false;
 bool          opt_list_devices        = false;
 bool          opt_print_schema        = false;
+bool          opt_trusted_only        = false;
 
 char         *opt_region              = NULL;
 char         *opt_preset_csv          = NULL;
@@ -117,6 +118,8 @@ void options_print_help(const char *prog)
         "  --scan                 off-grid LoRa discovery only (no decode)\n"
         "  --scan-and-decode      both: decode grid, alert on off-grid sightings\n"
         "  --alert-off-grid       emit OFF_GRID_LORA alerts on first off-grid sighting\n"
+        "  --trusted-only         suppress fields_trusted:false events from JSON/UDP/MQTT/web feeds\n"
+        "                         (stats counters still tally everything; only publishing is filtered)\n"
         "\n"
         "SDR selection (one):\n"
         "  --hackrf[=SERIAL]      use HackRF One\n"
@@ -309,7 +312,7 @@ int options_parse(int argc, char **argv)
         O_PCAP, O_PCAP_FIFO, O_PSK_WORDLIST, O_ARCHIVE, O_GEOFENCE, O_ANNOUNCE_TO, O_C2_DEALER,
         O_ZMQ_CURVE_SECRET, O_ZMQ_CURVE_KEYGEN, O_STATION_T_ACC_NS,
         O_HACKRF_LNA, O_HACKRF_VGA, O_HACKRF_AMP, O_HACKRF_AMP_OFF, O_USRP_OTW,
-        O_DECODE, O_SCAN, O_SCAN_DEC, O_ALERT_OFF_GRID,
+        O_DECODE, O_SCAN, O_SCAN_DEC, O_ALERT_OFF_GRID, O_TRUSTED_ONLY,
         O_SIMD_GEN, O_SELFTEST, O_SELFTEST_REJECTION, O_SELFTEST_REJECTION_AMP,
         O_SELFTEST_REJECTION_TWOTONE, O_SELFTEST_REJECTION_OFFBIN,
         O_SELFTEST_REJECTION_PROCGAIN,
@@ -368,6 +371,7 @@ int options_parse(int argc, char **argv)
         { "scan",       no_argument,       NULL, O_SCAN },
         { "scan-and-decode", no_argument,  NULL, O_SCAN_DEC },
         { "alert-off-grid",  no_argument,  NULL, O_ALERT_OFF_GRID },
+        { "trusted-only",    no_argument,  NULL, O_TRUSTED_ONLY },
         { "simd-generic", no_argument,     NULL, O_SIMD_GEN },
         { "selftest",   no_argument,       NULL, O_SELFTEST },
         { "selftest-rejection", no_argument, NULL, O_SELFTEST_REJECTION },
@@ -520,6 +524,7 @@ int options_parse(int argc, char **argv)
         case O_SCAN:             opt_op_mode = OP_MODE_SCAN; break;
         case O_SCAN_DEC:         opt_op_mode = OP_MODE_SCAN_AND_DECODE; break;
         case O_ALERT_OFF_GRID:   opt_alert_off_grid = true; break;
+        case O_TRUSTED_ONLY:     opt_trusted_only   = true; break;
 
         case O_SIMD_GEN: opt_force_simd_generic = true; break;
         case O_SELFTEST: return 100;
