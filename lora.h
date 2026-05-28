@@ -59,6 +59,15 @@ lora_decoder_t *lora_decoder_create_os(int sf, int cr, int bw_hz, int os_factor)
 void lora_decoder_set_callback(lora_decoder_t *dec,
                                lora_frame_cb_t cb, void *user);
 
+/* Set the slot's RF carrier frequency in Hz. Enables gr-lora_sdr-style
+ * SFO drift compensation: at preamble lock the decoder derives an SFO
+ * estimate from the measured CFO using the same-crystal assumption
+ * (sfo_hat = (cfo_int+cfo_frac) * bw_hz / center_freq_hz), then per
+ * payload symbol it accumulates drift and shifts the FFT window by
+ * one sample when the accumulator crosses 0.5. 0 (default) keeps the
+ * SFO path inert. Must be called before decode if you want compensation. */
+void lora_decoder_set_center_freq(lora_decoder_t *dec, double center_freq_hz);
+
 /* Feed one batch of complex baseband samples (rate = bw_hz). */
 void lora_decoder_feed(lora_decoder_t *dec,
                        const float complex *samples, size_t n);

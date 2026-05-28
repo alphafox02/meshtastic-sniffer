@@ -905,6 +905,9 @@ static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr)
 
     g_demods[id] = lora_decoder_create_os(sf, cr, bw_hz, os_factor);
     if (!g_demods[id]) return -1;
+    /* Per-slot RF carrier enables the SFO drift compensation path; without
+     * it the decoder's gr-lora_sdr-style SFO logic stays inert. */
+    lora_decoder_set_center_freq(g_demods[id], (double)f_hz);
     /* Stash channel id in user pointer so on_lora_frame can attribute stats. */
     lora_decoder_set_callback(g_demods[id], on_lora_frame, (void *)(intptr_t)id);
 

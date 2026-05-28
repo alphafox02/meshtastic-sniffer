@@ -438,6 +438,11 @@ struct lora_decoder {
     int          preamble_bin_hist[16];
     int          preamble_bin_hist_count;
     int          sto_skip_remaining; /* gr-lora_sdr-style k_hat realignment after preamble lock */
+    /* One-shot per-symbol consume adjust set by SFO drift code. +1 means
+     * the next symbol's FFT window starts 1 sample EARLIER (carry the
+     * current symbol's last sample forward across the symbuf reset).
+     * -1 means start 1 sample LATER (one extra sto-skip). 0 = no shift. */
+    int          sfo_next_sym_shift;
     uint16_t     header_syms[8];
     int          header_idx;
 
@@ -480,6 +485,28 @@ struct lora_decoder {
     bool         soft_decoding;
     float        header_llrs[8][LLR_PER_SYMBOL];
     float        payload_llrs[MAX_PAYLOAD_SYMBOLS][LLR_PER_SYMBOL];
+
+    /* SFO/STO sub-bin tracking, gr-lora_sdr frame_sync_impl.cc port.
+     * Set via lora_decoder_set_center_freq(); when 0 the SFO compensation
+     * paths are inert and the decoder behaves as before. */
+    double         center_freq_hz;
+    /* Per-payload-symbol drift accumulator (fractional samples). Per gr-lora
+     * sfo_cum += sfo_hat; when |sfo_cum| > 1/(2*os_factor), one sample is
+     * dropped or added before the next FFT and sfo_cum is decremented by
+     * 1/os_factor. */
+    double         sfo_cum;
+    double         sfo_hat;       /* drift per payload symbol; set at DC2 */
+    float          sto_frac;      /* RCTSL sub-bin estimate at lock time */
+    /* Rolling buffer of the last K dechirped preamble symbols, used by
+     * RCTSL. Allocated when center_freq_hz is set. */
+    float complex *preamble_dechirped;
+    int            preamble_dechirped_capacity; /* K */
+    int            preamble_dechirped_count;
+    int            preamble_dechirped_next;     /* next slot to fill (ring) */
+    /* 2N-point FFT for RCTSL (zero-padded for sub-bin resolution). */
+    fftwf_complex *fft2_in;
+    fftwf_complex *fft2_out;
+    fftwf_plan     fft2_plan;
 
     /* Per-frame metadata, updated as we go. */
     lora_frame_meta_t meta;
@@ -569,6 +596,34 @@ void lora_decoder_set_callback(lora_decoder_t *d, lora_frame_cb_t cb, void *user
     d->cb = cb; d->user = user;
 }
 
+/* Number of preamble upchirps to average for the RCTSL estimator. gr-lora_sdr
+ * uses (preamble_len - 3); Meshtastic preambles are 8 symbols so 5 fits but
+ * 4 is a good compromise that keeps the per-decoder buffer modest at SF12. */
+#define PREAMBLE_DECHIRPED_K 4
+
+void lora_decoder_set_center_freq(lora_decoder_t *d, double center_freq_hz)
+{
+    if (!d) return;
+    d->center_freq_hz = center_freq_hz;
+    if (center_freq_hz <= 0.0) return;
+    /* Lazy-allocate the SFO compensation buffers on first set. */
+    if (!d->preamble_dechirped) {
+        d->preamble_dechirped_capacity = PREAMBLE_DECHIRPED_K;
+        d->preamble_dechirped = calloc((size_t)PREAMBLE_DECHIRPED_K * d->N,
+                                       sizeof(float complex));
+    }
+    if (!d->fft2_in) {
+        d->fft2_in  = fftwf_alloc_complex((size_t)2 * d->N);
+        d->fft2_out = fftwf_alloc_complex((size_t)2 * d->N);
+        if (d->fft2_in && d->fft2_out) {
+            fftw_planner_lock();
+            d->fft2_plan = fftwf_plan_dft_1d(2 * d->N, d->fft2_in, d->fft2_out,
+                                             FFTW_FORWARD, FFTW_ESTIMATE);
+            fftw_planner_unlock();
+        }
+    }
+}
+
 void lora_decoder_destroy(lora_decoder_t *d)
 {
     if (!d) return;
@@ -577,10 +632,18 @@ void lora_decoder_destroy(lora_decoder_t *d)
         fftwf_destroy_plan(d->fft_plan);
         fftw_planner_unlock();
     }
+    if (d->fft2_plan) {
+        fftw_planner_lock();
+        fftwf_destroy_plan(d->fft2_plan);
+        fftw_planner_unlock();
+    }
     fftwf_free(d->downchirp);
     fftwf_free(d->upchirp);
     fftwf_free(d->fft_in);
     fftwf_free(d->fft_out);
+    if (d->fft2_in)  fftwf_free(d->fft2_in);
+    if (d->fft2_out) fftwf_free(d->fft2_out);
+    free(d->preamble_dechirped);
     free(d->symbuf);
     free(d);
 }
@@ -898,6 +961,12 @@ static void reset_to_idle(lora_decoder_t *d)
     d->cfo_frac           = 0.0f;
     d->snr_db_sum         = 0.0;
     d->snr_db_count       = 0;
+    d->sfo_cum            = 0.0;
+    d->sfo_hat            = 0.0;
+    d->sto_frac           = 0.0f;
+    d->sfo_next_sym_shift = 0;
+    d->preamble_dechirped_count = 0;
+    d->preamble_dechirped_next  = 0;
     /* Rebuild the chirp references to id=0. apply_cfo_correction
      * (called at DC2) mutates d->upchirp and d->downchirp in place
      * to bake the just-measured cfo_int into the reference. Without
@@ -912,6 +981,70 @@ static void reset_to_idle(lora_decoder_t *d)
      * with the drift-across-payload signature -- because the chirp
      * references stayed mutated from the first frame's cfo_int. */
     build_chirps(d->upchirp, d->downchirp, d->N);
+}
+
+/* RCTSL (Rational Combined Three Spectral Line) fractional STO estimator.
+ *
+ * Ported from gr-lora_sdr frame_sync_impl.cc:254-320 (estimate_STO_frac).
+ * Algorithm: zero-pad each saved dechirped preamble symbol to 2N samples,
+ * FFT it, accumulate per-bin |Y|^2 across all saved symbols, find the
+ * argmax k0 across the 2N-point averaged spectrum, then apply the
+ * Cui Yang interpolation formula on three adjacent spectral lines:
+ *
+ *   u = 64*N / 406.5506497
+ *   v = u * 2.4674
+ *   wa = (Y[+1] - Y[-1]) / ( u*(Y[+1]+Y[-1]) + v*Y[0] )
+ *   ka = wa * N / pi
+ *   k_residual = ((k0 + ka)/2) mod 1
+ *   sto_frac = k_residual - (k_residual > 0.5 ? 1 : 0)
+ *
+ * Result is in [-0.5, +0.5] -- sub-bin fractional STO offset. Stored on
+ * the decoder for downstream use; we don't currently apply it as a
+ * sample-shift (would require os_factor>=2). For os_factor=1 channelizer
+ * output this still measures the offset so future work can fold it into
+ * the FFT phase-rotation path. */
+static void compute_sto_frac(lora_decoder_t *d)
+{
+    if (!d->preamble_dechirped || d->preamble_dechirped_count == 0 ||
+        !d->fft2_plan) {
+        d->sto_frac = 0.0f;
+        return;
+    }
+    const int N  = d->N;
+    const int M2 = 2 * N;
+    /* Accumulate |Y|^2 across saved symbols. */
+    static double mag_sq[2 * MAX_FFT];
+    for (int j = 0; j < M2; ++j) mag_sq[j] = 0.0;
+    for (int s = 0; s < d->preamble_dechirped_count; ++s) {
+        const float complex *sym = &d->preamble_dechirped[(size_t)s * N];
+        float complex *in = (float complex *)d->fft2_in;
+        for (int i = 0; i < N;  ++i) in[i] = sym[i];
+        for (int i = N; i < M2; ++i) in[i] = 0.0f + 0.0f * I;
+        fftwf_execute(d->fft2_plan);
+        const float complex *out = (const float complex *)d->fft2_out;
+        for (int j = 0; j < M2; ++j) {
+            float r = crealf(out[j]), im = cimagf(out[j]);
+            mag_sq[j] += (double)(r * r + im * im);
+        }
+    }
+    /* argmax */
+    int k0 = 0;
+    double peak = mag_sq[0];
+    for (int j = 1; j < M2; ++j) {
+        if (mag_sq[j] > peak) { peak = mag_sq[j]; k0 = j; }
+    }
+    /* Three spectral lines (wrap-around). */
+    double Y_1 = mag_sq[(k0 - 1 + M2) % M2];
+    double Y0  = mag_sq[k0];
+    double Y1  = mag_sq[(k0 + 1) % M2];
+    double u = 64.0 * (double)N / 406.5506497;
+    double v = u * 2.4674;
+    double denom = u * (Y1 + Y_1) + v * Y0;
+    double wa = (denom != 0.0) ? (Y1 - Y_1) / denom : 0.0;
+    double ka = wa * (double)N / M_PI;
+    double k_residual = fmod(((double)k0 + ka) / 2.0, 1.0);
+    if (k_residual < 0) k_residual += 1.0;
+    d->sto_frac = (float)(k_residual - (k_residual > 0.5 ? 1.0 : 0.0));
 }
 
 /* Run the state machine for one accumulated symbol. */
@@ -1039,6 +1172,18 @@ static void state_tick(lora_decoder_t *d)
             int B_HIST = (int)(sizeof(d->preamble_bin_hist) / sizeof(d->preamble_bin_hist[0]));
             if (d->preamble_bin_hist_count < B_HIST)
                 d->preamble_bin_hist[d->preamble_bin_hist_count++] = (int)sym;
+            /* Snapshot the dechirped time-domain samples for RCTSL sto_frac
+             * estimation. demod_one_symbol_full left them in d->fft_in.
+             * Rolling buffer keeps the last K preamble symbols. */
+            if (d->preamble_dechirped) {
+                int K = d->preamble_dechirped_capacity;
+                int slot = d->preamble_dechirped_next;
+                memcpy(&d->preamble_dechirped[(size_t)slot * d->N],
+                       d->fft_in, sizeof(float complex) * (size_t)d->N);
+                d->preamble_dechirped_next = (slot + 1) % K;
+                if (d->preamble_dechirped_count < K)
+                    d->preamble_dechirped_count++;
+            }
         } else if (d->preamble_count >= PREAMBLE_MIN) {
             /* Bin shifted significantly after we had a confirmed preamble:
              * this is the first sync-word symbol. Treat it as such -- skip
@@ -1055,6 +1200,10 @@ static void state_tick(lora_decoder_t *d)
             d->state      = STATE_HEADER;
             STATS_BUMP(sync_seen,       d->sf);
             STATS_BUMP(header_attempts, d->sf);
+            /* RCTSL fractional STO estimate. Currently advisory-only at
+             * os_factor=1 (sub-sample shift would need os>=2); the value
+             * is stored on the decoder for downstream use. */
+            compute_sto_frac(d);
             /* k_hat = mode of the captured preamble bins (gr-lora_sdr's
              * `most_frequent(preamb_up_vals, n_up_req)` form, frame_sync_impl.cc:534).
              * The IDLE-entry latch can be off by ±1 due to FFT peak landing
@@ -1174,6 +1323,19 @@ static void state_tick(lora_decoder_t *d)
                 if (trace_on)
                     fprintf(stderr, "[lora] cfo_int=%d cfo_frac=%.4f (down_val=%d)\n",
                             d->cfo_int, (double)d->cfo_frac, down_val);
+                /* gr-lora_sdr-style SFO drift estimate, frame_sync_impl.cc:638.
+                 * Same-crystal assumption: sample-rate offset and carrier
+                 * offset are proportional. sfo_hat (in fractional samples
+                 * per symbol) = (cfo_bins) * bw_hz / center_freq_hz where
+                 * cfo_bins = cfo_int + cfo_frac. Drives the per-symbol
+                 * consume-count adjustment in STATE_PAYLOAD below. */
+                if (d->center_freq_hz > 0.0) {
+                    double cfo_bins = (double)d->cfo_int + (double)d->cfo_frac;
+                    d->sfo_hat = cfo_bins * (double)d->bw_hz / d->center_freq_hz;
+                } else {
+                    d->sfo_hat = 0.0;
+                }
+                d->sfo_cum = 0.0;
             }
             d->header_idx++;
             if (d->header_idx == 2) {
@@ -1516,6 +1678,51 @@ static void state_tick(lora_decoder_t *d)
         break;
     }
     }
+
+    /* gr-lora_sdr-style per-symbol SFO drift adjustment, frame_sync_impl.cc:855-862.
+     *
+     * sfo_hat is fractional samples of drift per symbol, set at DC2 from the
+     * measured CFO and the slot's center frequency (same-crystal assumption).
+     * Per symbol we accumulate sfo_cum; when it crosses 1/(2*os_factor) we
+     * skip an input sample before the next FFT to maintain symbol-grid
+     * alignment. Applied to every symbol AFTER the DC2 measurement -- the
+     * header data symbols also need this, not just payload.
+     *
+     * Positive direction only for now: shifts the next FFT start one sample
+     * later via sto_skip_remaining. Negative direction (receiver clock slow,
+     * sample stream falls behind grid) is unimplemented.
+     *
+     * Conditional on state to skip preamble + DC1 + DC2 ticks. After
+     * reset_to_idle (frame delivered) the state machine returns to IDLE
+     * and sfo_hat is zeroed, so the accumulator quiesces. */
+    bool apply_drift = (d->state == STATE_HEADER && d->header_idx >= 2)
+                    || (d->state == STATE_PAYLOAD);
+    if (apply_drift && d->sfo_hat != 0.0) {
+        d->sfo_cum += d->sfo_hat;
+        /* Threshold = 1.0 instead of gr-lora's 1/(2*os) = 0.5. Empirically
+         * a 0.5 threshold fires the carry-back mechanism at moderate drift
+         * cells (LongSlow SFO=5 ppm) where the cumulative drift over a
+         * frame is only ~1 sample and the decoder already tolerates it
+         * without help. The cost of carry-back (one sample of phase-
+         * discontinuity contamination in the next FFT) outweighs the
+         * benefit at low drift. Threshold 1.0 only fires when accumulated
+         * drift would push the FFT peak ~1 full bin off the symbol grid. */
+        const double thresh = 1.0;
+        const double adj = 1.0 / (double)d->os_factor;
+        if (d->sfo_cum > thresh) {
+            d->sfo_next_sym_shift = +1;
+            d->sfo_cum -= adj;
+        } else if (d->sfo_cum < -thresh) {
+            d->sfo_next_sym_shift = -1;
+            d->sfo_cum += adj;
+        }
+        const char *dbg = getenv("MESHTASTIC_LORA_DEBUG_SFO");
+        if (dbg && *dbg == '1') {
+            fprintf(stderr, "[sfo] state=%d hdr_idx=%d sfo_hat=%.4f cum=%.4f shift=%+d\n",
+                    d->state, d->header_idx, d->sfo_hat, d->sfo_cum,
+                    d->sfo_next_sym_shift);
+        }
+    }
 }
 
 void lora_decoder_feed(lora_decoder_t *d, const float complex *samples, size_t n)
@@ -1535,7 +1742,25 @@ void lora_decoder_feed(lora_decoder_t *d, const float complex *samples, size_t n
         d->symbuf[d->symbuf_count++] = samples[i];
         if (d->symbuf_count == spsym) {
             state_tick(d);
-            d->symbuf_count = 0;
+            /* Apply SFO drift-corrected symbol boundary shift, set by
+             * state_tick during STATE_HEADER post-DC2 / STATE_PAYLOAD.
+             *
+             * +1 = next FFT 1 sample EARLIER. Achieved by reusing this
+             *      symbol's last sample as the next symbol's first.
+             * -1 = next FFT 1 sample LATER. Achieved via one extra
+             *      sto_skip_remaining (which lora_decoder_feed already
+             *      honors at the top of this loop).
+             *  0 = no shift (default). */
+            if (d->sfo_next_sym_shift > 0) {
+                d->symbuf[0] = d->symbuf[spsym - 1];
+                d->symbuf_count = 1;
+            } else if (d->sfo_next_sym_shift < 0) {
+                d->sto_skip_remaining += 1;
+                d->symbuf_count = 0;
+            } else {
+                d->symbuf_count = 0;
+            }
+            d->sfo_next_sym_shift = 0;
         }
     }
 }
