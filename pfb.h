@@ -43,6 +43,16 @@ typedef void (*pfb_emit_cb)(int channel_id, const float complex *iq,
  * Returns NULL on allocation failure. */
 pfb_t *pfb_create(int M, int L, double pre_shift_hz, double samp_rate);
 
+/* Construct an os-times-oversampled PFB: same M channels and channel
+ * bandwidth (Fs/M), but each channel's output is produced at os*Fs/M
+ * instead of Fs/M. The commutator advances M/os input samples per
+ * output cycle (50% overlap at os=2) with a per-cycle bin phase
+ * twiddle, so the channel is a TRUE oversampled version of the same
+ * Fs/M-wide channel -- NOT a wider channel. M must be divisible by os.
+ * os=1 is identical to pfb_create. Returns NULL on bad args / alloc. */
+pfb_t *pfb_create_os(int M, int L, double pre_shift_hz, double samp_rate,
+                     int os);
+
 /* Register an output bin. bin is in FFTW natural order (0..M-1, where
  * 0..M/2 = positive frequencies, M/2..M-1 = negative frequencies in
  * FFT-shift sense). Multiple decoders may bind to the same bin -- a

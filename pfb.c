@@ -144,6 +144,16 @@ struct bin_sink {
 struct pfb {
     int               M;
     int               L;
+    int               os;          /* oversample factor; 1 = critically sampled */
+    /* Oversampled path only (os>1): linear history ring of the last
+     * M*L post-NCO input samples, plus an absolute input counter. The
+     * commutator advances M/os samples per output cycle (overlap); a
+     * per-cycle bin twiddle (exp(j*2*pi*b*(block_start mod M)/M))
+     * keeps consecutive outputs phase-consistent. */
+    float complex    *hist;
+    int               hist_cap;    /* = M*L */
+    int               hist_w;      /* next write index into hist */
+    long long         total_in;    /* count of input samples consumed */
     double            samp_rate;
     /* Polyphase taps: contiguous M*L floats, indexed h_p[i*L + k]. */
     float            *h_p;
@@ -429,6 +439,7 @@ pfb_t *pfb_create(int M, int L, double pre_shift_hz, double samp_rate)
     if (!p) return NULL;
     p->M = M;
     p->L = L;
+    p->os = 1;
     p->samp_rate = samp_rate;
 
     p->h_p = malloc(sizeof(float)         * (size_t)M * (size_t)L);
@@ -504,6 +515,26 @@ pfb_t *pfb_create(int M, int L, double pre_shift_hz, double samp_rate)
         return NULL;
     }
 
+    return p;
+}
+
+pfb_t *pfb_create_os(int M, int L, double pre_shift_hz, double samp_rate,
+                     int os)
+{
+    if (os < 1) os = 1;
+    if (os > 1 && (M % os != 0)) return NULL;
+    pfb_t *p = pfb_create(M, L, pre_shift_hz, samp_rate);
+    if (!p || os == 1) return p;
+    p->os = os;
+    p->hist_cap = M * L;
+    p->hist = calloc((size_t)p->hist_cap, sizeof(float complex));
+    if (!p->hist) { pfb_destroy(p); return NULL; }
+    p->hist_w   = 0;
+    p->total_in = 0;
+    /* Group delay is (L*M-1)/2 input samples = (L-1)/2 output samples at
+     * the os=1 rate; output cycles fire os times more often, so drop os*
+     * as many warmup cycles. */
+    p->warmup_remaining = ((L - 1) / 2 + 1) * os;
     return p;
 }
 
@@ -623,9 +654,83 @@ static inline void pfb_one_cycle(pfb_t *p)
     p->cycle++;
 }
 
+/* One oversampled output cycle, fired every M/os input samples. Uses
+ * the linear history ring (direct polyphase) rather than the per-branch
+ * reverse rings of the critically-sampled path. Branch i holds the
+ * sample at absolute index (block_start + i) and its M-strided history;
+ * the per-cycle bin twiddle compensates for the commutator advancing
+ * by M/os (not M) each cycle. At os=1 block_start advances by M so the
+ * twiddle is identity and this matches pfb_one_cycle. */
+static inline void pfb_cycle_os(pfb_t *p)
+{
+    int M = p->M;
+    int L = p->L;
+    long long p_idx = p->total_in - 1;          /* newest sample, absolute */
+    long long block_start = p_idx - (long long)(M - 1);
+    int cap = p->hist_cap;
+    int w = p->hist_w;                           /* points one past newest */
+
+    for (int i = 0; i < M; ++i) {
+        const float *h = &p->h_p[i * L];
+        float acc_re = 0.0f, acc_im = 0.0f;
+        for (int k = 0; k < L; ++k) {
+            long long back = (long long)(M - 1 - i) + (long long)k * M;
+            if (back >= cap) break;              /* beyond history horizon */
+            int hpos = w - 1 - (int)back;
+            hpos %= cap;
+            if (hpos < 0) hpos += cap;
+            float complex xv = p->hist[hpos];
+            acc_re += crealf(xv) * h[k];
+            acc_im += cimagf(xv) * h[k];
+        }
+        p->fft_in[i] = acc_re + I * acc_im;
+    }
+    fftwf_execute(p->fft_plan);
+
+    if (p->warmup_remaining > 0) {
+        --p->warmup_remaining;
+        ++p->cycle;
+        return;
+    }
+
+    int shift = (int)(((block_start % M) + M) % M);
+    for (int b = 0; b < M; ++b) {
+        if (!p->bins[b]) continue;
+        float complex y = (float complex)p->fft_out[b];
+        if (shift != 0) {
+            double ph = 2.0 * M_PI * (double)b * (double)shift / (double)M;
+            y *= (float)cos(ph) + I * (float)sin(ph);
+        }
+        emit_to_bin(p, b, y);
+    }
+    ++p->cycle;
+}
+
+static void pfb_process_os(pfb_t *p, const float complex *samples, size_t n)
+{
+    int M = p->M;
+    int D = M / p->os;                           /* commutator advance/cycle */
+    int cap = p->hist_cap;
+    for (size_t s = 0; s < n; ++s) {
+        float complex x = samples[s] * p->nco_current;
+        p->nco_current *= p->nco_phasor;
+        if (++p->nco_renorm >= 1024) {
+            p->nco_renorm = 0;
+            float mag = cabsf(p->nco_current);
+            if (mag > 0.0f) p->nco_current /= mag;
+        }
+        p->hist[p->hist_w] = x;
+        p->hist_w = (p->hist_w + 1) % cap;
+        ++p->total_in;
+        if (p->total_in % D == 0)
+            pfb_cycle_os(p);
+    }
+}
+
 void pfb_process(pfb_t *p, const float complex *samples, size_t n)
 {
     if (!p || !samples) return;
+    if (p->os > 1) { pfb_process_os(p, samples, n); return; }
     int M = p->M;
     int L = p->L;
     /* M=1 special case: there's no actual channelization to do (input
@@ -723,6 +828,7 @@ void pfb_destroy(pfb_t *p)
     free(p->bins);
     free(p->dly);
     free(p->h_p);
+    free(p->hist);
     pthread_mutex_destroy(&p->flush_mu);
     pthread_cond_destroy(&p->flush_cv);
     free(p);

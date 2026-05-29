@@ -137,17 +137,22 @@ static int find_or_create_group(channelizer_t *c, int bw_hz, int os_factor,
     grp->samp_rate = (double)c->samp_rate;
     double pre_shift = first_channel_hz - (double)c->f_center;
     grp->bin_0_freq = first_channel_hz;
-    grp->pfb = pfb_create(M, PFB_TAPS_PER_BR, pre_shift, (double)c->samp_rate);
+    /* os_factor > 1 makes the PFB emit os*bw_hz per channel (a TRUE
+     * oversampled version of the same bw_hz-wide channel, with guard
+     * band -- not a wider channel). M (channel count / bin grid) is
+     * unchanged. */
+    grp->pfb = pfb_create_os(M, PFB_TAPS_PER_BR, pre_shift,
+                             (double)c->samp_rate, os_factor);
     if (!grp->pfb) {
         --c->n_groups;
         return -1;
     }
     if (verbose) {
         fprintf(stderr,
-                "channelizer: PFB group %d  BW=%d kHz  M=%d  bin0=%.3f MHz  "
+                "channelizer: PFB group %d  BW=%d kHz  M=%d  os=%d  bin0=%.3f MHz  "
                 "pre_shift=%+.0f Hz  output=%.3f kHz/bin\n",
-                gidx, bw_hz / 1000, M, grp->bin_0_freq / 1e6,
-                pre_shift, pfb_output_rate(grp->pfb) / 1e3);
+                gidx, bw_hz / 1000, M, os_factor, grp->bin_0_freq / 1e6,
+                pre_shift, pfb_output_rate(grp->pfb) / 1e3 * os_factor);
     }
     return gidx;
 }
@@ -169,13 +174,10 @@ int channelizer_add_channel(channelizer_t *c, const channel_cfg_t *cfg)
     if ((uint32_t)cfg->bw_hz > c->samp_rate) return -1;
 
     int os = cfg->os_factor > 0 ? cfg->os_factor : 1;
-    /* Critically-sampled PFB outputs at exactly bw_hz, regardless of the
-     * caller's requested os_factor. The LoRa demod must be created with
-     * os=1 in this mode -- main.c already does that when our channel's
-     * BW divides the rate evenly with M >= 2. */
-    (void)os;
-
-    int gidx = find_or_create_group(c, cfg->bw_hz, 1, (double)cfg->f_hz);
+    /* Honor cfg->os_factor: the PFB group oversamples each channel by os
+     * (output rate = os*bw_hz) while keeping the channel bw_hz wide. The
+     * decoder is created at the matching os_factor by the caller. */
+    int gidx = find_or_create_group(c, cfg->bw_hz, os, (double)cfg->f_hz);
     if (gidx < 0) return -1;
     pfb_group_t *grp = &c->groups[gidx];
     int M = pfb_M(grp->pfb);

@@ -884,13 +884,27 @@ static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr)
         return -1;
     }
 
-    /* The polyphase channelizer always emits critically sampled (output
-     * rate = bw_hz), so the LoRa demod runs at os_factor=1 regardless
-     * of the SDR-to-BW ratio. The fractional-STO compensation that the
-     * cascade DDC needed for real radio (os_factor>=2) is unnecessary
-     * here -- the PFB's prototype filter delivers integer-sample
-     * alignment by construction. */
+    /* The polyphase channelizer emits critically sampled channels (output
+     * rate = bw_hz) at os_factor=1. PROTOTYPE: MESHTASTIC_PROTOTYPE_OS=N
+     * makes the PFB natively oversample each channel by N (output rate
+     * N*bw_hz, same bw_hz-wide channel with guard band) and runs the
+     * decoder at os_factor=N, giving its fractional-STO/SFO machinery
+     * real sub-sample resolution. Default (unset) keeps os=1. */
     int os_factor = 1;
+    {
+        const char *e = getenv("MESHTASTIC_PROTOTYPE_OS");
+        if (e) {
+            int v = atoi(e);
+            if (v >= 1 && v <= 4) os_factor = v;
+        }
+        /* DIAG: SF-gated os. The native oversampled PFB helps the
+         * shortest-symbol presets (SF7) at SFO=25 but the os=2 decoder
+         * path regresses SF8+. MESHTASTIC_PROTOTYPE_OS_MAXSF caps which
+         * SF gets oversampled (default: all). Set to 7 to oversample
+         * only SF7. */
+        const char *ms = getenv("MESHTASTIC_PROTOTYPE_OS_MAXSF");
+        if (ms && sf > atoi(ms)) os_factor = 1;
+    }
     channel_cfg_t cfg = {
         .f_hz        = f_hz,
         .bw_hz       = bw_hz,
