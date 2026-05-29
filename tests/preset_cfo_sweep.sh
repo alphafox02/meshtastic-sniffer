@@ -80,12 +80,17 @@ for spec in "${PRESETS[@]}"; do
 
     col=$(sf_col "$SF")
 
+    # --no-sfo-inference: pure CFO sweep with no matching SFO. Without
+    # it the decoder would derive sfo_hat from injected CFO under the
+    # same-crystal assumption (correct for real radio, wrong for this
+    # synthetic CFO-only injection).
     # Positive side
     printf "  %-${pad}s | %4d/%-2d | %6d |" "$NAME" "$BW" "$SF" "$BIN_HZ"
     for fr in "${FRACS[@]}"; do
         cfo=$(python3 -c "print(int(round($fr * $BIN_HZ)))")
         out=$("$TOOL" --file="$OUT" --fmt=cf32 --rate="$SAMP_RATE" --no-ddc \
             --bw="$BW" --sf="$SF" --cr="$CR" --os="$OS" --duration=0 \
+            --no-sfo-inference \
             --cfo="$cfo" 2>&1)
         crcp=$(echo "$out" | awk -v c="$col" '/payload_crc_pass/  { print $c }')
         crcf=$(echo "$out" | awk -v c="$col" '/payload_crc_fail/  { print $c }')
@@ -103,6 +108,7 @@ for spec in "${PRESETS[@]}"; do
         cfo=$(python3 -c "print(-int(round($fr * $BIN_HZ)))")
         out=$("$TOOL" --file="$OUT" --fmt=cf32 --rate="$SAMP_RATE" --no-ddc \
             --bw="$BW" --sf="$SF" --cr="$CR" --os="$OS" --duration=0 \
+            --no-sfo-inference \
             --cfo="$cfo" 2>&1)
         crcp=$(echo "$out" | awk -v c="$col" '/payload_crc_pass/  { print $c }')
         crcf=$(echo "$out" | awk -v c="$col" '/payload_crc_fail/  { print $c }')

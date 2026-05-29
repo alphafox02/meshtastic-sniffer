@@ -69,8 +69,14 @@ printf "  %10s | %4s %4s %4s %4s %12s\n" "CFO_Hz" "lock" "hdr" "crc+" "crc-" "st
 echo   "  ---------------------------------------------------------"
 for cfo in "${CFOS[@]}"; do
     out="$WORK/run_${cfo}.log"
+    # --no-sfo-inference: this fixture injects pure CFO with no matching
+    # SFO (synthetic CFO sweep). Without the flag, the decoder would
+    # infer sfo_hat from measured CFO under the same-crystal assumption
+    # and fire the SFO drift compensator -- which is not what this test
+    # is exercising (CFO sign symmetry).
     "$TOOL" --file="$WORK/synth.cf32" --fmt=cf32 --rate=1000000 --no-ddc \
         --bw=250000 --sf=11 --cr=5 --os=4 --duration=0 \
+        --no-sfo-inference \
         --cfo="$cfo" > /dev/null 2> "$out"
     # Parse the SF11 column (index 5 of the 6 SF columns, 1-based field 6
     # after the stage name). Atomic counter columns are aligned %10llu.

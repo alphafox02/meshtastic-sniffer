@@ -99,7 +99,15 @@ static void usage(const char *argv0)
         "                    os * bw, channel at DC. (For synthetic tests.)\n"
         "  --cfo=HZ          inject a carrier-frequency offset at the post-\n"
         "                    DDC rate before feeding the decoder. Used to\n"
-        "                    isolate CFO-tracking bugs from clean-IQ bugs.\n",
+        "                    isolate CFO-tracking bugs from clean-IQ bugs.\n"
+        "  --no-sfo-inference  skip lora_decoder_set_center_freq() so the\n"
+        "                    decoder does NOT derive sfo_hat from measured\n"
+        "                    CFO. Use for fixtures that inject pure CFO\n"
+        "                    without matching SFO (LO offset, tuning\n"
+        "                    offset, synthetic CFO sweeps). Default off:\n"
+        "                    matches production where set_center_freq is\n"
+        "                    always called and same-crystal SFO inference\n"
+        "                    is active.\n",
         argv0);
 }
 
@@ -117,6 +125,7 @@ int main(int argc, char **argv)
     double duration_s = 30.0;
     int    n_taps     = 257;
     int    skip_ddc   = 0;
+    int    no_sfo_inference = 0;
     double inject_cfo_hz = 0.0;
 
     for (int i = 1; i < argc; ++i) {
@@ -133,6 +142,7 @@ int main(int argc, char **argv)
         else if (!strncmp(a, "--duration=",11)) duration_s  = atof(a + 11);
         else if (!strncmp(a, "--ntaps=",    8)) n_taps      = atoi(a + 8);
         else if (!strcmp (a, "--no-ddc"))       skip_ddc    = 1;
+        else if (!strcmp (a, "--no-sfo-inference")) no_sfo_inference = 1;
         else if (!strncmp(a, "--cfo=",      6)) inject_cfo_hz = atof(a + 6);
         else if (!strcmp (a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", a); usage(argv[0]); return 2; }
@@ -186,10 +196,14 @@ int main(int argc, char **argv)
      * assigns a channel. Without it the decoder lazy-allocation of the
      * RCTSL preamble-dechirped buffer is skipped (compute_sto_frac
      * early-returns sto_frac=0) and sfo_hat stays 0 (no SFO inference).
-     * The historical absence of this call muted both code paths in this
-     * harness, which is why every fractional-STO trace through it came
-     * up zero. */
-    lora_decoder_set_center_freq(dec, channel_hz);
+     *
+     * --no-sfo-inference opts out for fixtures that inject pure CFO
+     * with no matching SFO (LO offset, tuning offset, synthetic CFO
+     * sweeps). For those, the same-crystal sfo_hat the decoder would
+     * derive from measured CFO is non-physical and fires the SFO drift
+     * compensator spuriously. */
+    if (!no_sfo_inference)
+        lora_decoder_set_center_freq(dec, channel_hz);
 
     /* Mix oscillator: shift the channel to DC. */
     double freq_offset_hz = channel_hz - center_hz;
