@@ -112,7 +112,8 @@ def synth_cell(preset_cfg: dict, snr_db: float, cfo_hz: float, sfo_ppm: float,
     subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
 
 
-def count_ours(out_path: Path, preset_cfg: dict, os_factor: int) -> int:
+def count_ours(out_path: Path, preset_cfg: dict, os_factor: int,
+               prototype_os: int = 1) -> int:
     channel_rate = preset_cfg["bw"] * os_factor
     cmd = [
         str(SNIFFER),
@@ -125,7 +126,13 @@ def count_ours(out_path: Path, preset_cfg: dict, os_factor: int) -> int:
         "--region=US",
         "--keys=default",
     ]
-    proc = subprocess.run(cmd, capture_output=True, timeout=120)
+    # prototype_os>1 selects the native oversampled-PFB path via the same
+    # env var production uses (main.c). Default (1) leaves the env unset, so
+    # the default critically-sampled production path is measured unchanged.
+    env = dict(os.environ)
+    if prototype_os > 1:
+        env["MESHTASTIC_PROTOTYPE_OS"] = str(prototype_os)
+    proc = subprocess.run(cmd, capture_output=True, timeout=120, env=env)
     n_pass = 0
     for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
         line = line.strip()
@@ -217,7 +224,8 @@ def count_gr(out_path: Path, preset_cfg: dict, os_factor: int) -> int:
 
 
 def run_cell(preset: str, snr_db: float, cfo_hz: float, sfo_ppm: float,
-             n_frames: int, os_factor: int, seed: int, work: Path) -> CellResult:
+             n_frames: int, os_factor: int, seed: int, work: Path,
+             prototype_os: int = 1) -> CellResult:
     """Run N independent single-frame synths per cell. Each synth uses a
     different seed so the noise realization varies; the underlying signal
     is identical. Aggregates pass-counts across trials.
@@ -233,7 +241,7 @@ def run_cell(preset: str, snr_db: float, cfo_hz: float, sfo_ppm: float,
     for trial in range(n_frames):
         out = work / f"synth_{preset}_snr{snr_db:.0f}_cfo{cfo_hz:.0f}_sfo{sfo_ppm:.1f}_t{trial}.cs8"
         synth_cell(cfg, snr_db, cfo_hz, sfo_ppm, 1, os_factor, seed + trial, out)
-        ours_total   += count_ours(out, cfg, os_factor)
+        ours_total   += count_ours(out, cfg, os_factor, prototype_os)
         gr_total     += count_gr(out, cfg, os_factor)
         lorarx_total += count_lorarx(out, cfg, os_factor)
         try:
@@ -259,6 +267,11 @@ def parse_args() -> argparse.Namespace:
                    help="Comma-separated SFO cells in ppm (0 = clock-locked)")
     p.add_argument("--n-frames", type=int, default=10)
     p.add_argument("--os-factor", type=int, default=4)
+    p.add_argument("--prototype-os", type=int, default=1,
+                   help="Decoder oversampled-PFB factor for OUR sniffer only "
+                        "(sets MESHTASTIC_PROTOTYPE_OS). 1 = default production "
+                        "path (critically sampled). Must divide os-factor. "
+                        "References (gr-lora, lorarx) are unaffected.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--csv", default="/tmp/sensitivity.csv")
     p.add_argument("--workdir", default="/tmp/sensitivity_work")
@@ -279,6 +292,17 @@ def main() -> int:
     cfos = [float(c) for c in args.cfo_hz.split(",") if c.strip()]
     sfos = [float(s) for s in args.sfo_ppm.split(",") if s.strip()]
 
+    # The PFB channel count M = rate/bw = os_factor, and pfb_create_os
+    # requires M % prototype_os == 0, else channel creation fails (0 decodes).
+    if args.prototype_os > 1 and args.os_factor % args.prototype_os != 0:
+        print(f"--prototype-os={args.prototype_os} must divide --os-factor="
+              f"{args.os_factor} (PFB M=os-factor)", file=sys.stderr)
+        return 2
+    if args.prototype_os > 1:
+        print(f"NOTE: measuring OUR sniffer at MESHTASTIC_PROTOTYPE_OS="
+              f"{args.prototype_os} (oversampled-PFB path); references unchanged.",
+              file=sys.stderr)
+
     results: list[CellResult] = []
     total = len(presets) * len(snrs) * len(cfos) * len(sfos)
     idx = 0
@@ -290,7 +314,8 @@ def main() -> int:
                     print(f"[{idx}/{total}] {preset:14s} SNR={snr:+5.1f} CFO={cfo:+6.0f} SFO={sfo:+5.1f}ppm ... ",
                           end="", file=sys.stderr, flush=True)
                     r = run_cell(preset, snr, cfo, sfo, args.n_frames,
-                                 args.os_factor, args.seed, work)
+                                 args.os_factor, args.seed, work,
+                                 args.prototype_os)
                     results.append(r)
                     print(f"ours={r.ours_pass:3d}  gr={r.gr_pass:3d}  "
                           f"lorarx={r.lorarx_pass:3d}",
