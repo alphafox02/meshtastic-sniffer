@@ -868,6 +868,33 @@ int app_add_runtime_extra_freq(uint64_t f_hz, int bw_hz, int sf, int cr)
 
 /* ---- Build the channel set for the configured (region, presets) pair ---- */
 
+/* Per-(SF,BW) PFB oversampling policy, enabled by MESHTASTIC_OS_POLICY=auto.
+ *
+ * Measured with tests/sensitivity.py --prototype-os at SFO=25 ppm / SNR=10 dB
+ * (n=30): each preset has a DISTINCT preferred oversampling factor. Native
+ * oversampling gives the decoder's fractional-STO/SFO machinery sub-sample
+ * resolution -- it closes the SFO gap to gr-lora/lorarx parity on the
+ * short/turbo presets, but it HURTS SF8 (ShortSlow declines 30->22->13 with
+ * more os) and is wasted on the already-clean BW125 long presets. So we apply
+ * oversampling ONLY where the measurements prove it helps, never globally.
+ *
+ *   SF7/BW250 ShortFast  : 0  -> 29/30 at os=2
+ *   SF7/BW500 ShortTurbo : 11 -> 30/30 at os=2
+ *   SF9/BW250 MediumFast : 19 -> 29/30 at os=4
+ *   SF11/BW500 LongTurbo : 0  -> 30/30 at os=2
+ *
+ * SF10/BW250 (MediumSlow) and SF11/BW250 (LongFast) are unhelped by ANY os
+ * (0 at 1/2/4) -- they need decoder-estimator work, not oversampling, so
+ * they stay at 1. Everything else is already at parity at os=1. */
+static int os_policy_auto(int sf, int bw_hz)
+{
+    if (sf == 7  && bw_hz == 250000) return 2;  /* ShortFast  */
+    if (sf == 7  && bw_hz == 500000) return 2;  /* ShortTurbo */
+    if (sf == 9  && bw_hz == 250000) return 4;  /* MediumFast */
+    if (sf == 11 && bw_hz == 500000) return 2;  /* LongTurbo  */
+    return 1;
+}
+
 static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr)
 {
     /* Skip channels whose passband doesn't fit inside the capture.
@@ -892,18 +919,29 @@ static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr)
      * real sub-sample resolution. Default (unset) keeps os=1. */
     int os_factor = 1;
     {
+        /* MESHTASTIC_OS_POLICY=auto opts into the measured per-(SF,BW)
+         * oversampling table. Default (unset) keeps every channel at os=1
+         * = unchanged production behaviour. */
+        const char *pol = getenv("MESHTASTIC_OS_POLICY");
+        if (pol && !strcmp(pol, "auto"))
+            os_factor = os_policy_auto(sf, bw_hz);
+        /* Explicit MESHTASTIC_PROTOTYPE_OS overrides the policy (diagnostics
+         * / forcing a single factor across all channels). */
         const char *e = getenv("MESHTASTIC_PROTOTYPE_OS");
         if (e) {
             int v = atoi(e);
             if (v >= 1 && v <= 4) os_factor = v;
         }
-        /* DIAG: SF-gated os. The native oversampled PFB helps the
-         * shortest-symbol presets (SF7) at SFO=25 but the os=2 decoder
-         * path regresses SF8+. MESHTASTIC_PROTOTYPE_OS_MAXSF caps which
-         * SF gets oversampled (default: all). Set to 7 to oversample
-         * only SF7. */
+        /* DIAG: SF-gated os. MESHTASTIC_PROTOTYPE_OS_MAXSF caps which SF
+         * gets oversampled (default: all). Set to 7 to oversample only SF7. */
         const char *ms = getenv("MESHTASTIC_PROTOTYPE_OS_MAXSF");
         if (ms && sf > atoi(ms)) os_factor = 1;
+        /* Native oversampling needs M = samp_rate/bw divisible by os, else
+         * pfb_create_os fails. Fall back to os=1 if the grid doesn't divide. */
+        if (os_factor > 1) {
+            int M = (int)llround(samp_rate / (double)bw_hz);
+            if (M <= 0 || (M % os_factor) != 0) os_factor = 1;
+        }
     }
     channel_cfg_t cfg = {
         .f_hz        = f_hz,
