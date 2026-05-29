@@ -182,6 +182,14 @@ int main(int argc, char **argv)
     lora_decoder_t *dec = lora_decoder_create_os(sf, cr, bw_hz, os_factor);
     if (!dec) { fprintf(stderr, "lora_decoder_create_os failed\n"); fclose(f); return 1; }
     lora_decoder_set_callback(dec, on_frame, NULL);
+    /* Match production: main.c:910 calls this when the PFB channelizer
+     * assigns a channel. Without it the decoder lazy-allocation of the
+     * RCTSL preamble-dechirped buffer is skipped (compute_sto_frac
+     * early-returns sto_frac=0) and sfo_hat stays 0 (no SFO inference).
+     * The historical absence of this call muted both code paths in this
+     * harness, which is why every fractional-STO trace through it came
+     * up zero. */
+    lora_decoder_set_center_freq(dec, channel_hz);
 
     /* Mix oscillator: shift the channel to DC. */
     double freq_offset_hz = channel_hz - center_hz;
