@@ -719,7 +719,20 @@ downsample_symbol(lora_decoder_t *d, const float complex *src, int phase,
      * 1 input sample of residue at os=2; at SFO-induced fractional
      * symbol-boundary positions that residue manifests as a 1-bin
      * header dechirp shift. */
-    int fine = (int)lrintf(d->sto_frac * (float)os);
+    /* Continuous in-frame STO tracking: the static RCTSL sto_frac is the
+     * timing residual at preamble lock; sfo_cum is the drift accumulated
+     * since DC2 (sfo_cum += sfo_hat per symbol, state_tick tail). Folding
+     * sfo_cum into the per-symbol fine shift re-centres the dechirp window
+     * as the sample clock drifts across the frame -- the static one-shot
+     * sto_frac alone leaves the frame tail ~0.4 output samples off at
+     * SF9 SFO=25, smearing the last payload symbols off the bin grid.
+     *
+     * Complementary to the integer-sample carry-back below (not double
+     * counting): when the carry-back fires it advances the window +1 input
+     * sample AND decrements sfo_cum by 1/os, so this lrint drops by exactly
+     * 1 input sample -- net correction stays sto_frac + total_drift either
+     * way. At SFO=0 sfo_hat=0 so sfo_cum stays 0 and this is inert. */
+    int fine = (int)lrintf((d->sto_frac + (float)d->sfo_cum) * (float)os);
     for (int k = 0; k < d->N; ++k) {
         int idx = half + os * k - phase - fine;
         if (idx < 0) idx = 0;
