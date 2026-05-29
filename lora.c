@@ -423,6 +423,16 @@ struct lora_decoder {
     /* State machine. */
     lora_state_t state;
     int          preamble_count;
+    /* Running sum + count of dechirped peak magnitudes across matched
+     * preamble ticks. Used to detect window-straddle ticks where the
+     * argmax bin still lands on the preamble bin but the peak magnitude
+     * drops to ~sinc(0.5) of the preamble mean (= the FFT window is
+     * straddling the preamble/sync chirp boundary). Such ticks must
+     * trigger the sync transition even though their bin matches, or
+     * we over-count preamble by one symbol and read the header one
+     * symbol late -- the os_factor>=2 SFO=0 baseline failure. */
+    double       preamble_peak_sum;
+    int          preamble_peak_count;
     /* Set the first time preamble_count crosses PREAMBLE_MIN within one
      * STATE_PREAMBLE_OK run; cleared on every IDLE->PREAMBLE_OK entry.
      * Lets the stats counter record one "lock" per preamble rather than
@@ -987,6 +997,8 @@ static void reset_to_idle(lora_decoder_t *d)
     d->preamble_locked_once = 0;
     d->preamble_fft_count = 0;
     d->preamble_bin_hist_count = 0;
+    d->preamble_peak_sum  = 0.0;
+    d->preamble_peak_count = 0;
     d->header_idx         = 0;
     d->sto_skip_remaining = 0;
     d->hdr_leftover_count = 0;
@@ -1164,6 +1176,8 @@ static void state_tick(lora_decoder_t *d)
         d->preamble_fft_count = 0;
         d->preamble_bin_hist[0] = (int)sym;
         d->preamble_bin_hist_count = 1;
+        d->preamble_peak_sum   = (double)peak;
+        d->preamble_peak_count = 1;
         d->cfo_int         = 0;
         d->cfo_frac        = 0.0f;
         d->state           = STATE_PREAMBLE_OK;
@@ -1174,6 +1188,11 @@ static void state_tick(lora_decoder_t *d)
     case STATE_PREAMBLE_OK: {
         if (!above_floor) {
             /* Lost the signal -- back to hunting. */
+            if (framesync_enabled())
+                fprintf(stderr,
+                    "[fs] frame=%d POK_TICK sym=%d peak=%.3f noise=%.3f decision=below_floor\n",
+                    d->framesync_frame_idx + 1, (int)sym,
+                    (double)peak, (double)noise);
             reset_to_idle(d);
             d->preamble_fft_count = 0;
             break;
@@ -1181,15 +1200,64 @@ static void state_tick(lora_decoder_t *d)
         int diff = abs((int)sym - d->preamble_bin);
         /* Account for FFT wrap-around. */
         if (diff > d->N / 2) diff = d->N - diff;
+        /* Detect window-straddle ticks where the dechirped FFT spans
+         * the preamble->sync chirp boundary. In that case the argmax
+         * bin can land on the preamble bin (matching) but the peak
+         * magnitude drops to ~sinc(0.5) of the preamble mean (the
+         * energy is split between bin v and bin v+sync_offset). If
+         * we treat such a tick as still-preamble we over-count by one
+         * symbol and start the header one symbol late -- the
+         * os_factor=2 SFO=0 baseline failure. After at least
+         * PREAMBLE_MIN clean matches, a peak drop below
+         * STRADDLE_PEAK_RATIO of the running mean triggers the sync
+         * transition regardless of bin. Threshold 0.7 catches the
+         * observed ~0.5 ratio on straddle ticks with plenty of margin
+         * over natural preamble-peak variations. */
+        const float STRADDLE_PEAK_RATIO = 0.7f;
+        float preamble_peak_mean = (d->preamble_peak_count > 0)
+            ? (float)(d->preamble_peak_sum / (double)d->preamble_peak_count)
+            : 0.0f;
+        bool straddle_trigger =
+            (d->preamble_count >= PREAMBLE_MIN)
+            && (preamble_peak_mean > 0.0f)
+            && (peak < STRADDLE_PEAK_RATIO * preamble_peak_mean);
+        if (framesync_enabled()) {
+            /* frame_idx here is the *prospective* index of the frame
+             * currently being assembled; it gets committed at LOCK. The
+             * "+1" reflects that the LOCK emit hasn't yet incremented
+             * the counter for this frame attempt. */
+            const char *decision;
+            if (diff <= 2 && !straddle_trigger)
+                decision = "still";
+            else if (straddle_trigger)
+                decision = "sync_start_straddle";
+            else if (d->preamble_count >= PREAMBLE_MIN)
+                decision = "sync_start";
+            else
+                decision = "shift_in_prelock";
+            fprintf(stderr,
+                "[fs] frame=%d POK_TICK sym=%d peak=%.3f bin=%d diff=%d pcount=%d "
+                "mean_peak=%.3f decision=%s\n",
+                d->framesync_frame_idx + 1, (int)sym, (double)peak,
+                d->preamble_bin, diff, d->preamble_count,
+                (double)preamble_peak_mean, decision);
+        }
         /* ±2 bin tolerance: with Hamming-window leakage and residual CFO,
          * the preamble FFT peak can oscillate between three adjacent
          * bins. A ±1 tolerance fires SHIFT spuriously on the wobble.
          * The smallest sync-word offset we still need to detect cleanly
          * is sync_word=1 -> bin = 8 (LoRa convention), so ±2 leaves
          * margin without missing real syncs. */
-        if (diff <= 2) {
+        if (diff <= 2 && !straddle_trigger) {
             /* Still on preamble. Cap count so we're ready to detect sync. */
             if (d->preamble_count < PREAMBLE_MIN + 4) d->preamble_count++;
+            /* Update the running preamble-peak mean used by the
+             * straddle detector above. Capped at the same horizon as
+             * preamble_count so a late strong tick doesn't dilute the
+             * mean and let an outright noise tick masquerade as a
+             * straddle later. */
+            d->preamble_peak_sum   += (double)peak;
+            d->preamble_peak_count += 1;
             /* First tick where we've collected PREAMBLE_MIN matching symbols
              * is a "lock". Record only once per preamble run so the lock
              * count is a per-preamble event, not a per-symbol event. */
