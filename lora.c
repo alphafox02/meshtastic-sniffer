@@ -689,15 +689,20 @@ void lora_decoder_destroy(lora_decoder_t *d)
 /* ---- DSP helpers ----
  *
  * When os_factor > 1, the symbol buffer holds N*os samples per symbol.
- * We need to pick N samples with a sub-sample offset (the "phase") for
- * dechirp+FFT. The phase is chosen during preamble lock to align the
- * sampling grid with the chirp boundaries -- without this, real-radio
- * captures land each chirp at a fractional offset that smears the FFT
- * peak and breaks decode.
+ * Pick N samples with two layers of sub-sample correction for
+ * dechirp+FFT.
  *
- * Picks samples at indices os/2 + os*k - phase, k=0..N-1. Phase comes
- * from d->sto_offset, set during preamble lock. For os_factor=1 this
- * collapses to a memcpy (phase always 0). */
+ * Picks samples at indices os/2 + os*k - phase - fine, k=0..N-1.
+ *   phase = d->sto_offset (integer, 0..os-1), chosen by the phase
+ *           scan in state_tick at IDLE / first PREAMBLE_OK tick.
+ *   fine  = lrintf(sto_frac * os_factor), the per-symbol sub-output-
+ *           sample STO correction in INPUT samples. sto_frac is the
+ *           RCTSL fractional estimate set at preamble lock
+ *           (compute_sto_frac, range [-0.5, +0.5] output samples).
+ *           Ports gr-lora_sdr frame_sync_impl.cc:501.
+ *
+ * For os_factor=1 the early return makes this a memcpy. fine is also
+ * 0 there since sto_frac in [-0.5, +0.5] times 1 rounds to 0. */
 static inline const float complex *
 downsample_symbol(lora_decoder_t *d, const float complex *src, int phase,
                   float complex *scratch)
@@ -707,8 +712,16 @@ downsample_symbol(lora_decoder_t *d, const float complex *src, int phase,
     int half = os / 2;
     if (phase < 0) phase = 0;
     if (phase >= os) phase = os - 1;
+    /* Sub-output-sample STO correction (gr-lora_sdr frame_sync_impl.cc:501).
+     * At os=2: lrint of sto_frac in [-0.5, +0.5] * 2 = {-1, 0, +1} input
+     * samples (= ±0.5 output samples). At os=4: {-2, -1, 0, +1, +2}
+     * input samples. Without this, the integer phase pick leaves up to
+     * 1 input sample of residue at os=2; at SFO-induced fractional
+     * symbol-boundary positions that residue manifests as a 1-bin
+     * header dechirp shift. */
+    int fine = (int)lrintf(d->sto_frac * (float)os);
     for (int k = 0; k < d->N; ++k) {
-        int idx = half + os * k - phase;
+        int idx = half + os * k - phase - fine;
         if (idx < 0) idx = 0;
         if (idx >= d->samples_per_symbol) idx = d->samples_per_symbol - 1;
         scratch[k] = src[idx];
@@ -1394,12 +1407,20 @@ static void state_tick(lora_decoder_t *d)
                 ++d->framesync_frame_idx;
                 d->framesync_k_hat    = k_hat;
                 d->framesync_sto_skip = d->sto_skip_remaining;
+                /* sto_fine is the per-symbol input-sample shift
+                 * downsample_symbol will apply from sto_frac. At os=1
+                 * always 0 (lrint of [-0.5, +0.5]*1 = 0); at os>=2
+                 * this surfaces the gr-lora-style sub-output-sample
+                 * correction alongside the integer phase pick. */
+                int fs_fine = (d->os_factor > 1)
+                    ? (int)lrintf(d->sto_frac * (float)d->os_factor)
+                    : 0;
                 fprintf(stderr,
                     "[fs] frame=%d LOCK sf=%d os=%d k_hat=%d k_signed=%d sto_skip=%d "
-                    "sto_frac=%+0.4f cfo_frac=%+0.4f preamble_bins=[",
+                    "sto_frac=%+0.4f sto_fine=%+d cfo_frac=%+0.4f preamble_bins=[",
                     d->framesync_frame_idx, d->sf, d->os_factor, k_hat, k_signed,
                     d->sto_skip_remaining,
-                    (double)d->sto_frac, (double)d->cfo_frac);
+                    (double)d->sto_frac, fs_fine, (double)d->cfo_frac);
                 int hist_n = d->preamble_bin_hist_count;
                 for (int i = 0; i < hist_n; ++i)
                     fprintf(stderr, "%d%s", d->preamble_bin_hist[i],
