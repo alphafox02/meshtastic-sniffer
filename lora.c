@@ -1428,10 +1428,28 @@ static void state_tick(lora_decoder_t *d)
              * tick 1 = DC2 (measure cfo_int from downchirp dechirp). */
             if (d->header_idx == 1) {
                 int down_val = demod_downchirp_argmax(d, sym_samples);
-                if ((uint32_t)down_val < (uint32_t)(d->N / 2))
-                    d->cfo_int = down_val / 2;
-                else
-                    d->cfo_int = (down_val - d->N) / 2;
+                /* DC2 dechirp peak lives at round(2*(cfo_int + cfo_frac))
+                 * (with cfo_frac already estimated from preamble). The
+                 * naive floor-divide form `cfo_int = down_val / 2`
+                 * silently drops the half-bin LSB, which manifests as a
+                 * 1-bin cfo_int error any time the true CFO falls on a
+                 * half-bin boundary and cfo_frac wraps to its sign-
+                 * opposite (e.g. true cfo_bins = 11.71 -> cfo_frac is
+                 * estimated as -0.29 by the preamble four_cum, DC2 peak
+                 * lands at 23.42 which rounds to 23 or 24 from noise;
+                 * cfo_int = 11 or 12 from floor-divide gives
+                 * cfo_bins = 10.71 or 11.71 -- correct only half the
+                 * time). Disambiguate by using cfo_frac to pick the
+                 * rounding direction: cfo_int = round(down_val/2 -
+                 * cfo_frac). Both DC2 measurements (23 or 24) converge
+                 * to the same cfo_int. Manifests at SFO=25 ppm on the
+                 * Short/Medium/Long{Fast,Turbo} cells where induced
+                 * cfo_bins ~= 11.71 hits the half-bin boundary. */
+                int signed_down = (down_val < d->N / 2)
+                                  ? down_val
+                                  : down_val - d->N;
+                d->cfo_int = (int)lrint((double)signed_down / 2.0
+                                        - (double)d->cfo_frac);
                 if (framesync_enabled())
                     d->framesync_dc2_down_val = down_val;
                 /* DEBUG: env-gated force of cfo_int. */
