@@ -27,6 +27,16 @@
 
 typedef struct focused_worker focused_worker_t;
 
+/* Lifecycle state -- see Codex's Phase 3 Commit 3 plan. The worker
+ * itself drives the DECODING -> HOLD_DOWN -> IDLE transitions; external
+ * code (manual-focus block in main.c today, scanner promotion in
+ * Commit 4) drives IDLE -> DECODING via focused_worker_arm(). */
+typedef enum {
+    FOCUSED_STATE_IDLE       = 0,
+    FOCUSED_STATE_DECODING   = 1,
+    FOCUSED_STATE_HOLD_DOWN  = 2,
+} focused_state_t;
+
 typedef struct {
     /* Channel under focus. */
     double channel_hz;
@@ -58,10 +68,28 @@ typedef struct {
 focused_worker_t *focused_worker_create(const focused_cfg_t *cfg);
 void              focused_worker_destroy(focused_worker_t *w);
 
-/* Start the worker thread. start_sample = absolute sample index from
- * which to begin DDC; if start_sample is older than the live range,
- * the worker silently advances to the oldest live sample. */
-int  focused_worker_start(focused_worker_t *w, uint64_t start_sample);
+/* Start the worker thread. After start the worker sits in IDLE and
+ * does not consume samples until armed. Pass `sticky_arm=1` to
+ * immediately arm the worker permanently (manual focus mode, won't
+ * fall back to IDLE on inactivity); `sticky_arm=0` leaves it idle for
+ * a later focused_worker_arm() call. start_sample is the absolute
+ * sample index from which the worker resumes once armed; if older
+ * than the live range it is silently snapped forward. */
+int  focused_worker_start(focused_worker_t *w, uint64_t start_sample,
+                          int sticky_arm);
+
+/* Arm the worker (IDLE -> DECODING) for a single activity window.
+ * hold_down_s is the hysteresis: after that many seconds elapse with
+ * no decoded frame the worker transitions DECODING -> HOLD_DOWN, then
+ * after another hold_down_s with still no frame, HOLD_DOWN -> IDLE.
+ * A frame delivered during HOLD_DOWN snaps the worker back to
+ * DECODING. start_sample identifies where in the ring to begin DDC
+ * (set to 0 to mean "oldest live"). Safe to call from any thread. */
+void focused_worker_arm(focused_worker_t *w,
+                        uint64_t start_sample,
+                        double hold_down_s);
+
+focused_state_t focused_worker_state(const focused_worker_t *w);
 
 /* Ask the worker to stop after it drains everything currently in the
  * ring. Blocks until the worker thread joins. */

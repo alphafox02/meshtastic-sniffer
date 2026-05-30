@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -54,8 +55,15 @@ struct focused_worker {
     /* Worker thread + lifecycle */
     pthread_t tid;
     int       started;
-    atomic_int run;            /* 1 = pull more samples, 0 = drain remainder + exit */
+    atomic_int run;            /* 1 = thread alive, 0 = drain remainder + exit */
+    atomic_int state;          /* focused_state_t */
+    int       sticky;          /* 1 = never fall back to IDLE (manual focus) */
+    double    hold_down_s;     /* DECODING -> HOLD_DOWN and HOLD_DOWN -> IDLE timer */
+    atomic_uint_fast64_t last_frame_mono_us;
+    atomic_uint_fast64_t hold_down_start_us;
     uint64_t   start_sample;
+    uint64_t   cursor;         /* private to worker thread; reset on arm */
+    atomic_int arm_pending;    /* set by focused_worker_arm; cleared by thread */
     char       label_buf[32];
 
     /* Stats */
@@ -98,11 +106,27 @@ typedef struct {
     void             *cb_user;
 } frame_trampoline_ctx_t;
 
+static uint64_t mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000);
+}
+
 static void focused_frame_trampoline(const uint8_t *payload, size_t len,
                                      const lora_frame_meta_t *meta, void *user)
 {
     frame_trampoline_ctx_t *ctx = (frame_trampoline_ctx_t *)user;
     atomic_fetch_add(&ctx->w->frames_delivered, 1);
+    /* Refresh activity timer; a frame received during HOLD_DOWN snaps
+     * us back into DECODING so a busy slot keeps streaming. */
+    uint64_t now = mono_us();
+    atomic_store(&ctx->w->last_frame_mono_us, now);
+    if (atomic_load(&ctx->w->state) == FOCUSED_STATE_HOLD_DOWN) {
+        atomic_store(&ctx->w->state, FOCUSED_STATE_DECODING);
+        fprintf(stderr, "focused[%s]: HOLD_DOWN -> DECODING (frame seen)\n",
+                ctx->w->label_buf);
+    }
     if (ctx->cb) ctx->cb(payload, len, meta, ctx->cb_user);
 }
 
@@ -158,47 +182,106 @@ static void *focused_thread(void *arg)
         return NULL;
     }
 
-    uint64_t cursor = w->start_sample;
+    w->cursor = w->start_sample;
     /* Snap to live range immediately. */
     uint64_t oldest, newest;
     iq_ring_live_range(w->cfg.ring, &oldest, &newest);
-    if (cursor < oldest) cursor = oldest;
+    if (w->cursor < oldest) w->cursor = oldest;
 
     while (atomic_load(&w->run)) {
-        iq_ring_live_range(w->cfg.ring, &oldest, &newest);
-        if (cursor < oldest) {
-            /* Fell behind the live window -- jump forward, log once. */
-            fprintf(stderr, "focused[%s]: cursor advanced %llu -> %llu (fell behind)\n",
-                    w->label_buf, (unsigned long long)cursor,
-                    (unsigned long long)oldest);
-            cursor = oldest;
+        /* Honour pending arm requests: re-anchor cursor + refresh
+         * activity clock + flip to DECODING. */
+        if (atomic_exchange(&w->arm_pending, 0)) {
+            uint64_t o2, n2;
+            iq_ring_live_range(w->cfg.ring, &o2, &n2);
+            if (w->start_sample == 0 || w->start_sample < o2) {
+                w->cursor = o2;
+            } else if (w->start_sample > n2) {
+                w->cursor = n2;
+            } else {
+                w->cursor = w->start_sample;
+            }
+            atomic_store(&w->last_frame_mono_us, mono_us());
+            atomic_store(&w->state, FOCUSED_STATE_DECODING);
+            fprintf(stderr, "focused[%s]: armed at cursor=%llu\n",
+                    w->label_buf, (unsigned long long)w->cursor);
         }
-        if (cursor >= newest) {
-            usleep(FOCUSED_POLL_USEC);
+
+        focused_state_t st = atomic_load(&w->state);
+        if (st == FOCUSED_STATE_IDLE) {
+            /* While idle, don't consume samples; just track the writer
+             * so an arm() starting from "oldest" lands in the recent
+             * window rather than ancient ring history. */
+            iq_ring_live_range(w->cfg.ring, &oldest, &newest);
+            w->cursor = newest;
+            usleep(FOCUSED_POLL_USEC * 4);
             continue;
         }
-        size_t want = newest - cursor;
-        if (want > FOCUSED_BATCH_SAMPLES) want = FOCUSED_BATCH_SAMPLES;
-        size_t got = iq_ring_get_window(w->cfg.ring, cursor, want, stage);
-        if (got == 0) { usleep(FOCUSED_POLL_USEC); continue; }
-        focused_process_chunk(w, stage, got, format);
-        atomic_fetch_add(&w->samples_consumed, got);
-        cursor += got;
+
+        /* DECODING or HOLD_DOWN -- both process samples; the only
+         * difference is the hysteresis timer below. */
+        iq_ring_live_range(w->cfg.ring, &oldest, &newest);
+        if (w->cursor < oldest) {
+            fprintf(stderr, "focused[%s]: cursor advanced %llu -> %llu (fell behind)\n",
+                    w->label_buf, (unsigned long long)w->cursor,
+                    (unsigned long long)oldest);
+            w->cursor = oldest;
+        }
+        if (w->cursor < newest) {
+            size_t want = newest - w->cursor;
+            if (want > FOCUSED_BATCH_SAMPLES) want = FOCUSED_BATCH_SAMPLES;
+            size_t got = iq_ring_get_window(w->cfg.ring, w->cursor, want, stage);
+            if (got > 0) {
+                focused_process_chunk(w, stage, got, format);
+                atomic_fetch_add(&w->samples_consumed, got);
+                w->cursor += got;
+            }
+        } else {
+            usleep(FOCUSED_POLL_USEC);
+        }
+
+        /* Hysteresis transitions; sticky workers (manual focus) skip
+         * them entirely and stay in DECODING for the whole run. */
+        if (!w->sticky && w->hold_down_s > 0.0) {
+            uint64_t now = mono_us();
+            uint64_t last = atomic_load(&w->last_frame_mono_us);
+            double idle_s = (double)(now - last) * 1e-6;
+            if (st == FOCUSED_STATE_DECODING && idle_s > w->hold_down_s) {
+                atomic_store(&w->state, FOCUSED_STATE_HOLD_DOWN);
+                atomic_store(&w->hold_down_start_us, now);
+                fprintf(stderr, "focused[%s]: DECODING -> HOLD_DOWN "
+                                "(%.1fs idle, hd=%.1fs)\n",
+                        w->label_buf, idle_s, w->hold_down_s);
+            } else if (st == FOCUSED_STATE_HOLD_DOWN) {
+                uint64_t hd_start = atomic_load(&w->hold_down_start_us);
+                double in_hd_s = (double)(now - hd_start) * 1e-6;
+                if (in_hd_s > w->hold_down_s) {
+                    atomic_store(&w->state, FOCUSED_STATE_IDLE);
+                    fprintf(stderr, "focused[%s]: HOLD_DOWN -> IDLE "
+                                    "(%.1fs in hold-down)\n",
+                            w->label_buf, in_hd_s);
+                }
+            }
+        }
     }
 
-    /* Drain whatever remains in the ring between cursor and the writer's
-     * final newest_plus_one. */
-    for (;;) {
-        iq_ring_live_range(w->cfg.ring, &oldest, &newest);
-        if (cursor < oldest) cursor = oldest;
-        if (cursor >= newest) break;
-        size_t want = newest - cursor;
-        if (want > FOCUSED_BATCH_SAMPLES) want = FOCUSED_BATCH_SAMPLES;
-        size_t got = iq_ring_get_window(w->cfg.ring, cursor, want, stage);
-        if (got == 0) break;
-        focused_process_chunk(w, stage, got, format);
-        atomic_fetch_add(&w->samples_consumed, got);
-        cursor += got;
+    /* Final drain whatever remains in the ring between cursor and the
+     * writer's final newest_plus_one. Skips when state is IDLE -- a
+     * worker that was never armed (or whose hold-down expired before
+     * shutdown) has nothing to emit. */
+    if (atomic_load(&w->state) != FOCUSED_STATE_IDLE) {
+        for (;;) {
+            iq_ring_live_range(w->cfg.ring, &oldest, &newest);
+            if (w->cursor < oldest) w->cursor = oldest;
+            if (w->cursor >= newest) break;
+            size_t want = newest - w->cursor;
+            if (want > FOCUSED_BATCH_SAMPLES) want = FOCUSED_BATCH_SAMPLES;
+            size_t got = iq_ring_get_window(w->cfg.ring, w->cursor, want, stage);
+            if (got == 0) break;
+            focused_process_chunk(w, stage, got, format);
+            atomic_fetch_add(&w->samples_consumed, got);
+            w->cursor += got;
+        }
     }
 
     free(stage);
@@ -263,9 +346,16 @@ focused_worker_t *focused_worker_create(const focused_cfg_t *cfg)
     }
 
     atomic_init(&w->run, 0);
+    atomic_init(&w->state, FOCUSED_STATE_IDLE);
+    atomic_init(&w->last_frame_mono_us, 0);
+    atomic_init(&w->hold_down_start_us, 0);
+    atomic_init(&w->arm_pending, 0);
     atomic_init(&w->samples_consumed, 0);
     atomic_init(&w->samples_to_decoder, 0);
     atomic_init(&w->frames_delivered, 0);
+    w->sticky      = 0;
+    w->hold_down_s = 0.0;
+    w->cursor      = 0;
 
     fprintf(stderr,
             "focused[%s]: ch=%.3fMHz BW=%dkHz SF=%d CR=4/%d os=%d  "
@@ -275,10 +365,20 @@ focused_worker_t *focused_worker_create(const focused_cfg_t *cfg)
     return w;
 }
 
-int focused_worker_start(focused_worker_t *w, uint64_t start_sample)
+int focused_worker_start(focused_worker_t *w, uint64_t start_sample,
+                         int sticky_arm)
 {
     if (!w || w->started) return -1;
     w->start_sample = start_sample;
+    w->sticky       = sticky_arm ? 1 : 0;
+    if (sticky_arm) {
+        /* Manual focus: immediately enter DECODING and never leave.
+         * The thread sees state != IDLE and processes from start_sample. */
+        atomic_store(&w->state, FOCUSED_STATE_DECODING);
+        atomic_store(&w->last_frame_mono_us, mono_us());
+    } else {
+        atomic_store(&w->state, FOCUSED_STATE_IDLE);
+    }
     atomic_store(&w->run, 1);
     if (pthread_create(&w->tid, NULL, focused_thread, w) != 0) {
         atomic_store(&w->run, 0);
@@ -286,6 +386,26 @@ int focused_worker_start(focused_worker_t *w, uint64_t start_sample)
     }
     w->started = 1;
     return 0;
+}
+
+void focused_worker_arm(focused_worker_t *w,
+                        uint64_t start_sample,
+                        double hold_down_s)
+{
+    if (!w) return;
+    w->start_sample = start_sample;
+    w->hold_down_s  = hold_down_s > 0.0 ? hold_down_s : 5.0;
+    atomic_store(&w->last_frame_mono_us, mono_us());
+    atomic_store(&w->arm_pending, 1);
+    /* The worker thread observes arm_pending on its next loop tick;
+     * we don't flip state directly here to keep cursor / activity
+     * timer reset on the worker side. */
+}
+
+focused_state_t focused_worker_state(const focused_worker_t *w)
+{
+    return w ? (focused_state_t)atomic_load(&((focused_worker_t *)w)->state)
+             : FOCUSED_STATE_IDLE;
 }
 
 void focused_worker_stop_and_join(focused_worker_t *w)

@@ -302,7 +302,8 @@ static void process_sample_buf(sample_buf_t *buf)
             g_focused_manual = focused_worker_create(&fcfg);
             if (!g_focused_manual ||
                 focused_worker_start(g_focused_manual,
-                                     g_focused_manual_start_sample) != 0) {
+                                     g_focused_manual_start_sample,
+                                     1 /* sticky: never fall back to IDLE */) != 0) {
                 fprintf(stderr, "focused: worker create/start failed; "
                                 "manual focus inactive.\n");
                 if (g_focused_manual) {
