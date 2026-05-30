@@ -21,6 +21,7 @@
 #include "feed.h"
 #include "geofence.h"
 #include "gpsd.h"
+#include "iq_ring.h"
 #include "pcap_out.h"
 #include "psk_dict.h"
 #include "schema.h"
@@ -91,6 +92,14 @@ static void on_signal(int sig)
 /* ---- Global pipeline state ---- */
 
 channelizer_t *g_channelizer = NULL;
+/* Optional raw-IQ ring buffer that mirrors everything the sample pump
+ * processes. Allocated only when MESHTASTIC_IQ_RING_MS is set, so the
+ * default cluster2 path sees no allocations and no copies. Lives for
+ * scan-then-focus: a scanner-side detection emits a sample-index range
+ * and a focused decoder rewinds via iq_ring_get_window(). */
+static iq_ring_t *g_iq_ring = NULL;
+static size_t     g_iq_ring_ms = 0;
+static size_t     g_iq_ring_capacity_samples = 0;
 static keyset_t      *g_keys = NULL;
 static lora_decoder_t *g_demods[CHANNELIZER_MAX_CHANNELS];
 static scanner_t     *g_scanner = NULL;
@@ -208,6 +217,30 @@ static void process_sample_buf(sample_buf_t *buf)
      * peak magnitude and clip count so the user can see when the input
      * is near full-scale (clip count > 0 means quantization is losing
      * dynamic range and the SDR gain should come down). */
+    /* Tee into the raw-IQ ring buffer when enabled. Created lazily on the
+     * first buffer so the ring matches the SDR's native format without
+     * the main thread having to predict it. */
+    if (g_iq_ring_ms > 0 && !g_iq_ring) {
+        size_t cap = (size_t)((double)samp_rate * (double)g_iq_ring_ms / 1000.0 + 0.5);
+        if (cap < 1024) cap = 1024;
+        g_iq_ring = iq_ring_create(cap, buf->format);
+        if (g_iq_ring) {
+            g_iq_ring_capacity_samples = cap;
+            double bytes = (double)cap *
+                (double)iq_ring_bytes_per_sample(buf->format);
+            fprintf(stderr,
+                    "iq-ring: enabled (%zu samples = %.0f MiB, %.0f ms @ %.3f Msps, "
+                    "format=%s)\n",
+                    cap, bytes / (1024.0 * 1024.0),
+                    (double)g_iq_ring_ms, samp_rate / 1e6,
+                    buf->format == SAMPLE_FMT_FLOAT ? "cf32" : "cs8");
+        } else {
+            fprintf(stderr, "iq-ring: allocation failed -- disabled.\n");
+            g_iq_ring_ms = 0;
+        }
+    }
+    if (g_iq_ring) iq_ring_append(g_iq_ring, buf->samples, buf->num);
+
     if (g_iq_record_fp) {
         if (buf->format == SAMPLE_FMT_FLOAT && g_iq_record_target_cs8) {
             const float *flt = (const float *)buf->samples;
@@ -2718,6 +2751,25 @@ static int run_live(void)
         }
     }
 
+    /* Phase 3 Commit 1: optional raw-IQ ring buffer. Sized in milliseconds
+     * of capture history; allocated lazily on the first sample so it picks
+     * up the SDR's native format. Default off -- production cluster2 path
+     * sees no allocations and no extra copies. */
+    {
+        const char *e = getenv("MESHTASTIC_IQ_RING_MS");
+        if (e && *e) {
+            long ms = atol(e);
+            if (ms > 0 && ms <= 10000) {
+                g_iq_ring_ms = (size_t)ms;
+                fprintf(stderr, "iq-ring: requested %ld ms of history "
+                                "(will allocate on first sample).\n", ms);
+            } else if (ms != 0) {
+                fprintf(stderr, "iq-ring: MESHTASTIC_IQ_RING_MS=%ld out of range "
+                                "(1..10000); disabled.\n", ms);
+            }
+        }
+    }
+
     feed_init();
     if (opt_pcap_path) pcap_out_init(opt_pcap_path, false);
     else if (opt_pcap_fifo) pcap_out_init(opt_pcap_fifo, true);
@@ -2839,6 +2891,20 @@ static int run_live(void)
     }
     channelizer_destroy(g_channelizer); g_channelizer = NULL;
     if (g_scanner) { scanner_destroy(g_scanner); g_scanner = NULL; }
+    if (g_iq_ring) {
+        uint64_t total = iq_ring_total_appended(g_iq_ring);
+        uint64_t oldest, newest;
+        iq_ring_live_range(g_iq_ring, &oldest, &newest);
+        fprintf(stderr,
+                "iq-ring: %llu samples appended over the run, live range "
+                "[%llu .. %llu) at shutdown (%zu-sample capacity).\n",
+                (unsigned long long)total,
+                (unsigned long long)oldest,
+                (unsigned long long)newest,
+                g_iq_ring_capacity_samples);
+        iq_ring_destroy(g_iq_ring);
+        g_iq_ring = NULL;
+    }
     keyset_destroy(g_keys);             g_keys = NULL;
     return 0;
 }

@@ -107,6 +107,7 @@ set(SOURCES
     ${PROJECT_SOURCE_DIR}/file_src.c
     ${PROJECT_SOURCE_DIR}/vita49.c
     ${PROJECT_SOURCE_DIR}/channelizer.c
+    ${PROJECT_SOURCE_DIR}/iq_ring.c
     ${PROJECT_SOURCE_DIR}/pfb.c
     ${PROJECT_SOURCE_DIR}/lora.c
     ${PROJECT_SOURCE_DIR}/keyset.c
@@ -293,6 +294,15 @@ if(OpenMP_C_FOUND)
     target_link_libraries(test_pfb_bin_power PRIVATE OpenMP::OpenMP_C)
 endif()
 set_property(TARGET test_pfb_bin_power PROPERTY C_STANDARD 99)
+
+# test_iq_ring: unit test for the raw-IQ ring buffer used by Phase 3
+# scan-then-focus. Covers linear append, wrap, age-out and the float
+# format round-trip; pure CPU, no FFTW.
+add_executable(test_iq_ring
+    ${PROJECT_SOURCE_DIR}/tests/test_iq_ring.c
+    ${PROJECT_SOURCE_DIR}/iq_ring.c)
+target_link_libraries(test_iq_ring PRIVATE Threads::Threads)
+set_property(TARGET test_iq_ring PROPERTY C_STANDARD 99)
 
 # focused_demo: scan-then-focus Phase 2 prototype. One shared file reader
 # streams cs8 IQ into N independent focused-decode workers, each with its
