@@ -19,6 +19,7 @@
 #include "c2_dealer.h"
 #include "dedup.h"
 #include "feed.h"
+#include "focused.h"
 #include "geofence.h"
 #include "gpsd.h"
 #include "iq_ring.h"
@@ -100,6 +101,22 @@ channelizer_t *g_channelizer = NULL;
 static iq_ring_t *g_iq_ring = NULL;
 static size_t     g_iq_ring_ms = 0;
 static size_t     g_iq_ring_capacity_samples = 0;
+
+/* Forward-decl: defined later in this file. Used by the lazy-spawn
+ * block inside process_sample_buf so the focused worker's frames flow
+ * into the same dedup pipeline as the wideband channels'. */
+static void on_lora_frame(const uint8_t *payload, size_t payload_len,
+                          const lora_frame_meta_t *meta, void *user);
+
+/* Phase 3 Commit 2: one manual focused worker driven from the ring.
+ * Activated by MESHTASTIC_FOCUS_MANUAL=freq:bw:sf:cr[:start_sample].
+ * Lifecycle (idle/decoding/hold-down) and multi-worker fan-out land
+ * in Commit 3 / 4; for now this is the simplest possible proof that
+ * the focused path can rewind from the ring inside the main sniffer. */
+static focused_worker_t *g_focused_manual = NULL;
+static int               g_focused_manual_channel_id = -1;
+static char              g_focused_manual_spec[128];
+static uint64_t          g_focused_manual_start_sample = 0;
 static keyset_t      *g_keys = NULL;
 static lora_decoder_t *g_demods[CHANNELIZER_MAX_CHANNELS];
 static scanner_t     *g_scanner = NULL;
@@ -240,6 +257,71 @@ static void process_sample_buf(sample_buf_t *buf)
         }
     }
     if (g_iq_ring) iq_ring_append(g_iq_ring, buf->samples, buf->num);
+
+    /* Phase 3 Commit 2: lazy-spawn the manual focused worker the first
+     * time samples are flowing through the ring. We do it here -- not in
+     * main() -- because the ring is created lazily by the same one-shot
+     * block above, and the worker needs the ring to exist before
+     * focused_worker_create() can register a config. */
+    if (g_iq_ring && g_focused_manual_spec[0] && !g_focused_manual) {
+        /* Parse freq:bw:sf:cr[:start_sample]. */
+        long long freq_hz = 0, bw_hz = 0;
+        int sf = 0, cr = 0;
+        unsigned long long start_sample_ull = 0;
+        int nparsed = sscanf(g_focused_manual_spec, "%lld:%lld:%d:%d:%llu",
+                             &freq_hz, &bw_hz, &sf, &cr, &start_sample_ull);
+        if (nparsed >= 4 && sf >= 7 && sf <= 12 && cr >= 5 && cr <= 8
+            && bw_hz > 0 && freq_hz > 0) {
+            /* Allocate a stat slot for this focused worker so JSON
+             * output gets a real freq_hz / preset_name. We use the top
+             * of g_chan_stats[] so it never collides with the wideband
+             * channels build_channel_set() populated from id=0 up. */
+            int focus_id = CHANNELIZER_MAX_CHANNELS - 1;
+            g_chan_stats[focus_id].sf      = sf;
+            g_chan_stats[focus_id].cr      = cr;
+            g_chan_stats[focus_id].bw_hz   = (int)bw_hz;
+            g_chan_stats[focus_id].freq_hz = (uint64_t)freq_hz;
+            strncpy(g_chan_stats[focus_id].preset_name, "Focused",
+                    sizeof(g_chan_stats[focus_id].preset_name) - 1);
+
+            g_focused_manual_channel_id   = focus_id;
+            g_focused_manual_start_sample = (uint64_t)start_sample_ull;
+            focused_cfg_t fcfg = {
+                .channel_hz    = (double)freq_hz,
+                .bw_hz         = (int)bw_hz,
+                .sf            = sf,
+                .cr            = cr,
+                .os_factor     = 1,
+                .sdr_center_hz = (double)center_freq,
+                .sdr_samp_rate = samp_rate,
+                .ring          = g_iq_ring,
+                .frame_cb      = on_lora_frame,
+                .frame_cb_user = (void *)(intptr_t)focus_id,
+                .label         = "manual",
+            };
+            g_focused_manual = focused_worker_create(&fcfg);
+            if (!g_focused_manual ||
+                focused_worker_start(g_focused_manual,
+                                     g_focused_manual_start_sample) != 0) {
+                fprintf(stderr, "focused: worker create/start failed; "
+                                "manual focus inactive.\n");
+                if (g_focused_manual) {
+                    focused_worker_destroy(g_focused_manual);
+                    g_focused_manual = NULL;
+                }
+                g_focused_manual_channel_id = -1;
+            } else {
+                fprintf(stderr, "focused: manual worker armed at "
+                                "channel_id=%d, start_sample=%llu.\n",
+                        focus_id,
+                        (unsigned long long)g_focused_manual_start_sample);
+            }
+        } else {
+            fprintf(stderr, "focused: bad MESHTASTIC_FOCUS_MANUAL spec '%s'\n",
+                    g_focused_manual_spec);
+            g_focused_manual_spec[0] = 0;
+        }
+    }
 
     if (g_iq_record_fp) {
         if (buf->format == SAMPLE_FMT_FLOAT && g_iq_record_target_cs8) {
@@ -2770,6 +2852,31 @@ static int run_live(void)
         }
     }
 
+    /* Phase 3 Commit 2: optional manual focused-decoder driven by the ring.
+     * Activated via:
+     *   MESHTASTIC_FOCUS_MANUAL=freq_hz:bw_hz:sf:cr[:start_sample]
+     * (e.g. "906875000:250000:9:5:0"). When set without an explicit ring
+     * size, an iq-ring of 500 ms is auto-provisioned so the worker has
+     * something to pull from. Worker creation itself runs lazily in
+     * process_sample_buf once the ring is allocated. */
+    {
+        const char *fm = getenv("MESHTASTIC_FOCUS_MANUAL");
+        if (fm && *fm && strlen(fm) < sizeof(g_focused_manual_spec)) {
+            strncpy(g_focused_manual_spec, fm,
+                    sizeof(g_focused_manual_spec) - 1);
+            if (g_iq_ring_ms == 0) {
+                g_iq_ring_ms = 500;
+                fprintf(stderr, "focused: MESHTASTIC_FOCUS_MANUAL set; "
+                                "auto-enabling iq-ring at %zu ms.\n",
+                        g_iq_ring_ms);
+            }
+            const char *ssample = strrchr(fm, ':');
+            (void)ssample;  /* parsed when the worker is constructed */
+            fprintf(stderr, "focused: manual spec '%s' queued.\n",
+                    g_focused_manual_spec);
+        }
+    }
+
     feed_init();
     if (opt_pcap_path) pcap_out_init(opt_pcap_path, false);
     else if (opt_pcap_fifo) pcap_out_init(opt_pcap_fifo, true);
@@ -2842,6 +2949,12 @@ static int run_live(void)
 
     pthread_join(input_tid, NULL);
     sample_pipeline_stop();
+    /* Phase 3 Commit 2: drain + stop the manual focused worker BEFORE the
+     * channelizer flushes and the dedup drainer stops, so any tail frames
+     * the worker emits make it through dedup like wideband frames. */
+    if (g_focused_manual) {
+        focused_worker_stop_and_join(g_focused_manual);
+    }
     pthread_join(stats_tid, NULL);
     pthread_join(wd_tid, NULL);
 
@@ -2891,6 +3004,10 @@ static int run_live(void)
     }
     channelizer_destroy(g_channelizer); g_channelizer = NULL;
     if (g_scanner) { scanner_destroy(g_scanner); g_scanner = NULL; }
+    if (g_focused_manual) {
+        focused_worker_destroy(g_focused_manual);
+        g_focused_manual = NULL;
+    }
     if (g_iq_ring) {
         uint64_t total = iq_ring_total_appended(g_iq_ring);
         uint64_t oldest, newest;
