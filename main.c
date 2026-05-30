@@ -111,13 +111,13 @@ static void on_lora_frame(const uint8_t *payload, size_t payload_len,
 static void on_wideband_preamble_lock(int sf, int cr, int bw_hz,
                                       float snr_db, void *user);
 
-/* Phase 3 Commit 4: one auto-promoted focused worker. Same shape as the
- * manual one but armed by the preamble_lock callback from a wideband
+/* Single-slot auto-promoted focused worker. Same shape as the manual
+ * one but armed by the preamble_lock callback from a wideband
  * channel. Spec via MESHTASTIC_FOCUS_AUTO=freq:bw:sf:cr -- only locks
  * matching (sf, cr, bw_hz) at the configured freq promote, since the
  * focused DDC is built once for a specific slot. Superseded by the
  * pool (MESHTASTIC_FOCUS_POOL) when both env vars are set; kept here
- * for the single-slot backward-compatible path. */
+ * for the single-slot path that pre-dated the pool. */
 static focused_worker_t *g_focused_auto = NULL;
 static int               g_focused_auto_channel_id = -1;
 static char              g_focused_auto_spec[128];
@@ -129,11 +129,11 @@ static double            g_focused_auto_hold_down_s = 5.0;
 static uint64_t          g_focused_auto_rewind_samples = 200000;
 static _Atomic uint64_t  g_focused_auto_arm_count = 0;
 
-/* Phase 3 Commit 5: bounded pool of focused workers. Any wideband
- * preamble lock promotes to the pool; workers are slot-coalesced
- * (same freq/bw/sf/cr refreshes the existing worker) or assigned to
- * an idle peer. When all workers are busy a promotion is dropped and
- * counted -- no eviction in this slice. Sized 1..FOCUS_POOL_MAX via
+/* Bounded pool of generic focused workers. Any wideband preamble
+ * lock promotes to the pool; workers are slot-coalesced (same
+ * freq/bw/sf/cr refreshes the existing worker) or assigned to an
+ * idle peer. When all workers are busy a promotion is dropped and
+ * counted -- no eviction. Sized 1..FOCUS_POOL_MAX via
  * MESHTASTIC_FOCUS_POOL=N. */
 #define FOCUS_POOL_MAX 4
 static focused_worker_t *g_focus_pool[FOCUS_POOL_MAX];
@@ -156,7 +156,7 @@ static _Atomic uint64_t  g_focus_pool_promote_matched    = 0;
 static _Atomic uint64_t  g_focus_pool_promote_assigned   = 0;
 static _Atomic uint64_t  g_focus_pool_promote_dropped    = 0;
 
-/* Phase 3 Commit 2: one manual focused worker driven from the ring.
+/* Single manual focused worker driven from the ring.
  * Activated by MESHTASTIC_FOCUS_MANUAL=freq:bw:sf:cr[:start_sample].
  * Lifecycle (idle/decoding/hold-down) and multi-worker fan-out land
  * in Commit 3 / 4; for now this is the simplest possible proof that
@@ -306,11 +306,11 @@ static void process_sample_buf(sample_buf_t *buf)
     }
     if (g_iq_ring) iq_ring_append(g_iq_ring, buf->samples, buf->num);
 
-    /* Phase 3 Commit 2: lazy-spawn the manual focused worker the first
-     * time samples are flowing through the ring. We do it here -- not in
-     * main() -- because the ring is created lazily by the same one-shot
-     * block above, and the worker needs the ring to exist before
-     * focused_worker_create() can register a config. */
+    /* Lazy-spawn the manual focused worker the first time samples are
+     * flowing through the ring. Done here, not in main(), because the
+     * ring itself is created lazily by the block above and the worker
+     * needs the ring to exist before focused_worker_create() can
+     * register a config. */
     if (g_iq_ring && g_focused_manual_spec[0] && !g_focused_manual) {
         /* Parse freq:bw:sf:cr[:start_sample]. */
         long long freq_hz = 0, bw_hz = 0;
@@ -372,7 +372,7 @@ static void process_sample_buf(sample_buf_t *buf)
         }
     }
 
-    /* Phase 3 Commit 5: lazy-spawn pool workers once the ring exists. */
+    /* Lazy-spawn the pool workers once the ring exists. */
     if (g_iq_ring && g_focus_pool_cfg_size > 0 && !g_focus_pool_inited) {
         g_focus_pool_inited = 1;
         for (int i = 0; i < g_focus_pool_cfg_size; ++i) {
@@ -414,7 +414,7 @@ static void process_sample_buf(sample_buf_t *buf)
                 CHANNELIZER_MAX_CHANNELS - 2 - g_focus_pool_size + 1);
     }
 
-    /* Phase 3 Commit 4: lazy-spawn the auto (scanner-triggered) worker.
+    /* Lazy-spawn the single-slot auto (scanner-triggered) worker.
      * Stays IDLE until on_wideband_preamble_lock arms it. */
     if (g_iq_ring && g_focused_auto_spec[0] && !g_focused_auto &&
         g_focused_auto_freq_hz > 0.0) {
@@ -967,11 +967,10 @@ static void promote_to_pool(double freq_hz, int bw_hz, int sf, int cr,
     pthread_mutex_unlock(&g_focus_pool_mu);
 }
 
-/* Phase 3 Commit 4 / 5: a wideband channel just preamble-locked.
- * If the pool is configured, route the event to it (any slot, any
- * worker). Otherwise fall back to the single-slot FOCUS_AUTO worker
- * for backward compatibility. Runs on the decoder's calling thread;
- * focused_worker_arm() is threadsafe. */
+/* A wideband channel just preamble-locked. If the pool is configured,
+ * route the event to it (any slot, any worker). Otherwise fall back
+ * to the single-slot MESHTASTIC_FOCUS_AUTO worker. Runs on the
+ * decoder's calling thread; focused_worker_arm() is threadsafe. */
 static void on_wideband_preamble_lock(int sf, int cr, int bw_hz,
                                       float snr_db, void *user)
 {
@@ -1315,9 +1314,9 @@ static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr)
     lora_decoder_set_center_freq(g_demods[id], (double)f_hz);
     /* Stash channel id in user pointer so on_lora_frame can attribute stats. */
     lora_decoder_set_callback(g_demods[id], on_lora_frame, (void *)(intptr_t)id);
-    /* Phase 3 Commit 4: every wideband channel can promote to the
-     * focused worker via the preamble-lock callback. The hook is a
-     * no-op when no MESHTASTIC_FOCUS_AUTO worker is configured. */
+    /* Every wideband channel can promote to a focused worker via the
+     * preamble-lock callback. The hook is a no-op when neither the
+     * pool nor the single-slot auto worker is configured. */
     lora_decoder_set_preamble_cb(g_demods[id], on_wideband_preamble_lock,
                                  (void *)(intptr_t)id);
 
@@ -3076,10 +3075,10 @@ static int run_live(void)
         }
     }
 
-    /* Phase 3 Commit 1: optional raw-IQ ring buffer. Sized in milliseconds
-     * of capture history; allocated lazily on the first sample so it picks
-     * up the SDR's native format. Default off -- production cluster2 path
-     * sees no allocations and no extra copies. */
+    /* Optional raw-IQ ring buffer. Sized in milliseconds of capture
+     * history; allocated lazily on the first sample so it picks up
+     * the SDR's native format. Default off -- production cluster2
+     * path sees no allocations and no extra copies. */
     {
         const char *e = getenv("MESHTASTIC_IQ_RING_MS");
         if (e && *e) {
@@ -3095,7 +3094,7 @@ static int run_live(void)
         }
     }
 
-    /* Phase 3 Commit 2: optional manual focused-decoder driven by the ring.
+    /* Optional manual focused-decoder driven by the ring.
      * Activated via:
      *   MESHTASTIC_FOCUS_MANUAL=freq_hz:bw_hz:sf:cr[:start_sample]
      * (e.g. "906875000:250000:9:5:0"). When set without an explicit ring
@@ -3177,7 +3176,7 @@ static int run_live(void)
         }
     }
 
-    /* Phase 3 Commit 4: scanner-promoted focused worker.
+    /* Scanner-promoted single-slot focused worker.
      *   MESHTASTIC_FOCUS_AUTO=freq:bw:sf:cr[:hold_down_s[:rewind_ms]]
      * The worker is created in non-sticky mode and sits IDLE until a
      * wideband channel matching (sf, cr, bw_hz, freq) reports a
@@ -3293,9 +3292,9 @@ static int run_live(void)
 
     pthread_join(input_tid, NULL);
     sample_pipeline_stop();
-    /* Phase 3 Commit 2: drain + stop the manual focused worker BEFORE the
-     * channelizer flushes and the dedup drainer stops, so any tail frames
-     * the worker emits make it through dedup like wideband frames. */
+    /* Drain + stop the manual focused worker BEFORE the channelizer
+     * flushes and the dedup drainer stops, so any tail frames the
+     * worker emits make it through dedup like wideband frames. */
     if (g_focused_manual) {
         focused_worker_stop_and_join(g_focused_manual);
     }

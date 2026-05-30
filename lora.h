@@ -49,11 +49,11 @@ typedef void (*lora_frame_cb_t)(const uint8_t *payload, size_t payload_len,
 
 /* Fired exactly once per preamble run, the first time the decoder
  * collects PREAMBLE_MIN matching upchirp symbols (gr-lora_sdr's
- * preamble lock). This is the event Phase 3 Commit 4 uses to promote
- * a wideband-detected slot to the focused decoder: "not raw energy
- * and not CRC". snr_db is the lock-time peak/noise estimate; sf/cr/
- * bw_hz are the slot's radio parameters; user is whatever the caller
- * passed to lora_decoder_set_preamble_cb (typically a channel id). */
+ * preamble lock). "Not raw energy, not CRC": a real preamble has been
+ * detected but header decode has not started yet -- the right point
+ * to wake a focused decoder from a stare-mode pool. snr_db is the
+ * lock-time peak/noise estimate; user is whatever the caller passed
+ * to lora_decoder_set_preamble_cb (typically a channel id). */
 typedef void (*lora_preamble_cb_t)(int sf, int cr, int bw_hz,
                                    float snr_db, void *user);
 

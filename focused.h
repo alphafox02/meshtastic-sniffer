@@ -5,15 +5,12 @@
  * focused -- a single LoRa-slot focused decoder driven by samples
  * pulled from the raw-IQ ring buffer (iq_ring.h). Each worker owns
  * one DDC chain (NCO mixer + Hamming LPF + decimator) and one
- * lora_decoder_t configured for a specific (SF, CR, BW) tuple. The
- * worker runs on its own thread, polling the ring at a fixed batch
- * size, and emits frames through the supplied lora_frame_cb_t so the
- * same dedup / feed / JSON pipeline carries them.
- *
- * This is the Phase 3 Commit 2 primitive: manual trigger (env-driven)
- * focus on a single channel/time from the ring. Commit 3 adds the
- * idle/decoding/hold-down lifecycle; Commit 4 attaches automatic
- * promotion from the scanner.
+ * lora_decoder_t. The worker runs on its own thread, polls the ring
+ * at a fixed batch size, and emits frames through the supplied
+ * lora_frame_cb_t so the same dedup / feed / JSON pipeline carries
+ * them. Slot config (channel_hz / bw / sf / cr) can be set at create
+ * time (manual focus) or deferred until the first arm_slot() call
+ * (pool-managed workers).
  */
 
 #ifndef FOCUSED_H
@@ -27,10 +24,10 @@
 
 typedef struct focused_worker focused_worker_t;
 
-/* Lifecycle state -- see Codex's Phase 3 Commit 3 plan. The worker
- * itself drives the DECODING -> HOLD_DOWN -> IDLE transitions; external
- * code (manual-focus block in main.c today, scanner promotion in
- * Commit 4) drives IDLE -> DECODING via focused_worker_arm(). */
+/* Lifecycle state. The worker drives the DECODING -> HOLD_DOWN ->
+ * IDLE transitions internally based on hold_down_s; external code
+ * (the scan-then-focus pool dispatcher) drives IDLE -> DECODING via
+ * focused_worker_arm() / focused_worker_arm_slot(). */
 typedef enum {
     FOCUSED_STATE_IDLE       = 0,
     FOCUSED_STATE_DECODING   = 1,
@@ -91,8 +88,8 @@ void focused_worker_arm(focused_worker_t *w,
 
 /* Same as focused_worker_arm() but additionally reconfigures the
  * worker's DDC chain for a (possibly different) channel slot. Used
- * by the pool dispatcher (Phase 3 Commit 5) where a single worker
- * floats between slots over its lifetime. Passing any of
+ * by the pool dispatcher when a single worker floats between slots
+ * over its lifetime. Passing any of
  * channel_hz/bw_hz/sf/cr as 0 keeps the current value for that
  * field. If the resulting slot exactly matches the worker's current
  * config, no DDC rebuild happens -- just an arm() refresh. */

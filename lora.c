@@ -1304,11 +1304,10 @@ static void state_tick(lora_decoder_t *d)
                                : 0.0f;
                 if (peak > 0.0f && noise > 0.0f)
                     STATS_SNR(snr_hist_preamble, snr_db);
-                /* Phase 3 Commit 4: fire the preamble-lock callback so
-                 * main.c can promote this slot to the focused decoder.
-                 * This is the "not raw energy, not CRC" trigger Codex
-                 * specified -- a real preamble has been detected but
-                 * the wideband decode hasn't completed yet. */
+                /* Fire the preamble-lock callback. Subscribers (the
+                 * scan-then-focus pool, scanners, telemetry) get the
+                 * event before header decode starts -- the right
+                 * trigger for "wake a focused decoder for this slot". */
                 if (d->preamble_cb) {
                     d->preamble_cb(d->sf, d->cr, d->bw_hz, snr_db,
                                    d->preamble_user);
