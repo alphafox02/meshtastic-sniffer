@@ -15,14 +15,13 @@ Sister project to [iridium-sniffer](https://github.com/alphafox02/iridium-sniffe
 
 ## What's new: scan-then-focus deep decode
 
-The wideband channelizer covers everything in the slice at the rate the SDR can sustain, but it's a throughput tradeoff: bin-leakage between adjacent channels limits how much SNR each per-slot decoder sees. The new `--deep-decode=auto` mode adds a bounded pool of *focused* workers that pull raw IQ from a short ring buffer, run a cleaner per-slot DDC, and feed the same LoRa decoder. They wake on preamble locks from the wideband scanner and idle out after a hold-down.
+The wideband channelizer covers everything in the slice at the rate the SDR can sustain, but it's a throughput tradeoff: bin-leakage between adjacent channels limits how much SNR each per-slot decoder sees. Deep-decode mode adds a bounded pool of *focused* workers that pull raw IQ from a short ring buffer, run a cleaner per-slot DDC, and feed the same LoRa decoder. They wake on preamble locks from the wideband scanner and idle out after a hold-down.
 
-Default is `off`, so the wideband-only path is unchanged for existing users. Enable per run:
+Deep-decode is **on by default** (`--deep-decode=auto`). Pass `--deep-decode=off` to disable it on weak CPUs or when you specifically want the wideband-only path. A typical run:
 
 ```bash
 ./meshtastic-sniffer --usrp --rate=20000000 --center=915000000 \
                     --region=US --presets=all --keys=default \
-                    --deep-decode=auto --focus-workers=2 \
                     --trusted-only --web=8888
 ```
 
@@ -109,10 +108,10 @@ CMake prints which backends it found. Run `./meshtastic-sniffer --list` to confi
 # Paste a channel-share URL from the Meshtastic app to import a key:
 ./meshtastic-sniffer --hackrf --share-url='https://meshtastic.org/e/#CgM...'
 
-# B205 covering full US 902-928 MHz at 26 Msps, deep decode on:
+# B205 covering full US 902-928 MHz at 26 Msps:
 ./meshtastic-sniffer --usrp --rate=26000000 --center=915000000 \
                     --usrp-otw=sc8 --gain=40 --region=US --presets=all \
-                    --keys=default --deep-decode=auto --trusted-only --web=8888
+                    --keys=default --trusted-only --web=8888
 
 # Replay an IQ file:
 ./meshtastic-sniffer --file=capture.cf32 --keys=default

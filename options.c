@@ -38,7 +38,7 @@ bool          opt_print_schema        = false;
 bool          opt_trusted_only        = false;
 bool          opt_show_untrusted      = false;
 bool          opt_diagnostics         = false;
-deep_decode_mode_t opt_deep_decode    = DEEP_DECODE_OFF;
+deep_decode_mode_t opt_deep_decode    = DEEP_DECODE_AUTO;
 int           opt_focus_workers       = 2;
 double        opt_focus_hold_s        = 5.0;
 int           opt_focus_rewind_ms     = 20;
@@ -133,8 +133,9 @@ void options_print_help(const char *prog)
         "                         (kept off by default in deep-decode-auto mode)\n"
         "\n"
         "Scan-then-focus deep decode (wideband scanner always on, focused workers wake on activity):\n"
-        "  --deep-decode=MODE     off | auto (default off). 'auto' enables the focused-worker pool\n"
+        "  --deep-decode=MODE     off | auto (default auto). 'auto' enables the focused-worker pool\n"
         "                         driven by wideband preamble locks; wideband never goes blind.\n"
+        "                         Pass 'off' to disable on weak CPUs or for a strict wideband-only run.\n"
         "  --focus-workers=N      bounded pool size, 1..4 (default 2)\n"
         "  --focus-hold-s=S       seconds of frame inactivity before a worker idles (default 5)\n"
         "  --focus-rewind-ms=N    rewind from 'now' when a preamble lock arrives (default 20)\n"
