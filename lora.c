@@ -541,6 +541,9 @@ struct lora_decoder {
 
     lora_frame_cb_t cb;
     void           *user;
+
+    lora_preamble_cb_t preamble_cb;
+    void              *preamble_user;
 };
 
 /* ---- Reference chirps ----
@@ -632,6 +635,12 @@ void lora_decoder_set_callback(lora_decoder_t *d, lora_frame_cb_t cb, void *user
 {
     if (!d) return;
     d->cb = cb; d->user = user;
+}
+
+void lora_decoder_set_preamble_cb(lora_decoder_t *d, lora_preamble_cb_t cb, void *user)
+{
+    if (!d) return;
+    d->preamble_cb = cb; d->preamble_user = user;
 }
 
 /* Number of preamble upchirps to average for the RCTSL estimator. gr-lora_sdr
@@ -1290,9 +1299,20 @@ static void state_tick(lora_decoder_t *d)
             if (d->preamble_count >= PREAMBLE_MIN && !d->preamble_locked_once) {
                 d->preamble_locked_once = 1;
                 STATS_BUMP(preamble_locks, d->sf);
+                float snr_db = (peak > 0.0f && noise > 0.0f)
+                               ? (float)(20.0 * log10((double)peak / (double)noise))
+                               : 0.0f;
                 if (peak > 0.0f && noise > 0.0f)
-                    STATS_SNR(snr_hist_preamble,
-                              20.0 * log10((double)peak / (double)noise));
+                    STATS_SNR(snr_hist_preamble, snr_db);
+                /* Phase 3 Commit 4: fire the preamble-lock callback so
+                 * main.c can promote this slot to the focused decoder.
+                 * This is the "not raw energy, not CRC" trigger Codex
+                 * specified -- a real preamble has been detected but
+                 * the wideband decode hasn't completed yet. */
+                if (d->preamble_cb) {
+                    d->preamble_cb(d->sf, d->cr, d->bw_hz, snr_db,
+                                   d->preamble_user);
+                }
             }
             /* Snapshot the FFT bin value for cfo_frac estimation later. */
             int N_HIST = (int)(sizeof(d->preamble_fft_hist) / sizeof(d->preamble_fft_hist[0]));

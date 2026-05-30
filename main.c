@@ -107,6 +107,26 @@ static size_t     g_iq_ring_capacity_samples = 0;
  * into the same dedup pipeline as the wideband channels'. */
 static void on_lora_frame(const uint8_t *payload, size_t payload_len,
                           const lora_frame_meta_t *meta, void *user);
+/* on_wideband_preamble_lock is defined after g_samples_total below. */
+static void on_wideband_preamble_lock(int sf, int cr, int bw_hz,
+                                      float snr_db, void *user);
+
+/* Phase 3 Commit 4: one auto-promoted focused worker. Same shape as the
+ * manual one but armed by the preamble_lock callback from a wideband
+ * channel. Spec via MESHTASTIC_FOCUS_AUTO=freq:bw:sf:cr -- only locks
+ * matching (sf, cr, bw_hz) at the configured freq promote, since the
+ * focused DDC is built once for a specific slot. The N-worker pool
+ * with dynamic slot allocation arrives in a follow-up commit. */
+static focused_worker_t *g_focused_auto = NULL;
+static int               g_focused_auto_channel_id = -1;
+static char              g_focused_auto_spec[128];
+static double            g_focused_auto_freq_hz = 0.0;
+static int               g_focused_auto_bw_hz = 0;
+static int               g_focused_auto_sf = 0;
+static int               g_focused_auto_cr = 0;
+static double            g_focused_auto_hold_down_s = 5.0;
+static uint64_t          g_focused_auto_rewind_samples = 200000;
+static _Atomic uint64_t  g_focused_auto_arm_count = 0;
 
 /* Phase 3 Commit 2: one manual focused worker driven from the ring.
  * Activated by MESHTASTIC_FOCUS_MANUAL=freq:bw:sf:cr[:start_sample].
@@ -321,6 +341,48 @@ static void process_sample_buf(sample_buf_t *buf)
             fprintf(stderr, "focused: bad MESHTASTIC_FOCUS_MANUAL spec '%s'\n",
                     g_focused_manual_spec);
             g_focused_manual_spec[0] = 0;
+        }
+    }
+
+    /* Phase 3 Commit 4: lazy-spawn the auto (scanner-triggered) worker.
+     * Stays IDLE until on_wideband_preamble_lock arms it. */
+    if (g_iq_ring && g_focused_auto_spec[0] && !g_focused_auto &&
+        g_focused_auto_freq_hz > 0.0) {
+        int focus_id = CHANNELIZER_MAX_CHANNELS - 2;  /* sibling of manual */
+        g_chan_stats[focus_id].sf      = g_focused_auto_sf;
+        g_chan_stats[focus_id].cr      = g_focused_auto_cr;
+        g_chan_stats[focus_id].bw_hz   = g_focused_auto_bw_hz;
+        g_chan_stats[focus_id].freq_hz = (uint64_t)g_focused_auto_freq_hz;
+        strncpy(g_chan_stats[focus_id].preset_name, "FocusedAuto",
+                sizeof(g_chan_stats[focus_id].preset_name) - 1);
+        g_focused_auto_channel_id = focus_id;
+        focused_cfg_t fcfg = {
+            .channel_hz    = g_focused_auto_freq_hz,
+            .bw_hz         = g_focused_auto_bw_hz,
+            .sf            = g_focused_auto_sf,
+            .cr            = g_focused_auto_cr,
+            .os_factor     = 1,
+            .sdr_center_hz = (double)center_freq,
+            .sdr_samp_rate = samp_rate,
+            .ring          = g_iq_ring,
+            .frame_cb      = on_lora_frame,
+            .frame_cb_user = (void *)(intptr_t)focus_id,
+            .label         = "auto",
+        };
+        g_focused_auto = focused_worker_create(&fcfg);
+        if (g_focused_auto &&
+            focused_worker_start(g_focused_auto, 0,
+                                 0 /* non-sticky: armed by preamble cb */) == 0) {
+            fprintf(stderr, "focused: auto worker spawned at "
+                            "channel_id=%d (idle until scanner promotion)\n",
+                    focus_id);
+        } else {
+            fprintf(stderr, "focused: auto worker spawn failed\n");
+            if (g_focused_auto) {
+                focused_worker_destroy(g_focused_auto);
+                g_focused_auto = NULL;
+            }
+            g_focused_auto_channel_id = -1;
         }
     }
 
@@ -781,6 +843,46 @@ static void on_lora_frame(const uint8_t *payload, size_t payload_len,
     dedup_buffer(payload, payload_len, meta, channel_id);
 }
 
+/* Phase 3 Commit 4: a wideband channel just preamble-locked; promote
+ * the matching focused worker if its slot config lines up. Runs on
+ * the decoder's calling thread; focused_worker_arm() is threadsafe. */
+static void on_wideband_preamble_lock(int sf, int cr, int bw_hz,
+                                      float snr_db, void *user)
+{
+    (void)snr_db;
+    if (!g_focused_auto) return;
+    if (sf != g_focused_auto_sf || cr != g_focused_auto_cr ||
+        bw_hz != g_focused_auto_bw_hz) return;
+    intptr_t channel_id = (intptr_t)user;
+    if (channel_id < 0 || channel_id >= CHANNELIZER_MAX_CHANNELS) return;
+    /* Match on freq too -- the focused DDC is centred on a specific
+     * channel, so promotion from a sibling slot at the same (sf,cr,bw)
+     * would just produce garbage. */
+    uint64_t chan_freq = g_chan_stats[channel_id].freq_hz;
+    if ((double)chan_freq != g_focused_auto_freq_hz) return;
+    /* Estimate where to rewind to. The wideband decoder fed us this
+     * lock from samples that arrived during the last few process_sample
+     * buf calls; "now" is g_samples_total, and the preamble at SF11
+     * BW250 is ~33ms long, so rewinding ~10ms is enough to re-find the
+     * preamble inside the focused DDC's own search. */
+    uint64_t now = __atomic_load_n(&g_samples_total, __ATOMIC_RELAXED);
+    uint64_t rewind = (uint64_t)((double)g_focused_auto_rewind_samples
+                                  * samp_rate / 1000.0);
+    uint64_t start = (now > rewind) ? (now - rewind) : 0;
+    focused_worker_arm(g_focused_auto, start, g_focused_auto_hold_down_s);
+    uint64_t armed = atomic_fetch_add(&g_focused_auto_arm_count, 1) + 1;
+    if (armed <= 5 || (armed % 10) == 0) {
+        fprintf(stderr,
+                "focused: promote #%llu from channel_id=%ld (%.3fMHz SF%d), "
+                "arm start_sample=%llu (now=%llu, rewind=%llu)\n",
+                (unsigned long long)armed, (long)channel_id,
+                (double)chan_freq / 1e6, sf,
+                (unsigned long long)start,
+                (unsigned long long)now,
+                (unsigned long long)rewind);
+    }
+}
+
 /* Forward decl for the web SSE publisher (we don't include web.h here
  * to avoid a circular dep when only main needs to push raw lines). */
 extern void web_publish_line(const char *json, size_t len);
@@ -1078,6 +1180,11 @@ static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr)
     lora_decoder_set_center_freq(g_demods[id], (double)f_hz);
     /* Stash channel id in user pointer so on_lora_frame can attribute stats. */
     lora_decoder_set_callback(g_demods[id], on_lora_frame, (void *)(intptr_t)id);
+    /* Phase 3 Commit 4: every wideband channel can promote to the
+     * focused worker via the preamble-lock callback. The hook is a
+     * no-op when no MESHTASTIC_FOCUS_AUTO worker is configured. */
+    lora_decoder_set_preamble_cb(g_demods[id], on_wideband_preamble_lock,
+                                 (void *)(intptr_t)id);
 
     /* Capture this slot's radio params + preset name into per-channel stats
      * so the stats-json line is self-describing. */
@@ -2878,6 +2985,50 @@ static int run_live(void)
         }
     }
 
+    /* Phase 3 Commit 4: scanner-promoted focused worker.
+     *   MESHTASTIC_FOCUS_AUTO=freq:bw:sf:cr[:hold_down_s[:rewind_ms]]
+     * The worker is created in non-sticky mode and sits IDLE until a
+     * wideband channel matching (sf, cr, bw_hz, freq) reports a
+     * preamble lock; main.c then arms it at (current_wideband_sample
+     * - rewind_ms * samp_rate). hold_down_s controls how long the
+     * worker stays warm after activity quiets (default 5s). */
+    {
+        const char *fa = getenv("MESHTASTIC_FOCUS_AUTO");
+        if (fa && *fa && strlen(fa) < sizeof(g_focused_auto_spec)) {
+            strncpy(g_focused_auto_spec, fa, sizeof(g_focused_auto_spec) - 1);
+            long long freq_hz = 0, bw_hz = 0;
+            int sf = 0, cr = 0;
+            double hd = 5.0;
+            int    rewind_ms = 10;
+            int nparsed = sscanf(g_focused_auto_spec,
+                                 "%lld:%lld:%d:%d:%lf:%d",
+                                 &freq_hz, &bw_hz, &sf, &cr,
+                                 &hd, &rewind_ms);
+            if (nparsed >= 4 && sf >= 7 && sf <= 12 && cr >= 5 && cr <= 8
+                && bw_hz > 0 && freq_hz > 0) {
+                g_focused_auto_freq_hz = (double)freq_hz;
+                g_focused_auto_bw_hz   = (int)bw_hz;
+                g_focused_auto_sf      = sf;
+                g_focused_auto_cr      = cr;
+                g_focused_auto_hold_down_s = hd > 0.0 ? hd : 5.0;
+                /* rewind window in samples at the SDR rate; computed
+                 * later when samp_rate is known. Stash ms here. */
+                g_focused_auto_rewind_samples = (uint64_t)rewind_ms;
+                if (g_iq_ring_ms == 0) g_iq_ring_ms = 500;
+                fprintf(stderr,
+                        "focused: auto spec '%s' queued "
+                        "(freq=%.3fMHz BW=%d SF=%d CR=4/%d "
+                        "hold_down=%.1fs rewind=%dms)\n",
+                        g_focused_auto_spec, (double)freq_hz / 1e6,
+                        (int)bw_hz, sf, cr, hd, rewind_ms);
+            } else {
+                fprintf(stderr, "focused: bad MESHTASTIC_FOCUS_AUTO spec '%s'\n",
+                        g_focused_auto_spec);
+                g_focused_auto_spec[0] = 0;
+            }
+        }
+    }
+
     feed_init();
     if (opt_pcap_path) pcap_out_init(opt_pcap_path, false);
     else if (opt_pcap_fifo) pcap_out_init(opt_pcap_fifo, true);
@@ -2956,6 +3107,11 @@ static int run_live(void)
     if (g_focused_manual) {
         focused_worker_stop_and_join(g_focused_manual);
     }
+    if (g_focused_auto) {
+        focused_worker_stop_and_join(g_focused_auto);
+        fprintf(stderr, "focused: auto arm_count=%llu over the run.\n",
+                (unsigned long long)atomic_load(&g_focused_auto_arm_count));
+    }
     pthread_join(stats_tid, NULL);
     pthread_join(wd_tid, NULL);
 
@@ -3008,6 +3164,10 @@ static int run_live(void)
     if (g_focused_manual) {
         focused_worker_destroy(g_focused_manual);
         g_focused_manual = NULL;
+    }
+    if (g_focused_auto) {
+        focused_worker_destroy(g_focused_auto);
+        g_focused_auto = NULL;
     }
     if (g_iq_ring) {
         uint64_t total = iq_ring_total_appended(g_iq_ring);

@@ -47,6 +47,16 @@ typedef struct lora_frame_meta {
 typedef void (*lora_frame_cb_t)(const uint8_t *payload, size_t payload_len,
                                 const lora_frame_meta_t *meta, void *user);
 
+/* Fired exactly once per preamble run, the first time the decoder
+ * collects PREAMBLE_MIN matching upchirp symbols (gr-lora_sdr's
+ * preamble lock). This is the event Phase 3 Commit 4 uses to promote
+ * a wideband-detected slot to the focused decoder: "not raw energy
+ * and not CRC". snr_db is the lock-time peak/noise estimate; sf/cr/
+ * bw_hz are the slot's radio parameters; user is whatever the caller
+ * passed to lora_decoder_set_preamble_cb (typically a channel id). */
+typedef void (*lora_preamble_cb_t)(int sf, int cr, int bw_hz,
+                                   float snr_db, void *user);
+
 /* os_factor: input rate is os_factor * bw_hz. 1 = legacy (synthetic IQ,
  * already at bw_hz). >=2 enables fractional-STO realignment which is
  * necessary to lock real-radio captures with sub-sample timing offset. */
@@ -58,6 +68,12 @@ lora_decoder_t *lora_decoder_create_os(int sf, int cr, int bw_hz, int os_factor)
  * meta->payload_crc_ok is false but the user wants soft fails). */
 void lora_decoder_set_callback(lora_decoder_t *dec,
                                lora_frame_cb_t cb, void *user);
+
+/* Register a preamble-lock callback. Fires exactly once per detected
+ * preamble (the same transition that bumps the preamble_locks stat).
+ * Safe to leave NULL; passing NULL clears any prior registration. */
+void lora_decoder_set_preamble_cb(lora_decoder_t *dec,
+                                  lora_preamble_cb_t cb, void *user);
 
 /* Set the slot's RF carrier frequency in Hz. Enables gr-lora_sdr-style
  * SFO drift compensation: at preamble lock the decoder derives an SFO
