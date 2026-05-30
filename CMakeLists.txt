@@ -294,6 +294,19 @@ if(OpenMP_C_FOUND)
 endif()
 set_property(TARGET test_pfb_bin_power PROPERTY C_STANDARD 99)
 
+# focused_demo: scan-then-focus Phase 2 prototype. One shared file reader
+# streams cs8 IQ into N independent focused-decode workers, each with its
+# own DDC chain (mixer + LPF + decim) and lora_decoder_t. Bypasses the
+# wideband PFB entirely. Architectural primitive for live "stare mode".
+add_executable(focused_demo
+    ${PROJECT_SOURCE_DIR}/tests/focused_demo.c
+    ${PROJECT_SOURCE_DIR}/lora.c)
+target_link_libraries(focused_demo PRIVATE
+    Threads::Threads
+    ${FFTW3F_LIB}
+    m)
+set_property(TARGET focused_demo PROPERTY C_STANDARD 99)
+
 # CPack
 set(CPACK_PACKAGE_NAME "meshtastic-sniffer")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Wideband Meshtastic LoRa receiver")
