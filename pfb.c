@@ -698,7 +698,17 @@ static inline void pfb_cycle_os(pfb_t *p)
         if (!p->bins[b]) continue;
         float complex y = (float complex)p->fft_out[b];
         if (shift != 0) {
-            double ph = 2.0 * M_PI * (double)b * (double)shift / (double)M;
+            /* Forward-FFT phase compensation: at cycle c with block_start=c*R
+             * (R=M/os) the FFT output X[k] picks up exp(+j*2*pi*k*block_start/M)
+             * relative to the desired DC-baseband channel-k output for a tone
+             * at bin k. Cancel with exp(-j*...). The original code had +j
+             * (doubled the spinning); invisible to every previous test because
+             * channelizer's find_or_create_group sets pre_shift so the FIRST
+             * registered channel is always bin 0 -- and at b=0 the twiddle is
+             * trivially identity for any sign. The bug only manifests when 2+
+             * channels share an os>1 group and the signal lands on a non-zero
+             * bin -- exactly --presets=MediumFast over the cluster2 SF9 channel. */
+            double ph = -2.0 * M_PI * (double)b * (double)shift / (double)M;
             y *= (float)cos(ph) + I * (float)sin(ph);
         }
         emit_to_bin(p, b, y);
