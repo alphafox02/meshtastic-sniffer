@@ -34,6 +34,7 @@
 #define FOCUSED_BATCH_SAMPLES   16384
 #define FOCUSED_POLL_USEC        2000   /* 2 ms; trades latency for CPU */
 #define FOCUSED_LPF_TAPS          257   /* good for os=1; lengthen for os>1 */
+#define FOCUSED_PHASOR_RENORM   4096    /* every N samples; |phasor| -> 1 */
 
 struct focused_worker {
     focused_cfg_t cfg;
@@ -56,9 +57,18 @@ struct focused_worker {
     int    pending_cr;
     int    pending_slot_change;
 
-    /* DDC chain */
+    /* DDC chain. The mixer runs as a phasor iteration: each input
+     * sample multiplies the running phasor by a precomputed
+     * per-sample rotation factor instead of recomputing cos/sin from
+     * the cumulative phase. That eliminates ~50 ns of libm transcendental
+     * work per sample, which was burning ~100% of one CPU core at
+     * 20-26 Msps wideband input and causing the worker to fall
+     * behind the ring writer. Renormalised every FOCUSED_PHASOR_RENORM
+     * samples to prevent magnitude drift from compound float rounding. */
     double mix_inc;
-    double mix_phase;
+    float complex mix_step;     /* exp(j * mix_inc), precomputed at arm time */
+    float complex mix_phasor;   /* running rotation; |mix_phasor| ~ 1 */
+    int   phasor_renorm_count;
     float *taps;
     int    n_taps;
     float complex *delay;
@@ -91,6 +101,7 @@ struct focused_worker {
     atomic_uint_fast64_t samples_consumed;
     atomic_uint_fast64_t samples_to_decoder;
     atomic_uint_fast64_t frames_delivered;
+    atomic_uint_fast64_t samples_skipped;     /* lost to fall-behind */
 };
 
 /* Hamming-windowed sinc LPF, cutoff at BW/2. Same shape as
@@ -160,17 +171,25 @@ static void focused_process_chunk(focused_worker_t *w,
 {
     const int8_t *si8  = (const int8_t *)samples;
     const float  *sf32 = (const float  *)samples;
+    float complex phasor = w->mix_phasor;
+    float complex step   = w->mix_step;
+    int renorm_count     = w->phasor_renorm_count;
     float complex one_out;
     for (size_t i = 0; i < n; ++i) {
         float ii, qq;
         if (format == SAMPLE_FMT_FLOAT) { ii = sf32[2*i+0]; qq = sf32[2*i+1]; }
         else                            { ii = (float)si8[2*i+0]; qq = (float)si8[2*i+1]; }
         float complex x = ii + I * qq;
-        float complex rot = (float complex)(cos(w->mix_phase) + I * sin(w->mix_phase));
-        float complex mixed = x * rot;
-        w->mix_phase += w->mix_inc;
-        if (w->mix_phase >  M_PI) w->mix_phase -= 2.0 * M_PI;
-        if (w->mix_phase < -M_PI) w->mix_phase += 2.0 * M_PI;
+        float complex mixed = x * phasor;
+        phasor *= step;
+        if (++renorm_count >= FOCUSED_PHASOR_RENORM) {
+            renorm_count = 0;
+            float mag2 = crealf(phasor) * crealf(phasor) +
+                         cimagf(phasor) * cimagf(phasor);
+            /* sqrt is cheap once per 4096 samples; keep |phasor| at 1
+             * so the rotation does not drift in magnitude. */
+            phasor = phasor / sqrtf(mag2);
+        }
         w->delay[w->delay_head] = mixed;
         w->delay_head = (w->delay_head + 1) % w->n_taps;
         if (++w->decim_phase >= w->decim) {
@@ -186,6 +205,8 @@ static void focused_process_chunk(focused_worker_t *w,
             atomic_fetch_add(&w->samples_to_decoder, 1);
         }
     }
+    w->mix_phasor = phasor;
+    w->phasor_renorm_count = renorm_count;
 }
 
 /* Re-build the DDC + decoder for a (possibly new) slot. Called from
@@ -210,7 +231,11 @@ static int focused_apply_slot_locked(focused_worker_t *w)
     w->cur_cr         = w->pending_cr;
     w->cur_set        = 1;
     w->mix_inc = -2.0 * M_PI * (w->cur_channel_hz - w->cfg.sdr_center_hz) / sr;
-    w->mix_phase = 0.0;
+    /* Precompute the single-sample rotation factor; the per-sample
+     * loop just multiplies mix_phasor by mix_step. */
+    w->mix_step   = (float complex)(cos(w->mix_inc) + I * sin(w->mix_inc));
+    w->mix_phasor = 1.0f + 0.0f * I;
+    w->phasor_renorm_count = 0;
     w->decim = decim;
     w->decim_phase = 0;
     w->channel_rate = sr / (double)decim;
@@ -312,10 +337,23 @@ static void *focused_thread(void *arg)
          * difference is the hysteresis timer below. */
         iq_ring_live_range(w->cfg.ring, &oldest, &newest);
         if (w->cursor < oldest) {
-            fprintf(stderr, "focused[%s]: cursor advanced %llu -> %llu (fell behind)\n",
-                    w->label_buf, (unsigned long long)w->cursor,
-                    (unsigned long long)oldest);
-            w->cursor = oldest;
+            /* The worker's cursor was overrun by the ring writer:
+             * samples between `cursor` and `oldest` are gone. Keeping
+             * a partial sample stream after a gap corrupts the
+             * decoder's chirp/STO/SFO state and produces nothing,
+             * which is exactly what we saw on live B205. Honest
+             * answer: drop this focus run, report it, and let the
+             * dispatcher arm a fresh attempt next time. */
+            uint64_t skipped = oldest - w->cursor;
+            atomic_fetch_add(&w->samples_skipped, skipped);
+            fprintf(stderr,
+                    "focused[%s]: fell behind by %llu samples (~%.1fms); "
+                    "dropping focus run and returning to IDLE\n",
+                    w->label_buf, (unsigned long long)skipped,
+                    (double)skipped * 1000.0 / w->cfg.sdr_samp_rate);
+            w->cursor = newest;
+            atomic_store(&w->state, FOCUSED_STATE_IDLE);
+            continue;
         }
         if (w->cursor < newest) {
             size_t want = newest - w->cursor;
@@ -425,6 +463,7 @@ focused_worker_t *focused_worker_create(const focused_cfg_t *cfg)
     atomic_init(&w->samples_consumed, 0);
     atomic_init(&w->samples_to_decoder, 0);
     atomic_init(&w->frames_delivered, 0);
+    atomic_init(&w->samples_skipped, 0);
     w->sticky      = 0;
     w->hold_down_s = 0.0;
     w->cursor      = 0;
@@ -568,11 +607,12 @@ void focused_worker_stop_and_join(focused_worker_t *w)
     pthread_join(w->tid, NULL);
     w->started = 0;
     fprintf(stderr,
-            "focused[%s]: consumed=%llu decoded=%llu frames=%llu\n",
+            "focused[%s]: consumed=%llu decoded=%llu frames=%llu skipped=%llu\n",
             w->label_buf,
             (unsigned long long)atomic_load(&w->samples_consumed),
             (unsigned long long)atomic_load(&w->samples_to_decoder),
-            (unsigned long long)atomic_load(&w->frames_delivered));
+            (unsigned long long)atomic_load(&w->frames_delivered),
+            (unsigned long long)atomic_load(&w->samples_skipped));
 }
 
 void focused_worker_destroy(focused_worker_t *w)
