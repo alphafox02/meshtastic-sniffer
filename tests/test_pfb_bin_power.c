@@ -49,6 +49,13 @@ typedef struct {
 
 static bin_stats_t g_stats[CHANNELIZER_MAX_CHANNELS];
 
+/* Diagnostic: dump the first N complex output samples per channel so we can
+ * inspect the PFB output's PHASE PROGRESSION (not just its RMS) -- the bug
+ * we're chasing makes consecutive samples spin rather than sit on a stable
+ * baseband. Enabled by --dump-first-n=N; 0 disables. */
+static int g_dump_first_n = 0;
+static int g_dumped[CHANNELIZER_MAX_CHANNELS];
+
 static void on_baseband(int channel_id, const float complex *iq,
                         size_t n, void *user)
 {
@@ -63,6 +70,22 @@ static void on_baseband(int channel_id, const float complex *iq,
     }
     st->sumsq += s;
     st->count += n;
+    if (g_dump_first_n > 0) {
+        int remaining = g_dump_first_n - g_dumped[channel_id];
+        if (remaining > 0) {
+            int dump_now = (int)((size_t)remaining < n ? (size_t)remaining : n);
+            for (int i = 0; i < dump_now; ++i) {
+                float r = crealf(iq[i]);
+                float im = cimagf(iq[i]);
+                float mag = sqrtf(r * r + im * im);
+                float ph  = (mag > 0.0f) ? atan2f(im, r) : 0.0f;
+                fprintf(stdout, "ch%d s%d  re=%+0.6f im=%+0.6f  |y|=%0.6f  arg=%+0.4f rad (%+0.1f deg)\n",
+                        channel_id, g_dumped[channel_id] + i, r, im, mag,
+                        ph, ph * 180.0f / (float)M_PI);
+            }
+            g_dumped[channel_id] += dump_now;
+        }
+    }
 }
 
 static void usage(const char *a0)
@@ -86,6 +109,7 @@ int main(int argc, char **argv)
     int    bw_hz     = 250000;
     double slot0_hz  = 905125000.0;
     int    nslots    = 80;
+    int    os_factor = 1;
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         if      (!strncmp(a, "--file=",     7)) path        = a + 7;
@@ -94,6 +118,8 @@ int main(int argc, char **argv)
         else if (!strncmp(a, "--bw=",       5)) bw_hz       = atoi(a + 5);
         else if (!strncmp(a, "--slot0-hz=",11)) slot0_hz    = atof(a + 11);
         else if (!strncmp(a, "--nslots=",   9)) nslots      = atoi(a + 9);
+        else if (!strncmp(a, "--os=",       5)) os_factor   = atoi(a + 5);
+        else if (!strncmp(a, "--dump-first-n=", 15)) g_dump_first_n = atoi(a + 15);
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", a); usage(argv[0]); return 2; }
     }
@@ -107,7 +133,7 @@ int main(int argc, char **argv)
         channel_cfg_t cfg = {
             .f_hz = (uint64_t)f,
             .bw_hz = bw_hz,
-            .sf = 9, .cr = 5, .os_factor = 1,
+            .sf = 9, .cr = 5, .os_factor = os_factor,
             .on_baseband = on_baseband,
             .user = NULL,
         };
