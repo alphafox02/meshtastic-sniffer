@@ -2887,6 +2887,31 @@ int main(int argc, char **argv)
         return run_selftest_rejection_procgain();
     }
 
+    /* Workaround: serialise sink-worker dispatch when the experimental
+     * oversampled PFB is going to be used (MESHTASTIC_OS_POLICY=auto or
+     * MESHTASTIC_PROTOTYPE_OS>1). Multi-worker dispatch has a concurrency
+     * bug when 2+ sinks share an os>1 PFB group -- cluster2 real-RF
+     * decodes 1-2 of 4 expected packets nondeterministically at 8 workers,
+     * 4 of 4 at 1 worker. The wall-time cost of serialising on the
+     * oversampled path is ~2%; the sample-pump producer is the bottleneck
+     * regardless. Default os=1 production runs leave the env vars unset
+     * and never enter this branch, so the full worker pool stays active
+     * for the critically-sampled path. The user can still override by
+     * setting MESHTASTIC_SINK_WORKERS explicitly. This is a correctness
+     * workaround, not the final root-cause fix. */
+    {
+        const char *pol = getenv("MESHTASTIC_OS_POLICY");
+        const char *po  = getenv("MESHTASTIC_PROTOTYPE_OS");
+        int os_active = (pol && !strcmp(pol, "auto")) ||
+                        (po && atoi(po) > 1);
+        if (os_active && !getenv("MESHTASTIC_SINK_WORKERS")) {
+            setenv("MESHTASTIC_SINK_WORKERS", "1", 0);
+            fprintf(stderr,
+                    "note: forcing MESHTASTIC_SINK_WORKERS=1 because an "
+                    "os>1 PFB path is enabled (avoids multi-worker race).\n");
+        }
+    }
+
     fprintf(stderr,
             "meshtastic-sniffer (build " __DATE__ " " __TIME__ ")\n"
             "  %d regions, %d presets compiled in.\n",
