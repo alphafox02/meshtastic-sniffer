@@ -115,8 +115,9 @@ static void on_wideband_preamble_lock(int sf, int cr, int bw_hz,
  * manual one but armed by the preamble_lock callback from a wideband
  * channel. Spec via MESHTASTIC_FOCUS_AUTO=freq:bw:sf:cr -- only locks
  * matching (sf, cr, bw_hz) at the configured freq promote, since the
- * focused DDC is built once for a specific slot. The N-worker pool
- * with dynamic slot allocation arrives in a follow-up commit. */
+ * focused DDC is built once for a specific slot. Superseded by the
+ * pool (MESHTASTIC_FOCUS_POOL) when both env vars are set; kept here
+ * for the single-slot backward-compatible path. */
 static focused_worker_t *g_focused_auto = NULL;
 static int               g_focused_auto_channel_id = -1;
 static char              g_focused_auto_spec[128];
@@ -127,6 +128,33 @@ static int               g_focused_auto_cr = 0;
 static double            g_focused_auto_hold_down_s = 5.0;
 static uint64_t          g_focused_auto_rewind_samples = 200000;
 static _Atomic uint64_t  g_focused_auto_arm_count = 0;
+
+/* Phase 3 Commit 5: bounded pool of focused workers. Any wideband
+ * preamble lock promotes to the pool; workers are slot-coalesced
+ * (same freq/bw/sf/cr refreshes the existing worker) or assigned to
+ * an idle peer. When all workers are busy a promotion is dropped and
+ * counted -- no eviction in this slice. Sized 1..FOCUS_POOL_MAX via
+ * MESHTASTIC_FOCUS_POOL=N. */
+#define FOCUS_POOL_MAX 4
+static focused_worker_t *g_focus_pool[FOCUS_POOL_MAX];
+static int               g_focus_pool_size = 0;
+static int               g_focus_pool_cfg_size = 0;     /* env value */
+static double            g_focus_pool_hold_down_s = 5.0;
+static int               g_focus_pool_rewind_ms = 20;
+static int               g_focus_pool_inited = 0;
+static pthread_mutex_t   g_focus_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+/* Optional frequency allowlist (decimal Hz, comma-separated). Empty
+ * means "accept any wideband slot". With --presets=all the wideband
+ * PFB at os=1 produces many leakage-bin preamble locks; the
+ * allowlist lets the operator tell the pool which slots are worth
+ * focusing on, mirroring the focused_demo test shape. */
+#define FOCUS_POOL_FREQS_MAX 32
+static uint64_t          g_focus_pool_freqs[FOCUS_POOL_FREQS_MAX];
+static int               g_focus_pool_freqs_n = 0;
+static _Atomic uint64_t  g_focus_pool_promote_total      = 0;
+static _Atomic uint64_t  g_focus_pool_promote_matched    = 0;
+static _Atomic uint64_t  g_focus_pool_promote_assigned   = 0;
+static _Atomic uint64_t  g_focus_pool_promote_dropped    = 0;
 
 /* Phase 3 Commit 2: one manual focused worker driven from the ring.
  * Activated by MESHTASTIC_FOCUS_MANUAL=freq:bw:sf:cr[:start_sample].
@@ -342,6 +370,48 @@ static void process_sample_buf(sample_buf_t *buf)
                     g_focused_manual_spec);
             g_focused_manual_spec[0] = 0;
         }
+    }
+
+    /* Phase 3 Commit 5: lazy-spawn pool workers once the ring exists. */
+    if (g_iq_ring && g_focus_pool_cfg_size > 0 && !g_focus_pool_inited) {
+        g_focus_pool_inited = 1;
+        for (int i = 0; i < g_focus_pool_cfg_size; ++i) {
+            int chan_id = CHANNELIZER_MAX_CHANNELS - 2 - i;  /* 1022..1019 */
+            char label[32];
+            snprintf(label, sizeof(label), "pool%d", i);
+            focused_cfg_t fcfg = {
+                /* leave channel_hz / bw_hz / sf / cr at 0 -- generic
+                 * worker; the DDC + decoder are built at first
+                 * focused_worker_arm_slot() call from the dispatcher. */
+                .channel_hz    = 0.0,
+                .bw_hz         = 0,
+                .sf            = 0,
+                .cr            = 0,
+                .os_factor     = 1,
+                .sdr_center_hz = (double)center_freq,
+                .sdr_samp_rate = samp_rate,
+                .ring          = g_iq_ring,
+                .frame_cb      = on_lora_frame,
+                .frame_cb_user = (void *)(intptr_t)chan_id,
+                .label         = label,
+            };
+            focused_worker_t *w = focused_worker_create(&fcfg);
+            if (!w || focused_worker_start(w, 0, 0 /* non-sticky */) != 0) {
+                fprintf(stderr, "focus-pool: worker %d spawn failed\n", i);
+                if (w) focused_worker_destroy(w);
+                continue;
+            }
+            /* Reserve a g_chan_stats slot per pool worker so its
+             * decoded frames get a freq_hz/preset_name in JSON. */
+            strncpy(g_chan_stats[chan_id].preset_name, "FocusedPool",
+                    sizeof(g_chan_stats[chan_id].preset_name) - 1);
+            g_focus_pool[g_focus_pool_size++] = w;
+        }
+        fprintf(stderr, "focus-pool: %d worker(s) spawned (channel_ids "
+                        "%d..%d, idle until promotion)\n",
+                g_focus_pool_size,
+                CHANNELIZER_MAX_CHANNELS - 2,
+                CHANNELIZER_MAX_CHANNELS - 2 - g_focus_pool_size + 1);
     }
 
     /* Phase 3 Commit 4: lazy-spawn the auto (scanner-triggered) worker.
@@ -843,29 +913,94 @@ static void on_lora_frame(const uint8_t *payload, size_t payload_len,
     dedup_buffer(payload, payload_len, meta, channel_id);
 }
 
-/* Phase 3 Commit 4: a wideband channel just preamble-locked; promote
- * the matching focused worker if its slot config lines up. Runs on
- * the decoder's calling thread; focused_worker_arm() is threadsafe. */
+/* Pool-mode dispatcher: route a wideband preamble lock to the pool. */
+static void promote_to_pool(double freq_hz, int bw_hz, int sf, int cr,
+                            uint64_t now_samples)
+{
+    if (g_focus_pool_size <= 0) return;
+    uint64_t rewind = (uint64_t)((double)g_focus_pool_rewind_ms
+                                  * samp_rate / 1000.0);
+    uint64_t start = (now_samples > rewind) ? (now_samples - rewind) : 0;
+    double   hd    = g_focus_pool_hold_down_s;
+
+    uint64_t total = atomic_fetch_add(&g_focus_pool_promote_total, 1) + 1;
+    pthread_mutex_lock(&g_focus_pool_mu);
+    /* 1) coalesce: a worker already focused on this slot just gets a
+     *    refresh -- no DDC rebuild, no idle worker eaten. */
+    for (int i = 0; i < g_focus_pool_size; ++i) {
+        focused_worker_t *w = g_focus_pool[i];
+        if (!w) continue;
+        double cf; int cb = 0, csf = 0, ccr = 0;
+        if (focused_worker_current_slot(w, &cf, &cb, &csf, &ccr) &&
+            cf == freq_hz && cb == bw_hz && csf == sf && ccr == cr &&
+            focused_worker_state(w) != FOCUSED_STATE_IDLE) {
+            focused_worker_arm_slot(w, freq_hz, bw_hz, sf, cr, start, hd);
+            atomic_fetch_add(&g_focus_pool_promote_matched, 1);
+            pthread_mutex_unlock(&g_focus_pool_mu);
+            return;
+        }
+    }
+    /* 2) assign an idle worker. */
+    for (int i = 0; i < g_focus_pool_size; ++i) {
+        focused_worker_t *w = g_focus_pool[i];
+        if (!w) continue;
+        if (focused_worker_state(w) == FOCUSED_STATE_IDLE) {
+            focused_worker_arm_slot(w, freq_hz, bw_hz, sf, cr, start, hd);
+            uint64_t armed = atomic_fetch_add(&g_focus_pool_promote_assigned, 1) + 1;
+            pthread_mutex_unlock(&g_focus_pool_mu);
+            /* Throttle stderr noise: log first 5, then every 25th. */
+            if (armed <= 5 || (armed % 25) == 0) {
+                fprintf(stderr,
+                        "focus-pool: assign #%llu (total promotions=%llu) "
+                        "worker[%d] <- %.3fMHz BW=%d SF=%d CR=4/%d "
+                        "start=%llu\n",
+                        (unsigned long long)armed,
+                        (unsigned long long)total, i,
+                        freq_hz / 1e6, bw_hz, sf, cr,
+                        (unsigned long long)start);
+            }
+            return;
+        }
+    }
+    /* 3) all busy: drop. */
+    atomic_fetch_add(&g_focus_pool_promote_dropped, 1);
+    pthread_mutex_unlock(&g_focus_pool_mu);
+}
+
+/* Phase 3 Commit 4 / 5: a wideband channel just preamble-locked.
+ * If the pool is configured, route the event to it (any slot, any
+ * worker). Otherwise fall back to the single-slot FOCUS_AUTO worker
+ * for backward compatibility. Runs on the decoder's calling thread;
+ * focused_worker_arm() is threadsafe. */
 static void on_wideband_preamble_lock(int sf, int cr, int bw_hz,
                                       float snr_db, void *user)
 {
     (void)snr_db;
+    intptr_t channel_id = (intptr_t)user;
+    if (channel_id < 0 || channel_id >= CHANNELIZER_MAX_CHANNELS) return;
+    uint64_t now = __atomic_load_n(&g_samples_total, __ATOMIC_RELAXED);
+
+    /* Pool mode: any wideband slot promotes, optionally filtered by
+     * the freq allowlist. */
+    if (g_focus_pool_size > 0) {
+        uint64_t chan_freq = g_chan_stats[channel_id].freq_hz;
+        if (chan_freq == 0) return;
+        if (g_focus_pool_freqs_n > 0) {
+            int allowed = 0;
+            for (int i = 0; i < g_focus_pool_freqs_n; ++i)
+                if (g_focus_pool_freqs[i] == chan_freq) { allowed = 1; break; }
+            if (!allowed) return;
+        }
+        promote_to_pool((double)chan_freq, bw_hz, sf, cr, now);
+        return;
+    }
+
+    /* Single-slot backwards-compat path (Commit 4). */
     if (!g_focused_auto) return;
     if (sf != g_focused_auto_sf || cr != g_focused_auto_cr ||
         bw_hz != g_focused_auto_bw_hz) return;
-    intptr_t channel_id = (intptr_t)user;
-    if (channel_id < 0 || channel_id >= CHANNELIZER_MAX_CHANNELS) return;
-    /* Match on freq too -- the focused DDC is centred on a specific
-     * channel, so promotion from a sibling slot at the same (sf,cr,bw)
-     * would just produce garbage. */
     uint64_t chan_freq = g_chan_stats[channel_id].freq_hz;
     if ((double)chan_freq != g_focused_auto_freq_hz) return;
-    /* Estimate where to rewind to. The wideband decoder fed us this
-     * lock from samples that arrived during the last few process_sample
-     * buf calls; "now" is g_samples_total, and the preamble at SF11
-     * BW250 is ~33ms long, so rewinding ~10ms is enough to re-find the
-     * preamble inside the focused DDC's own search. */
-    uint64_t now = __atomic_load_n(&g_samples_total, __ATOMIC_RELAXED);
     uint64_t rewind = (uint64_t)((double)g_focused_auto_rewind_samples
                                   * samp_rate / 1000.0);
     uint64_t start = (now > rewind) ? (now - rewind) : 0;
@@ -2985,6 +3120,63 @@ static int run_live(void)
         }
     }
 
+    /* Optional pool slot allowlist. Comma-separated decimal Hz; only
+     * preamble locks from wideband channels whose freq matches one of
+     * these will promote into the pool. */
+    {
+        const char *fl = getenv("MESHTASTIC_FOCUS_POOL_FREQS");
+        if (fl && *fl) {
+            char buf[512];
+            strncpy(buf, fl, sizeof(buf) - 1); buf[sizeof(buf)-1] = 0;
+            char *save = NULL;
+            for (char *t = strtok_r(buf, ",", &save); t;
+                 t = strtok_r(NULL, ",", &save)) {
+                if (g_focus_pool_freqs_n >= FOCUS_POOL_FREQS_MAX) break;
+                uint64_t f = strtoull(t, NULL, 10);
+                if (f > 0) g_focus_pool_freqs[g_focus_pool_freqs_n++] = f;
+            }
+            if (g_focus_pool_freqs_n > 0) {
+                fprintf(stderr, "focus-pool: allowlist (%d freqs):",
+                        g_focus_pool_freqs_n);
+                for (int i = 0; i < g_focus_pool_freqs_n; ++i)
+                    fprintf(stderr, " %.3fMHz",
+                            (double)g_focus_pool_freqs[i] / 1e6);
+                fputc('\n', stderr);
+            }
+        }
+    }
+
+    /* Pool: bounded set of generic focused workers.
+     *   MESHTASTIC_FOCUS_POOL=N[:hold_down_s[:rewind_ms]]
+     * (e.g. "2:5.0:20"). Any wideband preamble lock promotes to the
+     * pool: same-slot locks refresh the existing worker; a new slot
+     * lands on an idle worker; all-busy locks are dropped. */
+    {
+        const char *fp = getenv("MESHTASTIC_FOCUS_POOL");
+        if (fp && *fp) {
+            int n = 0;
+            double hd = 5.0;
+            int rewind_ms = 20;
+            int nparsed = sscanf(fp, "%d:%lf:%d", &n, &hd, &rewind_ms);
+            if (nparsed >= 1 && n >= 1 && n <= FOCUS_POOL_MAX) {
+                g_focus_pool_cfg_size   = n;
+                g_focus_pool_hold_down_s = hd > 0.0 ? hd : 5.0;
+                g_focus_pool_rewind_ms   = rewind_ms > 0 ? rewind_ms : 20;
+                if (g_iq_ring_ms == 0) g_iq_ring_ms = 500;
+                fprintf(stderr,
+                        "focus-pool: requested %d worker(s), hold_down=%.1fs, "
+                        "rewind=%dms\n",
+                        n, g_focus_pool_hold_down_s,
+                        g_focus_pool_rewind_ms);
+            } else {
+                fprintf(stderr,
+                        "focus-pool: bad MESHTASTIC_FOCUS_POOL='%s' "
+                        "(want N[:hd_s[:rewind_ms]], N=1..%d)\n",
+                        fp, FOCUS_POOL_MAX);
+            }
+        }
+    }
+
     /* Phase 3 Commit 4: scanner-promoted focused worker.
      *   MESHTASTIC_FOCUS_AUTO=freq:bw:sf:cr[:hold_down_s[:rewind_ms]]
      * The worker is created in non-sticky mode and sits IDLE until a
@@ -3112,6 +3304,18 @@ static int run_live(void)
         fprintf(stderr, "focused: auto arm_count=%llu over the run.\n",
                 (unsigned long long)atomic_load(&g_focused_auto_arm_count));
     }
+    if (g_focus_pool_size > 0) {
+        for (int i = 0; i < g_focus_pool_size; ++i) {
+            if (g_focus_pool[i]) focused_worker_stop_and_join(g_focus_pool[i]);
+        }
+        fprintf(stderr,
+                "focus-pool: promotions total=%llu matched_existing=%llu "
+                "assigned_idle=%llu dropped_busy=%llu\n",
+                (unsigned long long)atomic_load(&g_focus_pool_promote_total),
+                (unsigned long long)atomic_load(&g_focus_pool_promote_matched),
+                (unsigned long long)atomic_load(&g_focus_pool_promote_assigned),
+                (unsigned long long)atomic_load(&g_focus_pool_promote_dropped));
+    }
     pthread_join(stats_tid, NULL);
     pthread_join(wd_tid, NULL);
 
@@ -3169,6 +3373,13 @@ static int run_live(void)
         focused_worker_destroy(g_focused_auto);
         g_focused_auto = NULL;
     }
+    for (int i = 0; i < g_focus_pool_size; ++i) {
+        if (g_focus_pool[i]) {
+            focused_worker_destroy(g_focus_pool[i]);
+            g_focus_pool[i] = NULL;
+        }
+    }
+    g_focus_pool_size = 0;
     if (g_iq_ring) {
         uint64_t total = iq_ring_total_appended(g_iq_ring);
         uint64_t oldest, newest;

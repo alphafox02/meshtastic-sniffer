@@ -38,6 +38,24 @@
 struct focused_worker {
     focused_cfg_t cfg;
 
+    /* Mutable slot config + DDC chain. Protected by cfg_mu; the worker
+     * thread takes the lock only when it processes a pending slot
+     * reconfiguration so the steady-state path is uncontended. */
+    pthread_mutex_t cfg_mu;
+    double cur_channel_hz;
+    int    cur_bw_hz;
+    int    cur_sf;
+    int    cur_cr;
+    int    cur_set;            /* 1 once a slot has been configured */
+    /* Pending slot fields written by focused_worker_arm_slot(); the
+     * worker thread observes them along with arm_pending and copies
+     * into cur_* + rebuilds DDC. */
+    double pending_channel_hz;
+    int    pending_bw_hz;
+    int    pending_sf;
+    int    pending_cr;
+    int    pending_slot_change;
+
     /* DDC chain */
     double mix_inc;
     double mix_phase;
@@ -49,8 +67,11 @@ struct focused_worker {
     int    decim_phase;
     double channel_rate;
 
-    /* Decoder */
+    /* Decoder. Lifetime is owned by the worker. The trampoline ctx
+     * persists across decoder rebuilds so we register-and-forget the
+     * same `user` pointer on each new decoder. */
     lora_decoder_t *dec;
+    void *frame_trampoline_ctx;
 
     /* Worker thread + lifecycle */
     pthread_t tid;
@@ -167,6 +188,54 @@ static void focused_process_chunk(focused_worker_t *w,
     }
 }
 
+/* Re-build the DDC + decoder for a (possibly new) slot. Called from
+ * focused_worker_create() the first time (when w->dec is NULL) and
+ * from the worker thread when it sees pending_slot_change. Must be
+ * called with w->cfg_mu held -- it mutates the shared cur_* fields
+ * and replaces w->dec. Returns 0 on success, -1 on failure (decoder
+ * destroy + recreate cycle hit an allocator error). */
+static int focused_apply_slot_locked(focused_worker_t *w)
+{
+    int os    = w->cfg.os_factor;
+    double sr = w->cfg.sdr_samp_rate;
+    int decim = (int)(sr / (double)(os * w->pending_bw_hz) + 0.5);
+    if (decim <= 0) {
+        fprintf(stderr, "focused[%s]: rate %.0f not aligned to os*BW=%d\n",
+                w->label_buf, sr, os * w->pending_bw_hz);
+        return -1;
+    }
+    w->cur_channel_hz = w->pending_channel_hz;
+    w->cur_bw_hz      = w->pending_bw_hz;
+    w->cur_sf         = w->pending_sf;
+    w->cur_cr         = w->pending_cr;
+    w->cur_set        = 1;
+    w->mix_inc = -2.0 * M_PI * (w->cur_channel_hz - w->cfg.sdr_center_hz) / sr;
+    w->mix_phase = 0.0;
+    w->decim = decim;
+    w->decim_phase = 0;
+    w->channel_rate = sr / (double)decim;
+    /* Reuse the taps + delay buffer (size is fixed by FOCUSED_LPF_TAPS);
+     * just rebuild the LPF shape for the new BW. */
+    w->n_taps = build_lpf(w->n_taps > 0 ? w->n_taps : FOCUSED_LPF_TAPS,
+                          sr, (double)w->cur_bw_hz * 0.5, w->taps);
+    memset(w->delay, 0, sizeof(float complex) * (size_t)w->n_taps);
+    w->delay_head = 0;
+    /* Decoder is bound to (sf, cr, bw, os) at create -- destroy and
+     * recreate when any of those change. */
+    if (w->dec) lora_decoder_destroy(w->dec);
+    w->dec = lora_decoder_create_os(w->cur_sf, w->cur_cr, w->cur_bw_hz, os);
+    if (!w->dec) {
+        fprintf(stderr, "focused[%s]: lora_decoder_create_os failed for "
+                        "sf=%d cr=%d bw=%d os=%d\n",
+                w->label_buf, w->cur_sf, w->cur_cr, w->cur_bw_hz, os);
+        return -1;
+    }
+    lora_decoder_set_callback(w->dec, focused_frame_trampoline,
+                              w->frame_trampoline_ctx);
+    lora_decoder_set_center_freq(w->dec, w->cur_channel_hz);
+    return 0;
+}
+
 static void *focused_thread(void *arg)
 {
     focused_worker_t *w = arg;
@@ -190,8 +259,29 @@ static void *focused_thread(void *arg)
 
     while (atomic_load(&w->run)) {
         /* Honour pending arm requests: re-anchor cursor + refresh
-         * activity clock + flip to DECODING. */
+         * activity clock + (possibly) rebuild DDC + flip to DECODING. */
         if (atomic_exchange(&w->arm_pending, 0)) {
+            /* Drain a slot reconfiguration too, while we hold cfg_mu.
+             * The DDC and decoder are rebuilt in place; existing
+             * delay-line / decoder state from a previous slot is
+             * discarded so we never produce mixed-slot symbols. */
+            pthread_mutex_lock(&w->cfg_mu);
+            if (w->pending_slot_change) {
+                int rc = focused_apply_slot_locked(w);
+                w->pending_slot_change = 0;
+                if (rc != 0) {
+                    pthread_mutex_unlock(&w->cfg_mu);
+                    atomic_store(&w->state, FOCUSED_STATE_IDLE);
+                    continue;
+                }
+                fprintf(stderr,
+                        "focused[%s]: slot reconfigured -> ch=%.3fMHz "
+                        "BW=%dkHz SF=%d CR=4/%d\n",
+                        w->label_buf, w->cur_channel_hz / 1e6,
+                        w->cur_bw_hz / 1000, w->cur_sf, w->cur_cr);
+            }
+            pthread_mutex_unlock(&w->cfg_mu);
+
             uint64_t o2, n2;
             iq_ring_live_range(w->cfg.ring, &o2, &n2);
             if (w->start_sample == 0 || w->start_sample < o2) {
@@ -292,52 +382,34 @@ focused_worker_t *focused_worker_create(const focused_cfg_t *cfg)
 {
     if (!cfg || !cfg->ring) return NULL;
     if (cfg->os_factor < 1 || cfg->os_factor > 4) return NULL;
-    if (cfg->sf < 7 || cfg->sf > 12) return NULL;
-    if (cfg->cr < 5 || cfg->cr > 8)  return NULL;
-    if (cfg->bw_hz <= 0)             return NULL;
-
-    int os = cfg->os_factor;
-    int decim = (int)(cfg->sdr_samp_rate / (double)(os * cfg->bw_hz) + 0.5);
-    if (decim <= 0) {
-        fprintf(stderr, "focused: rate %.0f not divisible by os*BW=%d\n",
-                cfg->sdr_samp_rate, os * cfg->bw_hz);
-        return NULL;
-    }
 
     focused_worker_t *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
     w->cfg = *cfg;
+    pthread_mutex_init(&w->cfg_mu, NULL);
 
-    w->mix_inc   = -2.0 * M_PI * (cfg->channel_hz - cfg->sdr_center_hz)
-                                 / cfg->sdr_samp_rate;
-    w->mix_phase = 0.0;
-    w->decim     = decim;
-    w->channel_rate = cfg->sdr_samp_rate / (double)decim;
-    w->decim_phase  = 0;
+    /* Allocate taps + delay at max length once; build_lpf() inside
+     * focused_apply_slot_locked() reshapes them per slot. */
     w->n_taps = FOCUSED_LPF_TAPS;
     w->taps   = malloc(sizeof(float) * (size_t)w->n_taps);
-    if (!w->taps) { free(w); return NULL; }
-    w->n_taps = build_lpf(w->n_taps, cfg->sdr_samp_rate,
-                          (double)cfg->bw_hz * 0.5, w->taps);
+    if (!w->taps) { pthread_mutex_destroy(&w->cfg_mu); free(w); return NULL; }
     w->delay  = calloc((size_t)w->n_taps, sizeof(float complex));
-    if (!w->delay) { free(w->taps); free(w); return NULL; }
+    if (!w->delay) {
+        free(w->taps); pthread_mutex_destroy(&w->cfg_mu); free(w); return NULL;
+    }
     w->delay_head = 0;
-    w->dec = lora_decoder_create_os(cfg->sf, cfg->cr, cfg->bw_hz, os);
-    if (!w->dec) { free(w->delay); free(w->taps); free(w); return NULL; }
 
-    /* Set up the trampoline. We allocate ctx alongside the worker so its
-     * lifetime matches the worker; lora_decoder_set_callback holds the
-     * pointer. */
+    /* Set up the trampoline ctx; survives decoder rebuilds. */
     frame_trampoline_ctx_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) {
-        lora_decoder_destroy(w->dec); free(w->delay); free(w->taps); free(w);
+        free(w->delay); free(w->taps);
+        pthread_mutex_destroy(&w->cfg_mu); free(w);
         return NULL;
     }
     ctx->w = w;
     ctx->cb = cfg->frame_cb;
     ctx->cb_user = cfg->frame_cb_user;
-    lora_decoder_set_callback(w->dec, focused_frame_trampoline, ctx);
-    lora_decoder_set_center_freq(w->dec, cfg->channel_hz);
+    w->frame_trampoline_ctx = ctx;
 
     if (cfg->label) {
         snprintf(w->label_buf, sizeof(w->label_buf), "%s", cfg->label);
@@ -357,11 +429,38 @@ focused_worker_t *focused_worker_create(const focused_cfg_t *cfg)
     w->hold_down_s = 0.0;
     w->cursor      = 0;
 
-    fprintf(stderr,
-            "focused[%s]: ch=%.3fMHz BW=%dkHz SF=%d CR=4/%d os=%d  "
-            "decim=%d -> %.0f sps  ntaps=%d\n",
-            w->label_buf, cfg->channel_hz / 1e6, cfg->bw_hz / 1000,
-            cfg->sf, cfg->cr, os, decim, w->channel_rate, w->n_taps);
+    /* If cfg specifies an initial slot (legacy single-worker create
+     * path used by manual focus and the single auto worker), build
+     * the DDC + decoder now so the worker is fully usable from the
+     * moment focused_worker_start() returns. Pool-managed workers
+     * leave cfg.bw_hz = 0 (and friends) and defer the build to the
+     * first focused_worker_arm_slot() call. */
+    if (cfg->bw_hz > 0 && cfg->sf >= 7 && cfg->sf <= 12 &&
+        cfg->cr >= 5 && cfg->cr <= 8 && cfg->channel_hz > 0.0) {
+        pthread_mutex_lock(&w->cfg_mu);
+        w->pending_channel_hz = cfg->channel_hz;
+        w->pending_bw_hz      = cfg->bw_hz;
+        w->pending_sf         = cfg->sf;
+        w->pending_cr         = cfg->cr;
+        int rc = focused_apply_slot_locked(w);
+        pthread_mutex_unlock(&w->cfg_mu);
+        if (rc != 0) {
+            free(ctx); free(w->delay); free(w->taps);
+            pthread_mutex_destroy(&w->cfg_mu); free(w);
+            return NULL;
+        }
+        fprintf(stderr,
+                "focused[%s]: ch=%.3fMHz BW=%dkHz SF=%d CR=4/%d os=%d  "
+                "decim=%d -> %.0f sps  ntaps=%d\n",
+                w->label_buf, cfg->channel_hz / 1e6, cfg->bw_hz / 1000,
+                cfg->sf, cfg->cr, cfg->os_factor, w->decim,
+                w->channel_rate, w->n_taps);
+    } else {
+        fprintf(stderr,
+                "focused[%s]: created in generic mode (os=%d, slot deferred "
+                "until first arm_slot)\n",
+                w->label_buf, cfg->os_factor);
+    }
     return w;
 }
 
@@ -402,6 +501,54 @@ void focused_worker_arm(focused_worker_t *w,
      * timer reset on the worker side. */
 }
 
+void focused_worker_arm_slot(focused_worker_t *w,
+                             double channel_hz, int bw_hz,
+                             int sf, int cr,
+                             uint64_t start_sample,
+                             double hold_down_s)
+{
+    if (!w) return;
+    pthread_mutex_lock(&w->cfg_mu);
+    /* Fill defaults from current slot when caller passes 0 to keep a
+     * field. cur_set==0 means this is the worker's first arm; allow
+     * channel_hz=0 only if the caller really did mean the previous
+     * slot (which doesn't exist) -- treat as error. */
+    double next_ch = (channel_hz > 0.0) ? channel_hz : w->cur_channel_hz;
+    int    next_bw = (bw_hz      >  0 ) ? bw_hz      : w->cur_bw_hz;
+    int    next_sf = (sf         >  0 ) ? sf         : w->cur_sf;
+    int    next_cr = (cr         >  0 ) ? cr         : w->cur_cr;
+    int slot_changed = !w->cur_set ||
+                       next_ch != w->cur_channel_hz ||
+                       next_bw != w->cur_bw_hz ||
+                       next_sf != w->cur_sf ||
+                       next_cr != w->cur_cr;
+    if (slot_changed) {
+        w->pending_channel_hz = next_ch;
+        w->pending_bw_hz      = next_bw;
+        w->pending_sf         = next_sf;
+        w->pending_cr         = next_cr;
+        w->pending_slot_change = 1;
+    }
+    pthread_mutex_unlock(&w->cfg_mu);
+    focused_worker_arm(w, start_sample, hold_down_s);
+}
+
+int focused_worker_current_slot(const focused_worker_t *w,
+                                double *freq_hz_out, int *bw_hz_out,
+                                int *sf_out, int *cr_out)
+{
+    if (!w) return 0;
+    focused_worker_t *rw = (focused_worker_t *)w;
+    pthread_mutex_lock(&rw->cfg_mu);
+    int has = w->cur_set;
+    if (freq_hz_out) *freq_hz_out = w->cur_channel_hz;
+    if (bw_hz_out)   *bw_hz_out   = w->cur_bw_hz;
+    if (sf_out)      *sf_out      = w->cur_sf;
+    if (cr_out)      *cr_out      = w->cur_cr;
+    pthread_mutex_unlock(&rw->cfg_mu);
+    return has;
+}
+
 focused_state_t focused_worker_state(const focused_worker_t *w)
 {
     return w ? (focused_state_t)atomic_load(&((focused_worker_t *)w)->state)
@@ -425,12 +572,11 @@ void focused_worker_stop_and_join(focused_worker_t *w)
 void focused_worker_destroy(focused_worker_t *w)
 {
     if (!w) return;
-    /* Trampoline ctx leak intentional here -- a worker is created once
-     * for the program lifetime in Commit 2; the OS reclaims it on exit.
-     * Commit 3 introduces a real lifecycle that frees it. */
     if (w->dec) lora_decoder_destroy(w->dec);
+    free(w->frame_trampoline_ctx);
     free(w->delay);
     free(w->taps);
+    pthread_mutex_destroy(&w->cfg_mu);
     free(w);
 }
 

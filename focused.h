@@ -89,6 +89,27 @@ void focused_worker_arm(focused_worker_t *w,
                         uint64_t start_sample,
                         double hold_down_s);
 
+/* Same as focused_worker_arm() but additionally reconfigures the
+ * worker's DDC chain for a (possibly different) channel slot. Used
+ * by the pool dispatcher (Phase 3 Commit 5) where a single worker
+ * floats between slots over its lifetime. Passing any of
+ * channel_hz/bw_hz/sf/cr as 0 keeps the current value for that
+ * field. If the resulting slot exactly matches the worker's current
+ * config, no DDC rebuild happens -- just an arm() refresh. */
+void focused_worker_arm_slot(focused_worker_t *w,
+                             double channel_hz, int bw_hz,
+                             int sf, int cr,
+                             uint64_t start_sample,
+                             double hold_down_s);
+
+/* Read back the slot the worker is currently configured for. Returns
+ * 1 if a slot is set (worker has been armed at least once), 0
+ * otherwise. Output pointers are optional. Safe to call from any
+ * thread. */
+int  focused_worker_current_slot(const focused_worker_t *w,
+                                 double *freq_hz_out, int *bw_hz_out,
+                                 int *sf_out, int *cr_out);
+
 focused_state_t focused_worker_state(const focused_worker_t *w);
 
 /* Ask the worker to stop after it drains everything currently in the
