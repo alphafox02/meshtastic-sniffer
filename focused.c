@@ -166,10 +166,13 @@ static void focused_frame_trampoline(const uint8_t *payload, size_t len,
 
 /* Process `n` raw input samples through the DDC. samples is either
  * int8 (2 bytes/IQ pair) or float (8 bytes/IQ pair) depending on the
- * ring's format. */
+ * ring's format. chunk_start_sdr_idx is the absolute SDR sample index
+ * of the first sample in this batch (= w->cursor before the read);
+ * the focused decoder uses it via lora_decoder_set_stream_cursor to
+ * stamp a race-free, sample-precise lock anchor on each frame. */
 static void focused_process_chunk(focused_worker_t *w,
                                   const void *samples, size_t n,
-                                  int format)
+                                  int format, uint64_t chunk_start_sdr_idx)
 {
     const int8_t *si8  = (const int8_t *)samples;
     const float  *sf32 = (const float  *)samples;
@@ -177,6 +180,15 @@ static void focused_process_chunk(focused_worker_t *w,
     float complex step   = w->mix_step;
     int renorm_count     = w->phasor_renorm_count;
     float complex one_out;
+    /* TDOA stream-cursor announce: each consumed channelizer output
+     * sample represents w->decim SDR input samples, so the decoder's
+     * lock stamp at samples_in_chunk=k corresponds to SDR sample
+     * chunk_start_sdr_idx + k*w->decim. Sample-precise for this path
+     * because w->cursor is read straight from the IQ ring. */
+    if (w->dec) {
+        lora_decoder_set_stream_cursor(w->dec, chunk_start_sdr_idx,
+                                       (uint32_t)w->decim);
+    }
     for (size_t i = 0; i < n; ++i) {
         float ii, qq;
         if (format == SAMPLE_FMT_FLOAT) { ii = sf32[2*i+0]; qq = sf32[2*i+1]; }
@@ -363,9 +375,10 @@ static void *focused_thread(void *arg)
         if (w->cursor < newest) {
             size_t want = newest - w->cursor;
             if (want > FOCUSED_BATCH_SAMPLES) want = FOCUSED_BATCH_SAMPLES;
+            uint64_t chunk_start = w->cursor;
             size_t got = iq_ring_get_window(w->cfg.ring, w->cursor, want, stage);
             if (got > 0) {
-                focused_process_chunk(w, stage, got, format);
+                focused_process_chunk(w, stage, got, format, chunk_start);
                 atomic_fetch_add(&w->samples_consumed, got);
                 w->cursor += got;
             }
@@ -409,9 +422,10 @@ static void *focused_thread(void *arg)
             if (w->cursor >= newest) break;
             size_t want = newest - w->cursor;
             if (want > FOCUSED_BATCH_SAMPLES) want = FOCUSED_BATCH_SAMPLES;
+            uint64_t chunk_start = w->cursor;
             size_t got = iq_ring_get_window(w->cfg.ring, w->cursor, want, stage);
             if (got == 0) break;
-            focused_process_chunk(w, stage, got, format);
+            focused_process_chunk(w, stage, got, format, chunk_start);
             atomic_fetch_add(&w->samples_consumed, got);
             w->cursor += got;
         }

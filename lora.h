@@ -42,6 +42,12 @@ typedef struct lora_frame_meta {
     float    rssi_db;       /* indicated by demodulator (estimated) */
     float    snr_db;
     float    cfo_hz;        /* carrier frequency offset estimate */
+    /* TDOA: caller-opaque stream cursor at the moment of preamble lock
+     * for this frame. The decoder stashes it from its internal
+     * stream_cursor + per-feed sample offset (set via
+     * lora_decoder_set_stream_cursor). 0 if the caller never set the
+     * cursor (synthetic feeds, selftest). */
+    uint64_t preamble_lock_sample_idx;
 } lora_frame_meta_t;
 
 typedef void (*lora_frame_cb_t)(const uint8_t *payload, size_t payload_len,
@@ -74,6 +80,25 @@ void lora_decoder_set_callback(lora_decoder_t *dec,
  * Safe to leave NULL; passing NULL clears any prior registration. */
 void lora_decoder_set_preamble_cb(lora_decoder_t *dec,
                                   lora_preamble_cb_t cb, void *user);
+
+/* TDOA: announce the absolute stream-cursor value of the FIRST sample
+ * in the next lora_decoder_feed() call, plus how many cursor units
+ * each consumed input sample represents. The decoder treats both
+ * values as opaque uint64/uint32 and stashes
+ *
+ *     chunk_anchor + samples_consumed_in_chunk * step_per_sample
+ *
+ * at the moment its preamble-lock state fires, then propagates that
+ * value through lora_frame_meta_t.preamble_lock_sample_idx for any
+ * frame that comes out of the lock. Callers driving the decoder from
+ * a chunk-oriented stream should pass step_per_sample = SDR samples
+ * per consumed input sample (= channelizer or DDC decim factor) and
+ * chunk_anchor = SDR sample index of the first sample in the next
+ * feed. Synthetic / selftest paths can leave both at 0; the field
+ * stays 0 and downstream consumers see no anchor. */
+void lora_decoder_set_stream_cursor(lora_decoder_t *dec,
+                                    uint64_t chunk_anchor,
+                                    uint32_t step_per_sample);
 
 /* Set the slot's RF carrier frequency in Hz. Enables gr-lora_sdr-style
  * SFO drift compensation: at preamble lock the decoder derives an SFO

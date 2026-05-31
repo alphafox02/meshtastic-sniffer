@@ -224,11 +224,6 @@ typedef struct {
     int      bw_hz;
     uint64_t freq_hz;
     char     preset_name[24];
-    /* TDOA: absolute SDR-rate sample index recorded the last time this
-     * slot's wideband decoder fired a preamble lock (wideband path) or
-     * the last time a wideband lock promoted this focused-pool slot. 0
-     * until first lock; frames decoded before any lock event report 0. */
-    uint64_t preamble_lock_sample_idx;
 } chan_stat_t;
 static chan_stat_t g_chan_stats[CHANNELIZER_MAX_CHANNELS];
 
@@ -829,12 +824,6 @@ static void dedup_emit_locked(const dedup_entry_t *e)
         pcap_out_write_frame(e->best_payload, e->best_payload_len,
                              (uint32_t)ts.tv_sec, (uint32_t)(ts.tv_nsec / 1000));
     }
-    uint64_t lock_idx = 0;
-    if (channel_id >= 0 && channel_id < CHANNELIZER_MAX_CHANNELS) {
-        lock_idx = __atomic_load_n(
-            &g_chan_stats[channel_id].preamble_lock_sample_idx,
-            __ATOMIC_RELAXED);
-    }
     frame_emit_ctx_t ctx = {
         .channel_id       = (int)channel_id,
         .has_crc          = e->best_meta.has_crc,
@@ -842,7 +831,10 @@ static void dedup_emit_locked(const dedup_entry_t *e)
         .cfo_hz           = e->best_meta.cfo_hz,
         .station_t_ns     = e->first_seen_t_ns,
         .station_t_acc_ns = (uint32_t)opt_station_t_acc_ns,
-        .preamble_lock_sample_idx = lock_idx,
+        /* Per-frame anchor stamped by lora.c at preamble-lock fire;
+         * survives the dedup snapshot, so a later lock on the same
+         * channel can't overwrite this frame's cursor. */
+        .preamble_lock_sample_idx = e->best_meta.preamble_lock_sample_idx,
     };
     mesh_packet_decode_with_radio(e->best_payload, e->best_payload_len,
                                   e->best_meta.rssi_db, e->best_meta.snr_db,
@@ -937,8 +929,7 @@ static void on_lora_frame(const uint8_t *payload, size_t payload_len,
  * so downstream tools can attribute them to a real channel instead
  * of seeing a synthetic high channel_id with zeros. */
 static void focus_pool_stamp_chan_stats(int worker_idx, double freq_hz,
-                                        int bw_hz, int sf, int cr,
-                                        uint64_t lock_sample_idx)
+                                        int bw_hz, int sf, int cr)
 {
     int chan_id = CHANNELIZER_MAX_CHANNELS - 2 - worker_idx;
     if (chan_id < 0 || chan_id >= CHANNELIZER_MAX_CHANNELS) return;
@@ -946,11 +937,6 @@ static void focus_pool_stamp_chan_stats(int worker_idx, double freq_hz,
     g_chan_stats[chan_id].cr      = cr;
     g_chan_stats[chan_id].bw_hz   = bw_hz;
     g_chan_stats[chan_id].freq_hz = (uint64_t)freq_hz;
-    /* TDOA: carry the wideband-channel lock sample idx onto the focused
-     * pool slot so frames decoded from the rewound IQ window stamp the
-     * same absolute SDR sample index as the wideband path would. */
-    __atomic_store_n(&g_chan_stats[chan_id].preamble_lock_sample_idx,
-                     lock_sample_idx, __ATOMIC_RELAXED);
     /* preset_name was set to "FocusedPool" at spawn; leave it. */
 }
 
@@ -999,7 +985,7 @@ static void promote_to_pool(double freq_hz, int bw_hz, int sf, int cr,
             cf == freq_hz && cb == bw_hz && csf == sf && ccr == cr &&
             focused_worker_state(w) != FOCUSED_STATE_IDLE) {
             focused_worker_arm_slot_os(w, freq_hz, bw_hz, sf, cr, os, start, hd);
-            focus_pool_stamp_chan_stats(i, freq_hz, bw_hz, sf, cr, now_samples);
+            focus_pool_stamp_chan_stats(i, freq_hz, bw_hz, sf, cr);
             atomic_fetch_add(&g_focus_pool_promote_matched, 1);
             pthread_mutex_unlock(&g_focus_pool_mu);
             return;
@@ -1011,7 +997,7 @@ static void promote_to_pool(double freq_hz, int bw_hz, int sf, int cr,
         if (!w) continue;
         if (focused_worker_state(w) == FOCUSED_STATE_IDLE) {
             focused_worker_arm_slot_os(w, freq_hz, bw_hz, sf, cr, os, start, hd);
-            focus_pool_stamp_chan_stats(i, freq_hz, bw_hz, sf, cr, now_samples);
+            focus_pool_stamp_chan_stats(i, freq_hz, bw_hz, sf, cr);
             uint64_t armed = atomic_fetch_add(&g_focus_pool_promote_assigned, 1) + 1;
             pthread_mutex_unlock(&g_focus_pool_mu);
             /* Throttle stderr noise: log first 5, then every 25th. */
@@ -1044,11 +1030,10 @@ static void on_wideband_preamble_lock(int sf, int cr, int bw_hz,
     intptr_t channel_id = (intptr_t)user;
     if (channel_id < 0 || channel_id >= CHANNELIZER_MAX_CHANNELS) return;
     uint64_t now = __atomic_load_n(&g_samples_total, __ATOMIC_RELAXED);
-    /* TDOA anchor: record where in the SDR-rate stream this wideband
-     * channel's preamble locked. Frame emit reads this back so JSON
-     * carries an integer sample index per packet. */
-    __atomic_store_n(&g_chan_stats[channel_id].preamble_lock_sample_idx,
-                     now, __ATOMIC_RELAXED);
+    /* TDOA anchor lives on lora_frame_meta_t now: lora.c stamps it at
+     * preamble-lock fire from the per-feed stream cursor that
+     * on_channel_baseband / focused_process_chunk set before each
+     * feed. This callback only owns the wake-the-focused-pool side. */
 
     /* Pool mode: any wideband slot promotes, optionally filtered by
      * the freq allowlist and the SNR floor. The SNR gate stops the
@@ -1326,8 +1311,26 @@ static void on_channel_baseband(int channel_id,
 {
     (void)user;
     if (channel_id < 0 || channel_id >= CHANNELIZER_MAX_CHANNELS) return;
-    if (g_demods[channel_id])
+    if (g_demods[channel_id]) {
+        /* TDOA: announce the SDR-rate anchor for this baseband chunk
+         * before feeding. step_per_sample = SDR samples per channelizer
+         * output sample (= samp_rate / bw_hz, the PFB decimation).
+         * chunk_anchor is the SDR sample idx of the FIRST sample whose
+         * channelizer output is in this batch -- approximated as
+         * g_samples_total at callback time minus n*step. The PFB
+         * pipeline depth biases this by a constant offset shared by
+         * all stations with the same configuration; per-frame
+         * race-freeness still holds. */
+        int bw = g_chan_stats[channel_id].bw_hz;
+        if (bw > 0) {
+            uint32_t step  = (uint32_t)((samp_rate / (double)bw) + 0.5);
+            uint64_t now   = __atomic_load_n(&g_samples_total, __ATOMIC_RELAXED);
+            uint64_t span  = (uint64_t)n * (uint64_t)step;
+            uint64_t anchor = (now > span) ? (now - span) : 0;
+            lora_decoder_set_stream_cursor(g_demods[channel_id], anchor, step);
+        }
         lora_decoder_feed(g_demods[channel_id], samples, n);
+    }
 }
 
 static int instantiate_channel(uint64_t f_hz, int bw_hz, int sf, int cr);

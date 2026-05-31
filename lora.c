@@ -544,6 +544,18 @@ struct lora_decoder {
 
     lora_preamble_cb_t preamble_cb;
     void              *preamble_user;
+
+    /* TDOA stream cursor (caller-opaque). Set per feed batch via
+     * lora_decoder_set_stream_cursor. samples_in_chunk counts samples
+     * passed through this feed batch (both skipped-by-sto and accepted
+     * into symbuf). At preamble lock fire, the field
+     *     meta.preamble_lock_sample_idx = stream_chunk_anchor +
+     *         samples_in_chunk * stream_step_per_sample
+     * is stamped on the per-decoder meta struct so the next frame
+     * delivered to the frame callback inherits the lock-time anchor. */
+    uint64_t stream_chunk_anchor;
+    uint32_t stream_step_per_sample;
+    uint32_t samples_in_chunk;
 };
 
 /* ---- Reference chirps ----
@@ -635,6 +647,15 @@ void lora_decoder_set_callback(lora_decoder_t *d, lora_frame_cb_t cb, void *user
 {
     if (!d) return;
     d->cb = cb; d->user = user;
+}
+
+void lora_decoder_set_stream_cursor(lora_decoder_t *d, uint64_t chunk_anchor,
+                                    uint32_t step_per_sample)
+{
+    if (!d) return;
+    d->stream_chunk_anchor    = chunk_anchor;
+    d->stream_step_per_sample = step_per_sample;
+    d->samples_in_chunk       = 0;
 }
 
 void lora_decoder_set_preamble_cb(lora_decoder_t *d, lora_preamble_cb_t cb, void *user)
@@ -1304,6 +1325,16 @@ static void state_tick(lora_decoder_t *d)
                                : 0.0f;
                 if (peak > 0.0f && noise > 0.0f)
                     STATS_SNR(snr_hist_preamble, snr_db);
+                /* TDOA: stash the stream cursor at the moment of lock
+                 * directly on the per-decoder meta so the next frame
+                 * delivered (if any) inherits a race-free per-frame
+                 * anchor. Subsequent locks on the same decoder
+                 * overwrite this only after the current preamble run
+                 * resets via reset_to_idle. */
+                d->meta.preamble_lock_sample_idx =
+                    d->stream_chunk_anchor +
+                    (uint64_t)d->samples_in_chunk *
+                    (uint64_t)d->stream_step_per_sample;
                 /* Fire the preamble-lock callback. Subscribers (the
                  * scan-then-focus pool, scanners, telemetry) get the
                  * event before header decode starts -- the right
@@ -1952,9 +1983,11 @@ void lora_decoder_feed(lora_decoder_t *d, const float complex *samples, size_t n
     for (size_t i = 0; i < n; ++i) {
         if (d->sto_skip_remaining > 0) {
             --d->sto_skip_remaining;
+            ++d->samples_in_chunk;
             continue;
         }
         d->symbuf[d->symbuf_count++] = samples[i];
+        ++d->samples_in_chunk;
         if (d->symbuf_count == spsym) {
             state_tick(d);
             /* Apply SFO drift-corrected symbol boundary shift, set by
