@@ -221,6 +221,18 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
         if (ev->preamble_lock_sample_idx) {
             jw_field_u64(j, "preamble_lock_sample_idx",
                          ev->preamble_lock_sample_idx);
+            /* Sub-sample timing offset, SDR-sample units. Convenience
+             * field for consumers that want
+             *     toa_sample = preamble_lock_sample_idx
+             *                  + preamble_lock_sample_frac
+             * The eventual cross-station IQ correlation produces the
+             * authoritative sub-sample TOA; this field is the initial
+             * fractional lock estimate from the decoder's RCTSL
+             * estimator. */
+            if (ev->preamble_lock_sample_frac != 0.0f) {
+                jw_field_f32(j, "preamble_lock_sample_frac",
+                             ev->preamble_lock_sample_frac);
+            }
         }
         if (ev->sample_rate_sps) {
             jw_field_u64(j, "sample_rate_sps", ev->sample_rate_sps);

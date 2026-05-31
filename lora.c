@@ -1384,6 +1384,26 @@ static void state_tick(lora_decoder_t *d)
              * os_factor=1 (sub-sample shift would need os>=2); the value
              * is stored on the decoder for downstream use. */
             compute_sto_frac(d);
+            /* TDOA: convert the channel-rate sto_frac estimate to
+             * SDR-sample units, in TOA-positive-late convention, and
+             * stamp it on the meta the next delivered frame will
+             * inherit. Read-only metadata; the demod path does not
+             * use this field.
+             *
+             * Sign note: gr-lora_sdr's sto_frac is "shift our window
+             * LATER by sto_frac to catch a preamble that arrived
+             * sto_frac LATE relative to where we sampled." The
+             * existing fine-skip path at lora.c:downsample_symbol
+             * uses that convention directly. For the TOA-style
+             * consumer field we want
+             *     toa_sample = preamble_lock_sample_idx + frac
+             * where frac > 0 means the preamble arrived a fraction
+             * later than the integer cursor. Empirically (FFT-domain
+             * known-delay synth fixture in tests/test_subsample_toa.py)
+             * those two conventions disagree by a sign, so we negate
+             * here at publish time. d->sto_frac itself is untouched. */
+            d->meta.preamble_lock_sample_frac =
+                -d->sto_frac * (float)d->stream_step_per_sample;
             /* k_hat = mode of the captured preamble bins (gr-lora_sdr's
              * `most_frequent(preamb_up_vals, n_up_req)` form, frame_sync_impl.cc:534).
              * The IDLE-entry latch can be off by ±1 due to FFT peak landing

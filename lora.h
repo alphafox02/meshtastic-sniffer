@@ -48,6 +48,20 @@ typedef struct lora_frame_meta {
      * lora_decoder_set_stream_cursor). 0 if the caller never set the
      * cursor (synthetic feeds, selftest). */
     uint64_t preamble_lock_sample_idx;
+    /* TDOA: fractional-sample timing offset of the preamble peak, in
+     * SDR-sample units (same unit as preamble_lock_sample_idx), so a
+     * consumer computes
+     *
+     *     toa_sample = preamble_lock_sample_idx + preamble_lock_sample_frac
+     *
+     * without needing to know the channelizer or focused-worker
+     * decimation. Derived from the RCTSL fractional-STO estimate
+     * (compute_sto_frac), converted to SDR units via the same step
+     * value the caller passed to lora_decoder_set_stream_cursor.
+     * Read-only metadata -- decode behavior is unaffected. Range is
+     * roughly [-step/2, +step/2] SDR samples; 0 on synthetic feeds
+     * that never set a stream cursor. */
+    float    preamble_lock_sample_frac;
 } lora_frame_meta_t;
 
 typedef void (*lora_frame_cb_t)(const uint8_t *payload, size_t payload_len,

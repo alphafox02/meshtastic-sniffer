@@ -784,6 +784,7 @@ typedef struct {
     uint64_t station_t_ns;     /* first-replica realtime ns */
     uint32_t station_t_acc_ns; /* operator-self-reported clock-discipline class */
     uint64_t preamble_lock_sample_idx; /* abs SDR sample idx at lock; 0 if unknown */
+    float    preamble_lock_sample_frac;/* sub-sample frac, SDR-sample units */
 } frame_emit_ctx_t;
 
 static void on_mesh_event(const mesh_event_t *ev, void *user) {
@@ -804,6 +805,7 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
         stamped.station_t_acc_ns = ctx->station_t_acc_ns;
         stamped.preamble_lock_sample_idx = ctx->preamble_lock_sample_idx;
         stamped.sample_rate_sps  = (uint64_t)(samp_rate + 0.5);
+        stamped.preamble_lock_sample_frac = ctx->preamble_lock_sample_frac;
         /* CRC-failed frames have corrupt bytes by definition. AES-CTR is
          * a stream cipher with no integrity check, so the protobuf
          * parser can "succeed" on garbage and produce fictitious
@@ -873,7 +875,8 @@ static void dedup_emit_locked(const dedup_entry_t *e)
         /* Per-frame anchor stamped by lora.c at preamble-lock fire;
          * survives the dedup snapshot, so a later lock on the same
          * channel can't overwrite this frame's cursor. */
-        .preamble_lock_sample_idx = e->best_meta.preamble_lock_sample_idx,
+        .preamble_lock_sample_idx  = e->best_meta.preamble_lock_sample_idx,
+        .preamble_lock_sample_frac = e->best_meta.preamble_lock_sample_frac,
     };
     mesh_packet_decode_with_radio(e->best_payload, e->best_payload_len,
                                   e->best_meta.rssi_db, e->best_meta.snr_db,

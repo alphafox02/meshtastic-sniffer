@@ -84,6 +84,12 @@ typedef struct mesh_event {
      * the source isn't a tuned LoRa decoder. */
     uint64_t       preamble_lock_sample_idx;
     uint64_t       sample_rate_sps;
+    /* Fractional-sample timing offset of the preamble peak, in
+     * SDR-sample units. Combines with preamble_lock_sample_idx:
+     *     toa_sample = preamble_lock_sample_idx + preamble_lock_sample_frac
+     * Read-only metadata; the decoder does not feed this back into
+     * STO/CFO/SFO. 0 when no fractional estimate was available. */
+    float          preamble_lock_sample_frac;
 
     /* Inner Data envelope (when decrypted == true) */
     uint32_t       portnum;
