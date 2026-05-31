@@ -1667,6 +1667,11 @@ static size_t recv_full_request(int fd, char *buf, size_t cap)
 static void *web_thread(void *arg)
 {
     (void)arg;
+#if defined(__APPLE__)
+    pthread_setname_np("web");
+#elif defined(_GNU_SOURCE)
+    pthread_setname_np(pthread_self(), "web");
+#endif
     while (g_thread_running) {
         struct sockaddr_in peer;
         socklen_t peerlen = sizeof(peer);
@@ -1749,7 +1754,6 @@ void web_init(int port)
     if (pthread_create(&g_thread, NULL, web_thread, NULL) != 0) {
         close(g_listen_fd); g_listen_fd = -1; g_thread_running = 0; return;
     }
-    pthread_setname_np(g_thread, "web");
     fprintf(stderr, "web: listening on port %d\n", port);
 }
 
