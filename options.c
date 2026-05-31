@@ -47,6 +47,13 @@ char         *opt_focus_freqs_csv     = NULL;
 double        opt_focus_min_snr_db    = 6.0;
 int           opt_focus_os            = 0;    /* 0 = auto policy */
 
+char         *opt_snapshot_store_dir     = NULL;
+int           opt_snapshot_window_pre_ms = 50;
+int           opt_snapshot_window_post_ms= 100;
+long long     opt_snapshot_disk_mb       = 2048;     /* 2 GiB cap */
+long long     opt_snapshot_age_s         = 86400;    /* 24 h */
+double        opt_snapshot_min_snr_db    = -1.0;     /* <0: inherit focus floor */
+
 char         *opt_region              = NULL;
 char         *opt_preset_csv          = NULL;
 char         *opt_keys_csv            = NULL;
@@ -146,6 +153,16 @@ void options_print_help(const char *prog)
         "                         Wideband decode is unaffected; this only filters which locks\n"
         "                         wake a focused worker. Set 0 to promote on every lock.\n"
         "  --focus-os=N|auto      focused decoder oversampling (default auto; N=1,2,4,8)\n"
+        "  --snapshot-store=DIR   write a bounded raw-IQ window + JSON sidecar to DIR/YYYYMMDD/\n"
+        "                         on every qualifying wideband preamble lock. Off by default.\n"
+        "                         Snapshot writes happen on a separate thread; decode is\n"
+        "                         never blocked by disk. Activating this option auto-enables\n"
+        "                         the iq-ring even when --deep-decode=off.\n"
+        "  --snapshot-window-pre-ms=N    samples before lock to include (default 50)\n"
+        "  --snapshot-window-post-ms=N   samples after  lock to include (default 100)\n"
+        "  --snapshot-store-disk-mb=N    rolling cap on total snapshot bytes (default 2048)\n"
+        "  --snapshot-store-age-s=N      rolling cap on snapshot age in seconds (default 86400)\n"
+        "  --snapshot-min-snr-db=DB      SNR floor; default = --focus-min-snr-db\n"
         "  --diagnostics          enable verbose internal counters (demod stats, focus telemetry, etc.)\n"
         "\n"
         "SDR selection (one):\n"
@@ -343,6 +360,8 @@ int options_parse(int argc, char **argv)
         O_SHOW_UNTRUSTED, O_DIAGNOSTICS,
         O_DEEP_DECODE, O_FOCUS_WORKERS, O_FOCUS_HOLD_S, O_FOCUS_REWIND_MS,
         O_FOCUS_FREQS, O_FOCUS_RING_MS, O_FOCUS_MIN_SNR_DB, O_FOCUS_OS,
+        O_SNAPSHOT_STORE, O_SNAPSHOT_PRE_MS, O_SNAPSHOT_POST_MS,
+        O_SNAPSHOT_DISK_MB, O_SNAPSHOT_AGE_S, O_SNAPSHOT_MIN_SNR_DB,
         O_SIMD_GEN, O_SELFTEST, O_SELFTEST_REJECTION, O_SELFTEST_REJECTION_AMP,
         O_SELFTEST_REJECTION_TWOTONE, O_SELFTEST_REJECTION_OFFBIN,
         O_SELFTEST_REJECTION_PROCGAIN,
@@ -412,6 +431,12 @@ int options_parse(int argc, char **argv)
         { "focus-ring-ms",   required_argument, NULL, O_FOCUS_RING_MS },
         { "focus-min-snr-db", required_argument, NULL, O_FOCUS_MIN_SNR_DB },
         { "focus-os",        required_argument, NULL, O_FOCUS_OS },
+        { "snapshot-store",         required_argument, NULL, O_SNAPSHOT_STORE },
+        { "snapshot-window-pre-ms", required_argument, NULL, O_SNAPSHOT_PRE_MS },
+        { "snapshot-window-post-ms",required_argument, NULL, O_SNAPSHOT_POST_MS },
+        { "snapshot-store-disk-mb", required_argument, NULL, O_SNAPSHOT_DISK_MB },
+        { "snapshot-store-age-s",   required_argument, NULL, O_SNAPSHOT_AGE_S },
+        { "snapshot-min-snr-db",    required_argument, NULL, O_SNAPSHOT_MIN_SNR_DB },
         { "simd-generic", no_argument,     NULL, O_SIMD_GEN },
         { "selftest",   no_argument,       NULL, O_SELFTEST },
         { "selftest-rejection", no_argument, NULL, O_SELFTEST_REJECTION },
@@ -600,6 +625,12 @@ int options_parse(int argc, char **argv)
                 opt_focus_os = n;
             }
             break;
+        case O_SNAPSHOT_STORE:        opt_snapshot_store_dir       = strdup(optarg); break;
+        case O_SNAPSHOT_PRE_MS:       opt_snapshot_window_pre_ms   = atoi(optarg);  break;
+        case O_SNAPSHOT_POST_MS:      opt_snapshot_window_post_ms  = atoi(optarg);  break;
+        case O_SNAPSHOT_DISK_MB:      opt_snapshot_disk_mb         = atoll(optarg); break;
+        case O_SNAPSHOT_AGE_S:        opt_snapshot_age_s           = atoll(optarg); break;
+        case O_SNAPSHOT_MIN_SNR_DB:   opt_snapshot_min_snr_db      = atof(optarg);  break;
 
         case O_SIMD_GEN: opt_force_simd_generic = true; break;
         case O_SELFTEST: return 100;

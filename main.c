@@ -23,6 +23,7 @@
 #include "geofence.h"
 #include "gpsd.h"
 #include "iq_ring.h"
+#include "iq_snapshot.h"
 #include "pcap_out.h"
 #include "psk_dict.h"
 #include "schema.h"
@@ -308,6 +309,44 @@ static void process_sample_buf(sample_buf_t *buf)
         }
     }
     if (g_iq_ring) iq_ring_append(g_iq_ring, buf->samples, buf->num);
+
+    /* Lazy-init the snapshot store the first time samples flow through
+     * the ring. Done here, not in main(), so the writer thread can read
+     * iq_ring_format() from the populated ring. */
+    if (g_iq_ring && opt_snapshot_store_dir && !iq_snapshot_enabled()) {
+        double min_snr = opt_snapshot_min_snr_db >= 0.0
+                         ? opt_snapshot_min_snr_db
+                         : opt_focus_min_snr_db;
+        iq_snapshot_cfg_t scfg = {
+            .dir              = opt_snapshot_store_dir,
+            .window_pre_ms    = opt_snapshot_window_pre_ms,
+            .window_post_ms   = opt_snapshot_window_post_ms,
+            .disk_cap_mb      = opt_snapshot_disk_mb,
+            .age_cap_seconds  = opt_snapshot_age_s,
+            .min_snr_db       = min_snr,
+            .ring             = g_iq_ring,
+            .sample_rate      = samp_rate,
+            .station_id       = opt_station_id,
+            .station_t_acc_ns = (uint32_t)opt_station_t_acc_ns,
+            .queue_capacity   = 64,
+        };
+        const char *qcap = getenv("MESHTASTIC_SNAPSHOT_QUEUE_CAP");
+        if (qcap && *qcap) {
+            int qc = atoi(qcap);
+            if (qc >= 1 && qc <= 4096) scfg.queue_capacity = qc;
+        }
+        if (iq_snapshot_init(&scfg) == 0) {
+            fprintf(stderr,
+                    "snapshot-store: enabled dir=%s pre=%dms post=%dms "
+                    "disk_cap=%lldMB age_cap=%llds min_snr=%.1fdB\n",
+                    opt_snapshot_store_dir,
+                    opt_snapshot_window_pre_ms, opt_snapshot_window_post_ms,
+                    opt_snapshot_disk_mb, opt_snapshot_age_s, min_snr);
+        } else {
+            fprintf(stderr, "snapshot-store: init failed for dir=%s\n",
+                    opt_snapshot_store_dir);
+        }
+    }
 
     /* Lazy-spawn the manual focused worker the first time samples are
      * flowing through the ring. Done here, not in main(), because the
@@ -1034,6 +1073,32 @@ static void on_wideband_preamble_lock(int sf, int cr, int bw_hz,
      * preamble-lock fire from the per-feed stream cursor that
      * on_channel_baseband / focused_process_chunk set before each
      * feed. This callback only owns the wake-the-focused-pool side. */
+
+    /* Snapshot store: enqueue a raw-IQ capture request. Decoupled from
+     * the focused-pool path so a station can run snapshots with or
+     * without focused workers. The enqueue is O(1) and never blocks
+     * on disk; queue overflow drops the snapshot and bumps a counter. */
+    if (iq_snapshot_enabled()) {
+        uint64_t chan_freq = g_chan_stats[channel_id].freq_hz;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        iq_snapshot_event_t sev = {
+            .lock_sample_idx = now,
+            .lock_t_ns       = (uint64_t)ts.tv_sec * 1000000000ULL +
+                               (uint64_t)ts.tv_nsec,
+            .snr_db_at_lock  = (double)snr_db,
+            .sf              = sf,
+            .cr              = cr,
+            .bw_hz           = bw_hz,
+            .freq_hz         = chan_freq,
+        };
+        const char *pn = g_chan_stats[channel_id].preset_name;
+        if (pn && *pn) {
+            strncpy(sev.preset_name, pn, sizeof(sev.preset_name) - 1);
+            sev.preset_name[sizeof(sev.preset_name) - 1] = 0;
+        }
+        iq_snapshot_enqueue(&sev);
+    }
 
     /* Pool mode: any wideband slot promotes, optionally filtered by
      * the freq allowlist and the SNR floor. The SNR gate stops the
@@ -3246,6 +3311,44 @@ static int run_live(void)
         }
     }
 
+    /* Snapshot-store env overrides (parity with the other focused-pool envs).
+     * MESHTASTIC_SNAPSHOT_STORE      -- directory; takes effect if no CLI flag.
+     * MESHTASTIC_SNAPSHOT_QUEUE_CAP  -- hidden; overrides the writer queue
+     *                                   capacity (default 64). Exposed so
+     *                                   the queue-overflow drop path is
+     *                                   testable from a stress fixture
+     *                                   without rebuilding. */
+    {
+        const char *e = getenv("MESHTASTIC_SNAPSHOT_STORE");
+        if (e && *e && !opt_snapshot_store_dir) {
+            opt_snapshot_store_dir = strdup(e);
+        }
+    }
+    /* If --snapshot-store is enabled, force the iq-ring on even when
+     * --deep-decode=off: the snapshot writer reads from the ring, not
+     * from a focused worker, so we don't need the pool to be running.
+     * Size the ring to comfortably hold the requested window plus
+     * head-room for writer scheduling jitter (factor 2x the window,
+     * minimum 500 ms). Without this, a configured window equal to or
+     * larger than the ring history budget causes every pre-window
+     * sample to age out before the writer extracts -- counted as
+     * missed_ring_window and visible at shutdown. */
+    if (opt_snapshot_store_dir) {
+        long window_ms = (long)opt_snapshot_window_pre_ms +
+                         (long)opt_snapshot_window_post_ms;
+        long needed_ms = window_ms * 2;
+        if (needed_ms < 500) needed_ms = 500;
+        if (needed_ms > 10000) needed_ms = 10000;
+        if ((long)g_iq_ring_ms < needed_ms) {
+            size_t prev = g_iq_ring_ms;
+            g_iq_ring_ms = (size_t)needed_ms;
+            fprintf(stderr,
+                    "snapshot-store: enabled; iq-ring sized to %zu ms "
+                    "(was %zu ms; window=%ldms; 2x window + head-room).\n",
+                    g_iq_ring_ms, prev, window_ms);
+        }
+    }
+
     /* Optional manual focused-decoder driven by the ring.
      * Activated via:
      *   MESHTASTIC_FOCUS_MANUAL=freq_hz:bw_hz:sf:cr[:start_sample]
@@ -3407,6 +3510,18 @@ static int run_live(void)
             fprintf(stderr,
                     "[coverage] deep-decode: off (wideband only). "
                     "Pass --deep-decode=auto to wake focused workers.\n");
+        }
+        if (opt_snapshot_store_dir) {
+            double min_snr = opt_snapshot_min_snr_db >= 0.0
+                             ? opt_snapshot_min_snr_db
+                             : opt_focus_min_snr_db;
+            fprintf(stderr,
+                    "[coverage] snapshot-store: dir=%s window=%dms+%dms "
+                    "disk_cap=%lldMB age_cap=%llds min_snr=%.1fdB\n",
+                    opt_snapshot_store_dir,
+                    opt_snapshot_window_pre_ms,
+                    opt_snapshot_window_post_ms,
+                    opt_snapshot_disk_mb, opt_snapshot_age_s, min_snr);
         }
         fprintf(stderr,
                 "[output] %s%s%s\n",
@@ -3587,6 +3702,27 @@ static int run_live(void)
                 (unsigned long long)oldest,
                 (unsigned long long)newest,
                 g_iq_ring_capacity_samples);
+        /* Stop snapshot writer before destroying the ring it reads from.
+         * Shutdown drains any items still in the queue, so the counter
+         * snapshot AFTER shutdown reflects the final post-drain state
+         * (rather than the pre-drain state that misses last-batch
+         * writes on short fixtures). */
+        if (iq_snapshot_enabled()) {
+            iq_snapshot_shutdown();
+            iq_snapshot_counters_t sc;
+            iq_snapshot_get_counters(&sc);
+            fprintf(stderr,
+                    "snapshot-store: enqueued=%llu kept=%llu pruned=%llu "
+                    "dropped_queue_full=%llu dropped_below_snr=%llu "
+                    "wait_timeout=%llu missed_ring=%llu\n",
+                    (unsigned long long)sc.enqueued_total,
+                    (unsigned long long)sc.kept,
+                    (unsigned long long)sc.pruned,
+                    (unsigned long long)sc.dropped_queue_full,
+                    (unsigned long long)sc.dropped_below_snr,
+                    (unsigned long long)sc.wait_timeout,
+                    (unsigned long long)sc.missed_ring_window);
+        }
         iq_ring_destroy(g_iq_ring);
         g_iq_ring = NULL;
     }

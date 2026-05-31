@@ -108,6 +108,7 @@ set(SOURCES
     ${PROJECT_SOURCE_DIR}/vita49.c
     ${PROJECT_SOURCE_DIR}/channelizer.c
     ${PROJECT_SOURCE_DIR}/iq_ring.c
+    ${PROJECT_SOURCE_DIR}/iq_snapshot.c
     ${PROJECT_SOURCE_DIR}/focused.c
     ${PROJECT_SOURCE_DIR}/pfb.c
     ${PROJECT_SOURCE_DIR}/lora.c

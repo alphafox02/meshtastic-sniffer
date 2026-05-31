@@ -82,6 +82,16 @@ extern char         *opt_focus_freqs_csv;     /* optional allowlist Hz,Hz,... */
 extern double        opt_focus_min_snr_db;    /* drop pool promotions below this SNR */
 extern int           opt_focus_os;            /* 0=auto, otherwise 1/2/4/8 */
 
+/* TDOA snapshot-store: per-event raw-IQ capture from the iq_ring.
+ * Disabled when opt_snapshot_store_dir is NULL. min_snr_db < 0 means
+ * "inherit from opt_focus_min_snr_db at startup". */
+extern char         *opt_snapshot_store_dir;
+extern int           opt_snapshot_window_pre_ms;
+extern int           opt_snapshot_window_post_ms;
+extern long long     opt_snapshot_disk_mb;
+extern long long     opt_snapshot_age_s;
+extern double        opt_snapshot_min_snr_db;
+
 /* Meshtastic */
 extern char         *opt_region;          /* "US", "EU_868", ... */
 extern char         *opt_preset_csv;      /* "LongFast,LongSlow" or "all" */
