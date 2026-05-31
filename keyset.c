@@ -84,6 +84,22 @@ static uint8_t xor_bytes(const uint8_t *p, size_t n)
     return h;
 }
 
+/* Meshtastic simpleN: one-byte PSK (e.g. base64 "Pg==") expands the stock
+ * 16-byte default key with the last byte replaced. Matches firmware + web import. */
+static int keyset_add_psk(keyset_t *k, const char *channel_name,
+                          const uint8_t *psk, int psk_len)
+{
+    if (psk_len == 1) {
+        uint8_t expanded[16];
+        memcpy(expanded, MESH_DEFAULT_PSK, 16);
+        expanded[15] = psk[0];
+        return keyset_add(k, channel_name, expanded, 16);
+    }
+    if (psk_len == 0 || psk_len == 16 || psk_len == 32)
+        return keyset_add(k, channel_name, psk_len ? psk : NULL, (size_t)psk_len);
+    return -1;
+}
+
 /* ---- API ---- */
 
 keyset_t *keyset_create(void)
@@ -249,7 +265,7 @@ int keyset_parse_spec(keyset_t *k, const char *spec)
         if (psk_len <= 0) return -1;
     }
 
-    return keyset_add(k, eq ? name : NULL, psk, (size_t)psk_len);
+    return keyset_add_psk(k, eq ? name : NULL, psk, psk_len);
 }
 
 int keyset_parse_csv(keyset_t *k, const char *csv)
