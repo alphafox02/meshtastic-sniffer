@@ -56,7 +56,8 @@ type TimestampClass uint8
 
 const (
 	TimestampSample       TimestampClass = iota // sample-derived TOA (best; tdoa-sample-epoch branch)
-	TimestampSoftwareLock                       // CLOCK_REALTIME at preamble-detect
+	TimestampSync                               // software_lock + converged clock-sync correction
+	TimestampSoftwareLock                       // CLOCK_REALTIME at preamble-detect, no network correction
 	TimestampFrame                              // CLOCK_REALTIME at frame-emit / dedup (worst)
 )
 
@@ -64,6 +65,8 @@ func (c TimestampClass) String() string {
 	switch c {
 	case TimestampSample:
 		return "sample"
+	case TimestampSync:
+		return "sync"
 	case TimestampSoftwareLock:
 		return "software_lock"
 	case TimestampFrame:
@@ -100,6 +103,12 @@ type MlatResult struct {
 	TimestampClasses  map[TimestampClass]int // count of obs by timestamp source
 	WorstTimestampCls TimestampClass         // weakest class consumed; uncertainty floor
 	Degraded          bool                   // true when a mix of classes was used
+	// Clock-sync diagnostics, populated by the fusion event loop after
+	// solver returns. Surfaced on the GEOLOCATED JSON for operator UI.
+	ClockSyncPairCount    int     // converged pairs touching contributing stations
+	ClockSyncResidualNs   float64 // max MAD across contributing pairs
+	ClockSyncAnchorCount  int     // distinct anchors that contributed to the converged pairs
+	ClockSyncReference    string  // station chosen as the network time reference (or "")
 }
 
 // Solve runs hyperbolic-TDOA multilateration. Requires at least 3

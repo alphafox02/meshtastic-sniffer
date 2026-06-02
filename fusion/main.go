@@ -183,6 +183,21 @@ func main() {
 		"Bearer token required for /events and /api/* (Authorization: Bearer <T>, or ?token=<T> on EventSource). Empty = no auth.")
 	stateDB := flag.String("state-db", "",
 		"Path to bbolt file for SSE replay-ring persistence (e.g. ~/.config/meshtastic-fusion/state.db). Empty = memory-only; ring is lost on restart.")
+	calibrationCfg := flag.String("calibration-config", "",
+		"Path to anchor registry JSON ([{from_id, lat, lon, alt_m, accuracy_ns}, ...]) for clock-sync calibration. Anchor traffic feeds the clock-sync graph; arbitrary traffic does not. Empty = clock-sync disabled.")
+	calibrationFlag := stringSlice{}
+	flag.Var(&calibrationFlag, "calibration-node",
+		"Anchor declaration as from_id:lat=X:lon=Y[:alt=A][:accuracy_ns=N]. Repeatable. Composes with --calibration-config.")
+	clockSyncOn := flag.String("clock-sync", "auto",
+		"Clock-sync mode: on | off | auto (default: enabled iff any anchor declared)")
+	clockSyncMinN := flag.Int("clock-sync-min-n", 10,
+		"Min anchor observations before a pair is labeled converged.")
+	clockSyncMaxMADNs := flag.Float64("clock-sync-max-mad-ns", 5000.0,
+		"Max MAD residual (ns) for a pair to be labeled converged.")
+	clockSyncMaxAgeS := flag.Float64("clock-sync-max-age-s", 600.0,
+		"Expire pair samples older than this; converged pair becomes stale.")
+	clockSyncMaxRSSI := flag.Float64("clock-sync-max-rssi-dbm", -20.0,
+		"RSSI sanity gate: reject anchor observations stronger than this (near-field/saturation).")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr,
 			"Usage: %s [flags] tcp://host1:7008 tcp://host2:7008 ...\n\n"+
@@ -201,6 +216,38 @@ func main() {
 	if len(endpoints) == 0 && *sensorsFile == "" && *c2Router == "" && *listen == "" {
 		flag.Usage()
 		os.Exit(2)
+	}
+
+	// Build the clock-sync state. Anchor traffic feeds the pair-offset
+	// graph; everything else is consumed for solving only. See
+	// docs/clock-sync.md for the operator-facing details.
+	csCfg := DefaultClockSyncConfig()
+	csCfg.MinAnchorEvents = *clockSyncMinN
+	csCfg.MaxMADNs = *clockSyncMaxMADNs
+	csCfg.MaxAgeS = *clockSyncMaxAgeS
+	csCfg.MaxRSSIdBm = *clockSyncMaxRSSI
+	globalClockSync = NewClockSync(csCfg)
+	if err := loadAnchorConfig(*calibrationCfg, calibrationFlag, globalClockSync); err != nil {
+		log.Fatalf("calibration: %v", err)
+	}
+	csStats := globalClockSync.Snapshot()
+	switch *clockSyncOn {
+	case "off":
+		globalClockSync = nil
+		log.Printf("clock-sync: disabled (--clock-sync=off)")
+	case "on":
+		if csStats.AnchorsDeclared == 0 {
+			log.Printf("clock-sync: enabled but NO anchors declared; pair offsets will never converge")
+		} else {
+			log.Printf("clock-sync: enabled with %d anchor(s)", csStats.AnchorsDeclared)
+		}
+	default: // "auto"
+		if csStats.AnchorsDeclared == 0 {
+			globalClockSync = nil
+			log.Printf("clock-sync: auto disabled (no anchors declared)")
+		} else {
+			log.Printf("clock-sync: auto enabled with %d anchor(s)", csStats.AnchorsDeclared)
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -247,6 +294,25 @@ func main() {
 
 	dealerHub := NewDealerHub(ctx, *c2Router, hub)
 	registry.SetDealerHub(dealerHub)
+
+	// Anchor-placement sanity check: warn (don't refuse) when any
+	// declared anchor is closer than MinDistanceM to a registered
+	// sniffer station's coords. Near-field / front-end saturation
+	// will bias clock-sync samples even though the math itself
+	// works. Co-located anchors (Type=AnchorColocated) are
+	// intentionally close to one station and exempt from this check.
+	if globalClockSync != nil {
+		var stations []stationCoord
+		for _, s := range registry.List() {
+			if s.Lat == 0 && s.Lon == 0 {
+				continue
+			}
+			stations = append(stations, stationCoord{Name: s.Name, Lat: s.Lat, Lon: s.Lon})
+		}
+		for _, w := range globalClockSync.CheckAnchorPlacement(stations) {
+			log.Printf("WARN clock-sync: %s", w)
+		}
+	}
 
 	if *listen != "" {
 		go func() {
@@ -302,15 +368,25 @@ loop:
 			ready := flushReady(pending, *window, now)
 			for _, c := range ready {
 				printCluster(c, registry.pool.EndpointCount())
+				/* Feed clock-sync with anchor-cluster pair offsets BEFORE
+				 * solving any non-anchor cluster. Clock-sync silently
+				 * skips clusters whose from-id is not in the registry. */
+				if globalClockSync != nil {
+					globalClockSync.FeedCluster(c)
+				}
 				if hub != nil {
 					if b, err := txEventJSON(c, registry.pool.EndpointCount()); err == nil {
 						hub.Publish(b)
 					}
 					/* Multilateration: when 3+ observations carry station
 					 * positions and timestamps, run the solver and publish
-					 * a GEOLOCATED event alongside the TX consolidation. */
-					if g := tryGeolocate(c); g != nil {
-						hub.Publish(g)
+					 * a GEOLOCATED event alongside the TX consolidation.
+					 * Anchor traffic is calibration data, not a target --
+					 * suppress GEOLOCATED for declared anchors. */
+					if globalClockSync == nil || !globalClockSync.IsAnchor(c.Frame.From) {
+						if g := tryGeolocate(c); g != nil {
+							hub.Publish(g)
+						}
 					}
 				}
 				consolidated++
@@ -337,6 +413,13 @@ loop:
 // there's nothing to publish (insufficient data, solver failure).
 func tryGeolocate(c *Cluster) []byte {
 	usable := make([]MlatObservation, 0, len(c.Observations))
+	// If clock-sync is active and at least one pair touching this
+	// cluster has converged, apply the median pair offset to shift
+	// per-station timestamps onto a common network reference clock.
+	var refStation string
+	if globalClockSync != nil {
+		refStation = globalClockSync.PickReferenceStation()
+	}
 	for _, o := range c.Observations {
 		if o.StationTNs == 0 || o.StationLat == 0 || o.StationLon == 0 {
 			continue
@@ -347,11 +430,17 @@ func tryGeolocate(c *Cluster) []byte {
 		if o.StationTAccNs > 100_000_000 {
 			continue
 		}
+		// Apply clock-sync correction when available; the returned
+		// class drives the MlatResult's per-observation labeling.
+		lockTNs := o.PreambleLockTNs
+		if globalClockSync != nil && refStation != "" {
+			lockTNs, _ = globalClockSync.CorrectAndClassify(o, refStation)
+		}
 		usable = append(usable, MlatObservation{
 			StationName: o.Station, Lat: o.StationLat, Lon: o.StationLon,
 			AltM:    o.StationAltM,
 			TNs:     o.StationTNs,
-			LockTNs: o.PreambleLockTNs,
+			LockTNs: lockTNs,
 			TAccNs:  o.StationTAccNs,
 		})
 	}
@@ -362,32 +451,193 @@ func tryGeolocate(c *Cluster) []byte {
 	if err != nil {
 		return nil
 	}
+	// Tag the result with the dominant class observed across all
+	// usable observations, and surface clock-sync diagnostics if any
+	// pairs were converged.
+	if globalClockSync != nil && refStation != "" {
+		pairCount, maxMAD := 0, 0.0
+		anchorIDs := map[string]struct{}{}
+		for i, o := range c.Observations {
+			if i == 0 {
+				continue
+			}
+			if o.StationTNs == 0 || o.StationLat == 0 || o.StationLon == 0 {
+				continue
+			}
+			_, cls := globalClockSync.CorrectAndClassify(o, refStation)
+			if cls != TimestampSync {
+				continue
+			}
+			if snap := globalClockSync.PairSnapshotByStations(refStation, o.Station); snap != nil {
+				pairCount++
+				if snap.MadNs > maxMAD {
+					maxMAD = snap.MadNs
+				}
+			}
+		}
+		// Tally anchors that contributed to any converged pair touching this cluster's stations.
+		globalClockSync.mu.RLock()
+		for _, po := range globalClockSync.pairs {
+			if po.Status != ClockSyncConverged {
+				continue
+			}
+			for id := range po.AnchorIDs {
+				anchorIDs[id] = struct{}{}
+			}
+		}
+		globalClockSync.mu.RUnlock()
+		res.ClockSyncPairCount = pairCount
+		res.ClockSyncResidualNs = maxMAD
+		res.ClockSyncAnchorCount = len(anchorIDs)
+		res.ClockSyncReference = refStation
+		if pairCount > 0 && res.WorstTimestampCls > TimestampSync {
+			// Some observation downgraded; class stays "mixed"
+			res.Degraded = true
+		}
+	}
 	out := struct {
-		Event           string  `json:"event"`
-		From            string  `json:"from"`
-		PacketID        uint32  `json:"packet_id"`
-		Lat             float64 `json:"lat"`
-		Lon             float64 `json:"lon"`
-		UncertaintyM    float64 `json:"uncertainty_m"`
-		StationCount    int     `json:"station_count"`
-		Iterations      int     `json:"iterations"`
-		TimestampClass  string  `json:"timestamp_class"`            /* weakest class consumed */
-		Degraded        bool    `json:"timestamp_class_degraded,omitempty"` /* mixed classes */
+		Event                string  `json:"event"`
+		From                 string  `json:"from"`
+		PacketID             uint32  `json:"packet_id"`
+		Lat                  float64 `json:"lat"`
+		Lon                  float64 `json:"lon"`
+		UncertaintyM         float64 `json:"uncertainty_m"`
+		StationCount         int     `json:"station_count"`
+		Iterations           int     `json:"iterations"`
+		TimestampClass       string  `json:"timestamp_class"`
+		Degraded             bool    `json:"timestamp_class_degraded,omitempty"`
+		ClockSyncPairCount   int     `json:"clock_sync_pair_count,omitempty"`
+		ClockSyncResidualNs  float64 `json:"clock_sync_residual_ns,omitempty"`
+		ClockSyncAnchorCount int     `json:"clock_sync_anchor_count,omitempty"`
+		ClockSyncReference   string  `json:"clock_sync_reference,omitempty"`
 	}{
-		Event:          "GEOLOCATED",
-		From:           c.Frame.From,
-		PacketID:       c.Frame.PacketID,
-		Lat:            res.Lat,
-		Lon:            res.Lon,
-		UncertaintyM:   res.UncertaintyM,
-		StationCount:   res.StationCount,
-		Iterations:     res.Iterations,
-		TimestampClass: res.WorstTimestampCls.String(),
-		Degraded:       res.Degraded,
+		Event:                "GEOLOCATED",
+		From:                 c.Frame.From,
+		PacketID:             c.Frame.PacketID,
+		Lat:                  res.Lat,
+		Lon:                  res.Lon,
+		UncertaintyM:         res.UncertaintyM,
+		StationCount:         res.StationCount,
+		Iterations:           res.Iterations,
+		TimestampClass:       res.WorstTimestampCls.String(),
+		Degraded:             res.Degraded,
+		ClockSyncPairCount:   res.ClockSyncPairCount,
+		ClockSyncResidualNs:  res.ClockSyncResidualNs,
+		ClockSyncAnchorCount: res.ClockSyncAnchorCount,
+		ClockSyncReference:   res.ClockSyncReference,
 	}
 	b, err := json.Marshal(out)
 	if err != nil {
 		return nil
 	}
 	return b
+}
+
+// globalClockSync is the per-process clock-sync state. nil when
+// clock-sync is disabled at startup (no anchors declared and
+// --clock-sync=auto, or --clock-sync=off explicitly).
+var globalClockSync *ClockSync
+
+// stringSlice is a flag.Var-compatible repeatable string flag.
+type stringSlice []string
+
+func (s *stringSlice) String() string         { return strings.Join(*s, ",") }
+func (s *stringSlice) Set(v string) error     { *s = append(*s, v); return nil }
+
+// loadAnchorConfig populates the clock-sync anchor registry from the
+// optional config file path AND any --calibration-node CLI entries.
+// CLI entries use the form "from_id:lat=X:lon=Y[:alt=A][:accuracy_ns=N]";
+// the config file is a JSON array of AnchorNode-shaped records.
+func loadAnchorConfig(path string, cliEntries []string, cs *ClockSync) error {
+	if path != "" {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+		var anchors []AnchorNode
+		if err := json.Unmarshal(raw, &anchors); err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+		for _, a := range anchors {
+			if a.NodeID == "" {
+				return fmt.Errorf("anchor in %s missing node_id", path)
+			}
+			if err := cs.AddAnchor(a); err != nil {
+				return fmt.Errorf("anchor %s: %w", a.NodeID, err)
+			}
+		}
+	}
+	for _, raw := range cliEntries {
+		a, err := parseAnchorCLI(raw)
+		if err != nil {
+			return fmt.Errorf("--calibration-node %q: %w", raw, err)
+		}
+		if err := cs.AddAnchor(a); err != nil {
+			return fmt.Errorf("anchor %s: %w", a.NodeID, err)
+		}
+	}
+	return nil
+}
+
+// parseAnchorCLI parses "from_id:lat=X:lon=Y[:alt=A][:accuracy_ns=N]".
+// Returns an AnchorNode of Type=AnchorDeclared. Order of key=val pairs
+// after the from_id is free.
+func parseAnchorCLI(s string) (AnchorNode, error) {
+	parts := strings.Split(s, ":")
+	if len(parts) < 3 {
+		return AnchorNode{}, fmt.Errorf("expected from_id:lat=X:lon=Y[:...]")
+	}
+	a := AnchorNode{NodeID: parts[0], Type: AnchorDeclared}
+	sawLat, sawLon := false, false
+	for _, kv := range parts[1:] {
+		eq := strings.IndexByte(kv, '=')
+		if eq <= 0 {
+			return AnchorNode{}, fmt.Errorf("bad k=v: %q", kv)
+		}
+		k, v := kv[:eq], kv[eq+1:]
+		switch k {
+		case "lat":
+			f, err := parseFloatTrim(v)
+			if err != nil {
+				return AnchorNode{}, fmt.Errorf("lat: %w", err)
+			}
+			a.Lat = f
+			sawLat = true
+		case "lon":
+			f, err := parseFloatTrim(v)
+			if err != nil {
+				return AnchorNode{}, fmt.Errorf("lon: %w", err)
+			}
+			a.Lon = f
+			sawLon = true
+		case "alt", "alt_m":
+			f, err := parseFloatTrim(v)
+			if err != nil {
+				return AnchorNode{}, fmt.Errorf("alt: %w", err)
+			}
+			a.AltM = f
+		case "accuracy_ns":
+			f, err := parseFloatTrim(v)
+			if err != nil {
+				return AnchorNode{}, fmt.Errorf("accuracy_ns: %w", err)
+			}
+			a.AccuracyNs = f
+		default:
+			return AnchorNode{}, fmt.Errorf("unknown key: %q", k)
+		}
+	}
+	if !sawLat || !sawLon {
+		return AnchorNode{}, fmt.Errorf("lat= and lon= are required")
+	}
+	return a, nil
+}
+
+func parseFloatTrim(v string) (float64, error) {
+	v = strings.TrimSpace(v)
+	var f float64
+	_, err := fmt.Sscanf(v, "%g", &f)
+	if err != nil {
+		return 0, fmt.Errorf("not a number: %q", v)
+	}
+	return f, nil
 }
