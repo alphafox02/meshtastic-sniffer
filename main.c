@@ -3864,6 +3864,15 @@ int main(int argc, char **argv)
 #ifdef HAVE_UHD
         fprintf(stdout, "[usrp]\n");    usrp_backend_list();
 #endif
+        /* Vendor SDR libraries (notably SDRplay's API) register atexit
+         * handlers that emit munmap/free warnings on process exit
+         * when they were Open'd but no physical device was found. The
+         * messages fire AFTER main returns, so we silence stderr at
+         * the last moment to keep --list output clean. Flush stdout
+         * first so the actual device list is committed before the
+         * descriptor closes. */
+        fflush(stdout);
+        fclose(stderr);
         return 0;
     }
 

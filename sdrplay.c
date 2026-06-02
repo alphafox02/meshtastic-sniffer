@@ -138,11 +138,31 @@ static void event_callback(sdrplay_api_EventT eventId,
     }
 }
 
+/* The SDRplay vendor library installs atexit handlers that emit
+ * munmap/free errors when the sdrplay_apiService daemon isn't
+ * running. Probe via pidof before calling sdrplay_api_Open() so
+ * --list on hosts without SDRplay installed doesn't pollute stderr
+ * at process exit. Caller skips the Open path when this returns 0. */
+static int sdrplay_daemon_running(void)
+{
+    /* pidof exit code 0 = at least one matching process. We don't
+     * care about stdout/stderr; redirect both. */
+    return system("pidof -x sdrplay_apiService >/dev/null 2>&1") == 0;
+}
+
 /* ---- Device enumeration ---- */
 void sdrplay_list(void)
 {
     sdrplay_api_ErrT err;
     float ver = 0.0f;
+
+    if (!sdrplay_daemon_running()) {
+        /* Stay silent inside the [sdrplay] section so the --list output
+         * is clean. The vendor library's broken atexit would otherwise
+         * fire munmap/free warnings even though we never reach a real
+         * device. */
+        return;
+    }
 
     err = sdrplay_api_Open();
     if (err != sdrplay_api_Success) {
@@ -207,6 +227,12 @@ void *sdrplay_setup(const char *serial)
 {
     sdrplay_api_ErrT err;
     float ver = 0.0f;
+
+    if (!sdrplay_daemon_running()) {
+        errx(1, "sdrplay: sdrplay_apiService daemon is not running. "
+                "Start it (typically: sudo systemctl start sdrplay) "
+                "and try again.");
+    }
 
     sdrplay_ctx_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) errx(1, "sdrplay: out of memory");

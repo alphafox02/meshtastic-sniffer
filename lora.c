@@ -1842,7 +1842,12 @@ static void state_tick(lora_decoder_t *d)
                 else { bytes[byte_count++] = (uint8_t)((nib << 4) | pending_lo); pending_lo = -1; }
             }
             for (int blk = 0; blk + cr_p <= d->payload_sym_count; blk += cr_p) {
-                uint8_t cw_hard[16];
+                /* Zero-init silences a GCC may-be-uninitialized warning:
+                 * cw_hard is written by lora_deinterleave() inside the
+                 * d->soft_decoding==false branch and read by
+                 * lora_hamming_decode() inside the same branch. The
+                 * conditions match but the compiler can't prove it. */
+                uint8_t cw_hard[16] = {0};
                 float   cw_soft[16][8];
                 if (d->soft_decoding) {
                     lora_deinterleave_soft(
