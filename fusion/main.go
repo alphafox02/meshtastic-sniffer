@@ -433,15 +433,17 @@ func tryGeolocate(c *Cluster) []byte {
 		// Apply clock-sync correction when available; the returned
 		// class drives the MlatResult's per-observation labeling.
 		lockTNs := o.PreambleLockTNs
+		precClass := TimestampSample // zero value = "infer" for the solver
 		if globalClockSync != nil && refStation != "" {
-			lockTNs, _ = globalClockSync.CorrectAndClassify(o, refStation)
+			lockTNs, precClass = globalClockSync.CorrectAndClassify(o, refStation)
 		}
 		usable = append(usable, MlatObservation{
 			StationName: o.Station, Lat: o.StationLat, Lon: o.StationLon,
-			AltM:    o.StationAltM,
-			TNs:     o.StationTNs,
-			LockTNs: lockTNs,
-			TAccNs:  o.StationTAccNs,
+			AltM:             o.StationAltM,
+			TNs:              o.StationTNs,
+			LockTNs:          lockTNs,
+			TAccNs:           o.StationTAccNs,
+			PrecomputedClass: precClass,
 		})
 	}
 	if len(usable) < 3 {
@@ -457,11 +459,16 @@ func tryGeolocate(c *Cluster) []byte {
 	if globalClockSync != nil && refStation != "" {
 		pairCount, maxMAD := 0, 0.0
 		anchorIDs := map[string]struct{}{}
-		for i, o := range c.Observations {
-			if i == 0 {
+		// Count each (non-reference) station whose pair to refStation
+		// is converged. The reference itself counts as part of every
+		// converged pair touching it, so it doesn't get a "pair" entry
+		// on its own row. Cluster.Observations ordering is not aligned
+		// with refStation; iterate all and skip refStation explicitly.
+		for _, o := range c.Observations {
+			if o.StationTNs == 0 || o.StationLat == 0 || o.StationLon == 0 {
 				continue
 			}
-			if o.StationTNs == 0 || o.StationLat == 0 || o.StationLon == 0 {
+			if o.Station == refStation {
 				continue
 			}
 			_, cls := globalClockSync.CorrectAndClassify(o, refStation)
@@ -506,10 +513,15 @@ func tryGeolocate(c *Cluster) []byte {
 		Iterations           int     `json:"iterations"`
 		TimestampClass       string  `json:"timestamp_class"`
 		Degraded             bool    `json:"timestamp_class_degraded,omitempty"`
-		ClockSyncPairCount   int     `json:"clock_sync_pair_count,omitempty"`
-		ClockSyncResidualNs  float64 `json:"clock_sync_residual_ns,omitempty"`
-		ClockSyncAnchorCount int     `json:"clock_sync_anchor_count,omitempty"`
-		ClockSyncReference   string  `json:"clock_sync_reference,omitempty"`
+		// Clock-sync diagnostics: always emit (no omitempty) when the
+		// solve happened, so dashboard consumers don't have to guess
+		// "field missing == 0?". A solve without clock-sync emits
+		// zeros across the board, which is a distinct state from
+		// "fields not present at all" in older sniffer-only feeds.
+		ClockSyncPairCount   int     `json:"clock_sync_pair_count"`
+		ClockSyncResidualNs  float64 `json:"clock_sync_residual_ns"`
+		ClockSyncAnchorCount int     `json:"clock_sync_anchor_count"`
+		ClockSyncReference   string  `json:"clock_sync_reference"`
 	}{
 		Event:                "GEOLOCATED",
 		From:                 c.Frame.From,

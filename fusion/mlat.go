@@ -83,11 +83,28 @@ type MlatObservation struct {
 	TNs          uint64 // station_t_ns: frame-emit timestamp (worst tier)
 	LockTNs      uint64 // preamble_lock_t_ns: preamble-detect timestamp (better)
 	TAccNs       uint32 // station_t_acc_ns (clock-discipline class)
+	// PrecomputedClass is the timestamp class the caller has already
+	// resolved for this observation (e.g. via ClockSync.CorrectAndClassify).
+	// When set to TimestampSample (the zero value) the solver falls back
+	// to inferring the class from LockTNs/TNs presence -- preserves the
+	// pre-clock-sync code paths that don't set this field. Set
+	// explicitly to TimestampSync when clock-sync has corrected LockTNs
+	// onto a converged network reference.
+	PrecomputedClass TimestampClass
 }
 
 // resolveTNs picks the best available timestamp from an observation
-// and returns the value plus its class. Higher-precision sources win.
+// and returns the value plus its class. When PrecomputedClass is set
+// (non-zero -- note that TimestampSample is the zero value and means
+// "infer"), it wins. Otherwise we fall back to inferring from
+// LockTNs/TNs presence: software_lock > frame.
 func (o MlatObservation) resolveTNs() (uint64, TimestampClass) {
+	if o.PrecomputedClass != TimestampSample {
+		if o.LockTNs != 0 {
+			return o.LockTNs, o.PrecomputedClass
+		}
+		return o.TNs, o.PrecomputedClass
+	}
 	if o.LockTNs != 0 {
 		return o.LockTNs, TimestampSoftwareLock
 	}

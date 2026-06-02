@@ -50,11 +50,18 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"math"
+	"os"
 	"sort"
 	"sync"
 	"time"
 )
+
+// debugOn is set when MESHTASTIC_CLOCK_SYNC_DEBUG is non-empty.
+// Logs every anchor-cluster FeedCluster call and the resulting pair
+// state so tests can diagnose convergence failures.
+var debugOn = os.Getenv("MESHTASTIC_CLOCK_SYNC_DEBUG") != ""
 
 // AnchorType labels how the anchor's coordinates were obtained.
 // Currently all v1 anchors are operator-declared; future sources
@@ -370,6 +377,12 @@ func (cs *ClockSync) FeedCluster(c *Cluster) {
 		}
 	}
 	cs.stats.PairsConverged = conv
+	if debugOn {
+		for _, po := range cs.pairs {
+			log.Printf("clock-sync DBG: anchor=%s pair=%s|%s n=%d median=%.1fns mad=%.1fns status=%s",
+				c.Frame.From, po.A, po.B, len(po.Samples), po.MedianNs, po.MadNs, po.Status)
+		}
+	}
 }
 
 // recomputeMedianMAD updates the pair's robust statistics from
@@ -451,7 +464,7 @@ func (cs *ClockSync) CorrectAndClassify(obs Observation, refStation string) (uin
 	defer cs.mu.RUnlock()
 	key := PairKey(obs.Station, refStation)
 	po, ok := cs.pairs[key]
-	if !ok || po.Status != ClockSyncConverged {
+	if !ok || pairStatusNow(po, cs.config) != ClockSyncConverged {
 		return obs.PreambleLockTNs, TimestampSoftwareLock
 	}
 	// Shift this observation's time onto the reference station's clock.
@@ -475,22 +488,47 @@ func (cs *ClockSync) stationHasConvergedPair(station string) bool {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	for _, po := range cs.pairs {
-		if (po.A == station || po.B == station) && po.Status == ClockSyncConverged {
+		if (po.A == station || po.B == station) && pairStatusNow(po, cs.config) == ClockSyncConverged {
 			return true
 		}
 	}
 	return false
 }
 
+// pairStatusNow returns the pair's current status taking aging into
+// account. updateStatus() only runs inside FeedCluster (when an anchor
+// cluster arrives); if no anchor traffic has arrived for a while,
+// po.Status may still be ClockSyncConverged in memory even though
+// every sample has aged out. Anyone reading the status to decide a
+// solve's timestamp class needs the now-evaluated result, not the
+// last-write-time snapshot.
+func pairStatusNow(po *PairOffset, cfg ClockSyncConfig) ClockSyncStatus {
+	if po.AnchorEvents == 0 {
+		return ClockSyncNone
+	}
+	if len(po.Samples) < cfg.MinAnchorEvents {
+		return ClockSyncWarming
+	}
+	if po.MadNs > cfg.MaxMADNs {
+		return ClockSyncRejected
+	}
+	cutoff := time.Now().Add(-time.Duration(cfg.MaxAgeS * float64(time.Second)))
+	if po.LastUpdate.Before(cutoff) {
+		return ClockSyncStale
+	}
+	return ClockSyncConverged
+}
+
 // PickReferenceStation returns the lexicographically smallest station
 // name that participates in at least one converged pair. Returns ""
-// when no pair has converged.
+// when no pair has converged. Uses pairStatusNow() so a pair whose
+// samples have aged out doesn't get picked as a stale reference.
 func (cs *ClockSync) PickReferenceStation() string {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	var ref string
 	for _, po := range cs.pairs {
-		if po.Status != ClockSyncConverged {
+		if pairStatusNow(po, cs.config) != ClockSyncConverged {
 			continue
 		}
 		for _, name := range []string{po.A, po.B} {
