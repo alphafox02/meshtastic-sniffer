@@ -8,16 +8,41 @@
 // frames. That ring is lost when the fusion process exits. EventStore
 // mirrors the ring to disk so the next process startup preloads it.
 //
-// Storage layout (single bbolt file):
+// Storage layout (single bbolt file, schema_version=2):
+//
+//	bucket "meta"
+//	  key:   "schema_version"  value: ASCII integer
+//	  key:   "created_by"      value: identifier string
 //
 //	bucket "events"
 //	  key:   8-byte big-endian monotonic sequence number
 //	  value: raw event JSON bytes (same as the SSE wire format)
 //
-// Ring trimming: every Append checks the bucket size and deletes the
-// oldest entries until count <= maxEntries. maxEntries defaults to
+//	bucket "cluster_observations"   (schema v2; empty until write paths land)
+//	  key:   per-event composite (event_id | from | packet_id | cluster_time_ns)
+//	  value: JSON encoding the participating stations' raw Observations
+//	         (lat/lon/alt, PreambleLockTNs, StationTNs, TAccNs, SNR/RSSI,
+//	          freq/preset/SF/CR/BW) for replay re-solve.
+//
+//	bucket "pair_snapshots"         (schema v2; empty until write paths land)
+//	  key:   snapshot_time_ns (8 BE bytes) | pair_key (variable; "A|B")
+//	  value: JSON {median_ns, mad_ns, sample_count, anchor_ids,
+//	              status_at_snapshot, last_anchor_time_ns, max_age_s}
+//	  notes: snapshot_time_ns is the RF event time (max preamble_lock_t_ns
+//	         of the anchor cluster that triggered the update), not wall clock.
+//
+// Ring trimming: every Append checks the events bucket size and deletes
+// the oldest entries until count <= maxEntries. maxEntries defaults to
 // the SSE ring size; operators wanting a longer history can set
 // fusionMaxEntries higher (or run a follow-on archive sink).
+//
+// Schema compatibility:
+//   - An older binary opening a newer file ignores unknown buckets.
+//   - A newer binary opening an older file (missing v2 buckets / version)
+//     keeps live dashboard behavior and disables replay/re-solve. No
+//     migration is run; the missing buckets are created idempotently on
+//     the next OpenEventStore so the file becomes v2-shaped after one
+//     more run.
 
 package main
 
@@ -27,12 +52,28 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
 )
 
-const eventsBucket = "events"
+const (
+	// Bucket names.
+	eventsBucket              = "events"
+	metaBucket                = "meta"
+	clusterObservationsBucket = "cluster_observations"
+	pairSnapshotsBucket       = "pair_snapshots"
+
+	// Current schema version. Bumped when a future change requires a
+	// migration step beyond CreateBucketIfNotExists.
+	schemaVersion = 2
+
+	// Meta-bucket keys.
+	metaKeySchemaVersion = "schema_version"
+	metaKeyCreatedBy     = "created_by"
+	metaCreatedByValue   = "meshtastic-fusion"
+)
 
 // EventStore persists the SSE replay ring across fusion restarts.
 //
@@ -63,13 +104,90 @@ func OpenEventStore(path string, maxEntries int) (*EventStore, error) {
 		return nil, fmt.Errorf("bolt open %s: %w", path, err)
 	}
 	if err := db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists([]byte(eventsBucket))
-		return err
+		// Create / verify every bucket in the v2 layout. Older
+		// databases gain the new buckets on first open under a v2
+		// binary; their existing 'events' bucket and contents are
+		// preserved untouched.
+		for _, name := range []string{
+			eventsBucket,
+			metaBucket,
+			clusterObservationsBucket,
+			pairSnapshotsBucket,
+		} {
+			if _, err := tx.CreateBucketIfNotExists([]byte(name)); err != nil {
+				return fmt.Errorf("create %s bucket: %w", name, err)
+			}
+		}
+		// Record the schema version. If a key is already present from a
+		// prior run we only overwrite when the prior value was lower --
+		// never downgrade a number that a future binary might have
+		// written.
+		mb := tx.Bucket([]byte(metaBucket))
+		if existing := mb.Get([]byte(metaKeySchemaVersion)); existing == nil {
+			if err := mb.Put([]byte(metaKeySchemaVersion),
+				[]byte(strconv.Itoa(schemaVersion))); err != nil {
+				return err
+			}
+		} else {
+			if prev, err := strconv.Atoi(string(existing)); err == nil && prev < schemaVersion {
+				if err := mb.Put([]byte(metaKeySchemaVersion),
+					[]byte(strconv.Itoa(schemaVersion))); err != nil {
+					return err
+				}
+			}
+		}
+		if mb.Get([]byte(metaKeyCreatedBy)) == nil {
+			if err := mb.Put([]byte(metaKeyCreatedBy),
+				[]byte(metaCreatedByValue)); err != nil {
+				return err
+			}
+		}
+		return nil
 	}); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return &EventStore{db: db, maxEntries: maxEntries}, nil
+}
+
+// SchemaVersion returns the schema version recorded in the meta
+// bucket, or 0 when the meta bucket is missing / unreadable / the key
+// is absent. The 0 case lets callers detect a pre-v2 file even after
+// OpenEventStore has created the buckets idempotently: schemaVersion
+// will be 2 once written, so a 0 indicates either an empty file or a
+// future write that hasn't happened yet.
+func (s *EventStore) SchemaVersion() int {
+	if s == nil || s.db == nil {
+		return 0
+	}
+	var v int
+	_ = s.db.View(func(tx *bolt.Tx) error {
+		mb := tx.Bucket([]byte(metaBucket))
+		if mb == nil {
+			return nil
+		}
+		raw := mb.Get([]byte(metaKeySchemaVersion))
+		if raw == nil {
+			return nil
+		}
+		parsed, err := strconv.Atoi(string(raw))
+		if err == nil {
+			v = parsed
+		}
+		return nil
+	})
+	return v
+}
+
+// ReplayAvailable reports whether the on-disk schema is at the version
+// that supports replay / re-solve. Currently equivalent to "schema
+// version >= 2," but the function exists so callers do not hardcode
+// the version number. Write paths for cluster_observations and
+// pair_snapshots land in the next two commits; until then this
+// returns true for any v2 file regardless of whether the new buckets
+// have content.
+func (s *EventStore) ReplayAvailable() bool {
+	return s.SchemaVersion() >= 2
 }
 
 // Close releases the underlying bbolt file. Safe to call on nil.

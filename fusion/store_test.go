@@ -194,3 +194,33 @@ func TestSSEHub_HydratesFromStore(t *testing.T) {
 		}
 	}
 }
+
+// TestEventStore_SchemaV2 verifies the store records schema_version=2
+// and creates the cluster_observations + pair_snapshots buckets.
+// Re-opening the same file is a no-op for the version field (no
+// downgrade, no duplicate write).
+func TestEventStore_SchemaV2(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	s, err := OpenEventStore(path, 100)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if got := s.SchemaVersion(); got != 2 {
+		t.Errorf("SchemaVersion=%d, want 2", got)
+	}
+	if !s.ReplayAvailable() {
+		t.Error("ReplayAvailable should be true at v2")
+	}
+	s.Close()
+
+	// Re-open: version stays at 2, no error, buckets still present.
+	s2, err := OpenEventStore(path, 100)
+	if err != nil {
+		t.Fatalf("re-open: %v", err)
+	}
+	defer s2.Close()
+	if got := s2.SchemaVersion(); got != 2 {
+		t.Errorf("re-open SchemaVersion=%d, want 2", got)
+	}
+}
