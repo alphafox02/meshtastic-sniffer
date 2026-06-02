@@ -428,9 +428,19 @@ loop:
 				}
 				/* Feed clock-sync with anchor-cluster pair offsets BEFORE
 				 * solving any non-anchor cluster. Clock-sync silently
-				 * skips clusters whose from-id is not in the registry. */
+				 * skips clusters whose from-id is not in the registry.
+				 * Returned snapshots persist the per-pair state at
+				 * the RF event time of this anchor cluster, so replay
+				 * can later answer "what offsets were valid here?" */
 				if globalClockSync != nil {
-					globalClockSync.FeedCluster(c)
+					snapshots := globalClockSync.FeedCluster(c)
+					if store != nil {
+						for i := range snapshots {
+							if err := store.WritePairSnapshot(&snapshots[i]); err != nil {
+								log.Printf("pair_snapshots: %v", err)
+							}
+						}
+					}
 				}
 				if hub != nil {
 					if b, err := txEventJSON(c, registry.pool.EndpointCount()); err == nil {

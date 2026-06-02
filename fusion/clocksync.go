@@ -279,21 +279,26 @@ func distMeters(anchorLat, anchorLon, stationLat, stationLon float64) float64 {
 // only consumes operator-anchored traffic. The caller is responsible
 // for filtering on cluster.Frame.From; this method does the lookup
 // itself for clarity.
-func (cs *ClockSync) FeedCluster(c *Cluster) {
+func (cs *ClockSync) FeedCluster(c *Cluster) []PairSnapshotRecord {
 	if c == nil || len(c.Observations) < 2 {
-		return
+		return nil
 	}
 	cs.mu.RLock()
 	anchor, ok := cs.anchors[c.Frame.From]
 	cfg := cs.config
 	cs.mu.RUnlock()
 	if !ok {
-		return
+		return nil
 	}
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	cs.stats.ObservationsFed += len(c.Observations)
 	usable := make([]Observation, 0, len(c.Observations))
+	// snapshotTimeNs: RF event time anchor of THIS anchor cluster, used
+	// as the snapshot_time_ns of every pair_snapshot row this call
+	// produces. Max preamble_lock_t_ns across usable obs -- mirrors
+	// the cluster_observations key encoding for consistency.
+	var snapshotTimeNs uint64
 	for _, o := range c.Observations {
 		// Must have a precise per-frame lock timestamp to be useful.
 		if o.PreambleLockTNs == 0 {
@@ -305,12 +310,16 @@ func (cs *ClockSync) FeedCluster(c *Cluster) {
 			cs.stats.ObservationsRSSIGated++
 			continue
 		}
+		if o.PreambleLockTNs > snapshotTimeNs {
+			snapshotTimeNs = o.PreambleLockTNs
+		}
 		usable = append(usable, o)
 	}
 	if len(usable) < 2 {
-		return
+		return nil
 	}
 	now := time.Now()
+	touched := map[string]struct{}{} // pair keys mutated by this anchor cluster
 	for i := 0; i < len(usable); i++ {
 		for j := i + 1; j < len(usable); j++ {
 			A := usable[i]
@@ -367,6 +376,7 @@ func (cs *ClockSync) FeedCluster(c *Cluster) {
 			}
 			po.recomputeMedianMAD()
 			po.updateStatus(cfg)
+			touched[key] = struct{}{}
 		}
 	}
 	cs.stats.PairsKnown = len(cs.pairs)
@@ -383,6 +393,41 @@ func (cs *ClockSync) FeedCluster(c *Cluster) {
 				c.Frame.From, po.A, po.B, len(po.Samples), po.MedianNs, po.MadNs, po.Status)
 		}
 	}
+	// Build pair_snapshot records for replay persistence. Snapshot time
+	// is the RF event time of THIS anchor cluster -- the same instant
+	// the offsets reflect, not wall-clock. Caller (main.go) hands
+	// these to the EventStore in the same flush-loop iteration.
+	if snapshotTimeNs == 0 {
+		return nil
+	}
+	out := make([]PairSnapshotRecord, 0, len(touched))
+	for key := range touched {
+		po := cs.pairs[key]
+		if po == nil {
+			continue
+		}
+		anchorIDs := make([]string, 0, len(po.AnchorIDs))
+		for id := range po.AnchorIDs {
+			anchorIDs = append(anchorIDs, id)
+		}
+		sort.Strings(anchorIDs)
+		lastAnchorNs := uint64(0)
+		if !po.LastUpdate.IsZero() {
+			lastAnchorNs = uint64(po.LastUpdate.UnixNano())
+		}
+		out = append(out, PairSnapshotRecord{
+			PairKey:          key,
+			SnapshotTimeNs:   snapshotTimeNs,
+			LastAnchorTimeNs: lastAnchorNs,
+			MedianNs:         po.MedianNs,
+			MadNs:            po.MadNs,
+			SampleCount:      len(po.Samples),
+			AnchorIDs:        anchorIDs,
+			StatusAtSnapshot: pairStatusNow(po, cfg).String(),
+			MaxAgeS:          cfg.MaxAgeS,
+		})
+	}
+	return out
 }
 
 // recomputeMedianMAD updates the pair's robust statistics from

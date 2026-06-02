@@ -323,3 +323,152 @@ func TestClusterObservation_NilStore(t *testing.T) {
 		t.Errorf("nil store count: got %d, %v; want 0, nil", n, err)
 	}
 }
+
+// TestPairSnapshot_RoundTrip writes a sequence of pair snapshots and
+// reads them back via both the range-scan and the latest-at-or-before
+// lookups.
+func TestPairSnapshot_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	s, err := OpenEventStore(path, 100)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	mk := func(tsNs uint64, pair string, median float64) *PairSnapshotRecord {
+		return &PairSnapshotRecord{
+			PairKey:          pair,
+			SnapshotTimeNs:   tsNs,
+			LastAnchorTimeNs: tsNs,
+			MedianNs:         median,
+			MadNs:            12.3,
+			SampleCount:      10,
+			AnchorIDs:        []string{"!anchor1"},
+			StatusAtSnapshot: "converged",
+			MaxAgeS:          600.0,
+		}
+	}
+	rows := []*PairSnapshotRecord{
+		mk(1_700_000_000_000_000_000, "alpha|bravo", 50_000),
+		mk(1_700_000_001_000_000_000, "alpha|bravo", 50_100),
+		mk(1_700_000_002_000_000_000, "alpha|bravo", 50_200),
+		mk(1_700_000_001_000_000_000, "alpha|delta", -30_000),
+	}
+	for _, r := range rows {
+		if err := s.WritePairSnapshot(r); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if n, _ := s.CountPairSnapshots(); n != 4 {
+		t.Fatalf("CountPairSnapshots=%d, want 4", n)
+	}
+
+	// Range scan picks up everything in the window.
+	got, err := s.ReadPairSnapshotsRange(0, ^uint64(0))
+	if err != nil {
+		t.Fatalf("range: %v", err)
+	}
+	if len(got) != 4 {
+		t.Errorf("range len=%d, want 4", len(got))
+	}
+
+	// LatestAtOrBefore for "alpha|bravo" at t=1.5s should be the t=1.0s row.
+	rec, ok, err := s.LatestPairSnapshotAtOrBefore(1_700_000_001_500_000_000, "alpha|bravo")
+	if err != nil || !ok {
+		t.Fatalf("lookup: err=%v ok=%v", err, ok)
+	}
+	if rec.SnapshotTimeNs != 1_700_000_001_000_000_000 || rec.MedianNs != 50_100 {
+		t.Errorf("got rec %+v, want the 50_100 row at t=1s", rec)
+	}
+
+	// LatestAtOrBefore for "alpha|delta" at t=10s -> the only delta row.
+	rec, ok, err = s.LatestPairSnapshotAtOrBefore(1_700_000_010_000_000_000, "alpha|delta")
+	if err != nil || !ok {
+		t.Fatalf("delta lookup: err=%v ok=%v", err, ok)
+	}
+	if rec.PairKey != "alpha|delta" || rec.MedianNs != -30_000 {
+		t.Errorf("got rec %+v, want alpha|delta median=-30000", rec)
+	}
+
+	// LatestAtOrBefore well before any sample returns ok=false.
+	_, ok, err = s.LatestPairSnapshotAtOrBefore(1_699_999_999_000_000_000, "alpha|bravo")
+	if err != nil {
+		t.Fatalf("pre-window: %v", err)
+	}
+	if ok {
+		t.Errorf("ok=true for query before any sample")
+	}
+
+	// LatestAtOrBefore for a pair that never had a snapshot returns ok=false.
+	_, ok, err = s.LatestPairSnapshotAtOrBefore(^uint64(0)>>1, "alpha|echo")
+	if err != nil {
+		t.Fatalf("unknown pair: %v", err)
+	}
+	if ok {
+		t.Errorf("ok=true for unknown pair")
+	}
+}
+
+// TestPairSnapshot_NilStore covers the no-state-DB path.
+func TestPairSnapshot_NilStore(t *testing.T) {
+	var s *EventStore
+	if err := s.WritePairSnapshot(&PairSnapshotRecord{PairKey: "x|y"}); err != nil {
+		t.Errorf("nil write: %v", err)
+	}
+	rec, ok, err := s.LatestPairSnapshotAtOrBefore(123, "x|y")
+	if err != nil || ok || rec != nil {
+		t.Errorf("nil lookup: rec=%v ok=%v err=%v", rec, ok, err)
+	}
+	rows, err := s.ReadPairSnapshotsRange(0, 1)
+	if err != nil || len(rows) != 0 {
+		t.Errorf("nil range: rows=%v err=%v", rows, err)
+	}
+	if n, err := s.CountPairSnapshots(); n != 0 || err != nil {
+		t.Errorf("nil count: %d %v", n, err)
+	}
+}
+
+// TestPairSnapshot_FeedClusterEmits ensures FeedCluster returns one
+// PairSnapshotRecord per touched pair when an anchor cluster lands.
+func TestPairSnapshot_FeedClusterEmits(t *testing.T) {
+	sc := newScene(t, 0)
+	c := sc.mkAnchorCluster(1, 1_700_000_000_000_000_000, map[string]float64{
+		"alpha": 0, "bravo": 50_000, "delta": -30_000,
+	})
+	got := sc.cs.FeedCluster(c)
+	// 3 stations -> 3 unique pairs touched.
+	if len(got) != 3 {
+		t.Fatalf("FeedCluster returned %d records, want 3", len(got))
+	}
+	seen := map[string]bool{}
+	for _, r := range got {
+		seen[r.PairKey] = true
+		// snapshot_time_ns must be the max PreambleLockTNs in the cluster.
+		// We injected base+propagation; verify it's >= base.
+		if r.SnapshotTimeNs < 1_700_000_000_000_000_000 {
+			t.Errorf("snapshot_time_ns=%d, want >= base txTime", r.SnapshotTimeNs)
+		}
+		// anchor_ids should contain the anchor we declared.
+		if len(r.AnchorIDs) != 1 || r.AnchorIDs[0] != sc.anchor.NodeID {
+			t.Errorf("anchor_ids=%v, want [%s]", r.AnchorIDs, sc.anchor.NodeID)
+		}
+	}
+	for _, want := range []string{"alpha|bravo", "alpha|delta", "bravo|delta"} {
+		if !seen[want] {
+			t.Errorf("missing pair %s in FeedCluster output", want)
+		}
+	}
+	// Non-anchor cluster returns no snapshots.
+	spoof := &Cluster{Frame: Frame{From: "!notanchor", PacketID: 99}}
+	for _, st := range sc.stations {
+		spoof.Observations = append(spoof.Observations, Observation{
+			Station: st.Name, StationLat: st.Lat, StationLon: st.Lon,
+			PreambleLockTNs: 1_700_000_000_500_000_000,
+			RssiDB:          -90.0,
+		})
+	}
+	if got := sc.cs.FeedCluster(spoof); len(got) != 0 {
+		t.Errorf("non-anchor cluster returned %d records, want 0", len(got))
+	}
+}

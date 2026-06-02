@@ -427,3 +427,166 @@ func (s *EventStore) CountClusterObservations() (int, error) {
 	})
 	return n, err
 }
+
+// ---- pair_snapshots: persisted clock-pair offsets for replay ----
+//
+// Every anchor FeedCluster() that updates pair state emits one row per
+// touched pair. The key sorts by RF event time so replay can find the
+// pair-offset model that was valid at any given moment ("what was the
+// (alpha, bravo) offset when packet 7e5dd49a arrived?") with one
+// cursor seek.
+
+// PairSnapshotRecord is the on-disk shape of one pair-offset row. Each
+// field comes straight from PairOffset / pairStatusNow at the moment
+// the anchor cluster was processed.
+type PairSnapshotRecord struct {
+	PairKey            string   `json:"pair_key"`             // "A|B" lex-sorted
+	SnapshotTimeNs     uint64   `json:"snapshot_time_ns"`     // RF event time of the triggering anchor cluster
+	LastAnchorTimeNs   uint64   `json:"last_anchor_time_ns"`  // max RF time across samples currently in the ring
+	MedianNs           float64  `json:"median_ns"`            // robust per-pair offset estimate
+	MadNs              float64  `json:"mad_ns"`               // residual; converged when <= MaxMADNs
+	SampleCount        int      `json:"sample_count"`         // size of the in-memory ring at snapshot time
+	AnchorIDs          []string `json:"anchor_ids"`           // distinct from-ids that contributed
+	StatusAtSnapshot   string   `json:"status_at_snapshot"`   // warming | converged | stale | rejected | none
+	MaxAgeS            float64  `json:"max_age_s"`            // policy at snapshot time; replay reuses it
+}
+
+// pairSnapshotKey: 8 BE bytes of snapshot_time_ns then "|<pair_key>".
+// Same shape as clusterObsKey -- time-first for sortable scans.
+func pairSnapshotKey(snapshotTimeNs uint64, pairKey string) []byte {
+	out := make([]byte, 0, 8+1+len(pairKey))
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], snapshotTimeNs)
+	out = append(out, ts[:]...)
+	out = append(out, '|')
+	out = append(out, []byte(pairKey)...)
+	return out
+}
+
+// WritePairSnapshot persists one PairSnapshotRecord. No-op on nil
+// EventStore or nil record so the live publish path stays unaffected
+// when running without --state-db.
+func (s *EventStore) WritePairSnapshot(rec *PairSnapshotRecord) error {
+	if s == nil || s.db == nil || rec == nil {
+		return nil
+	}
+	payload, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("marshal pair snapshot: %w", err)
+	}
+	key := pairSnapshotKey(rec.SnapshotTimeNs, rec.PairKey)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(pairSnapshotsBucket))
+		if b == nil {
+			return errors.New("pair_snapshots bucket missing")
+		}
+		return b.Put(key, payload)
+	})
+}
+
+// ReadPairSnapshotsRange returns every snapshot whose SnapshotTimeNs
+// falls in [startNs, endNs]. Used by the future timeline UI to render
+// a "clock health over time" graph for one or more pairs.
+func (s *EventStore) ReadPairSnapshotsRange(startNs, endNs uint64) ([]PairSnapshotRecord, error) {
+	if s == nil || s.db == nil || endNs < startNs {
+		return nil, nil
+	}
+	var out []PairSnapshotRecord
+	var startKey [8]byte
+	binary.BigEndian.PutUint64(startKey[:], startNs)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(pairSnapshotsBucket))
+		if b == nil {
+			return nil
+		}
+		c := b.Cursor()
+		for k, v := c.Seek(startKey[:]); k != nil; k, v = c.Next() {
+			if len(k) < 8 {
+				continue
+			}
+			ts := binary.BigEndian.Uint64(k[:8])
+			if ts > endNs {
+				break
+			}
+			var rec PairSnapshotRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return fmt.Errorf("unmarshal pair snapshot at ts=%d: %w", ts, err)
+			}
+			out = append(out, rec)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// LatestPairSnapshotAtOrBefore returns the newest snapshot for the
+// given pair whose SnapshotTimeNs is <= eventTimeNs. This is the
+// canonical replay lookup: "what was this pair's offset when the
+// target packet arrived?" Returns (nil, false) when no snapshot
+// exists (pair was never seen by this fusion process, or the file
+// was rotated past the row).
+//
+// The walk goes newest-to-oldest -- the very first matching pair_key
+// is the answer, so most queries finish in O(snapshots-per-pair-since-T).
+func (s *EventStore) LatestPairSnapshotAtOrBefore(eventTimeNs uint64, pairKey string) (*PairSnapshotRecord, bool, error) {
+	if s == nil || s.db == nil {
+		return nil, false, nil
+	}
+	var out *PairSnapshotRecord
+	var found bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(pairSnapshotsBucket))
+		if b == nil {
+			return nil
+		}
+		c := b.Cursor()
+		// Seek to one past the event timestamp; Prev() then lands on
+		// the latest key <= eventTime.
+		var seek [9]byte
+		binary.BigEndian.PutUint64(seek[:8], eventTimeNs)
+		seek[8] = 0xFF // place sentinel between same-ts rows
+		c.Seek(seek[:])
+		for k, v := c.Prev(); k != nil; k, v = c.Prev() {
+			if len(k) < 8 {
+				continue
+			}
+			ts := binary.BigEndian.Uint64(k[:8])
+			if ts > eventTimeNs {
+				continue
+			}
+			// Key suffix after the leading 8 BE bytes + '|' is the pair_key.
+			if len(k) < 9 || k[8] != '|' {
+				continue
+			}
+			if string(k[9:]) != pairKey {
+				continue
+			}
+			var rec PairSnapshotRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return fmt.Errorf("unmarshal pair snapshot at ts=%d: %w", ts, err)
+			}
+			out = &rec
+			found = true
+			return nil
+		}
+		return nil
+	})
+	return out, found, err
+}
+
+// CountPairSnapshots returns the on-disk row count for the bucket.
+func (s *EventStore) CountPairSnapshots() (int, error) {
+	if s == nil || s.db == nil {
+		return 0, nil
+	}
+	var n int
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(pairSnapshotsBucket))
+		if b == nil {
+			return nil
+		}
+		n = b.Stats().KeyN
+		return nil
+	})
+	return n, err
+}
