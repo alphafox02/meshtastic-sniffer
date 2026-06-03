@@ -6,7 +6,7 @@ FFT-domain delays, runs the sniffer over each variant, and asserts that
 the reported preamble_lock_sample_frac tracks the injected offset
 within tolerance.
 
-Required acceptance per Codex section 54:
+Required acceptance:
 - synthetic known fractional timing fixture: reported sign and
   magnitude match expected value within tolerance
 - SFO=0 fixture: frac near zero OR a stable constant bias explained

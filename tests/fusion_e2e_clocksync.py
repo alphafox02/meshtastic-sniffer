@@ -8,7 +8,7 @@ sockets, and verifies the full event-flow path:
     pair convergence -> target solve -> GEOLOCATED event with
     timestamp_class=sync + diagnostic fields
 
-Per Codex section 64 the harness must cover 10 assertions; each runs
+The harness covers the clock-sync acceptance assertions. Each case runs
 in its own subprocess-isolated test case so failures are scoped.
 
 Usage:
@@ -432,7 +432,7 @@ def case_dashboard_contract():
             timeout_s=4.0,
         )
         _check(geo is not None, "expected GEOLOCATED")
-        # Fields the timeline needs (Codex section 61):
+        # Fields the timeline needs:
         wanted = ["from", "packet_id", "lat", "lon", "uncertainty_m",
                   "station_count", "timestamp_class",
                   "clock_sync_pair_count", "clock_sync_residual_ns",

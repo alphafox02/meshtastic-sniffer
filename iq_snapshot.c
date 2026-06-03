@@ -320,7 +320,7 @@ static void writer_handle_event(const iq_snapshot_event_t *ev)
     snprintf(iq_path,   sizeof(iq_path),   "%s.%s",   base, g.ext);
     snprintf(json_path, sizeof(json_path), "%s.json", base);
 
-    /* Atomic write: tmp + rename. No fsync by default per Codex. */
+    /* Atomic write: tmp + rename. No fsync by default. */
     char iq_tmp[IQ_PATH_MAX];
     snprintf(iq_tmp, sizeof(iq_tmp), "%s.tmp", iq_path);
     FILE *iqf = fopen(iq_tmp, "wb");
