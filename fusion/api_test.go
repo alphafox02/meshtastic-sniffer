@@ -19,8 +19,13 @@ import (
 
 // newAPIHandler builds the same wrapped /api/* mux that startWebServer
 // installs, plus an open / handler. Lets tests hit the real mux
-// without spinning up a TCP listener.
+// without spinning up a TCP listener. `store` may be nil for tests
+// that don't care about evidence endpoints.
 func newAPIHandler(t *testing.T, registry *Registry, hub *SSEHub, apiToken string) http.Handler {
+	return newAPIHandlerWithStore(t, registry, hub, nil, apiToken)
+}
+
+func newAPIHandlerWithStore(t *testing.T, registry *Registry, hub *SSEHub, store *EventStore, apiToken string) http.Handler {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -85,6 +90,12 @@ func newAPIHandler(t *testing.T, registry *Registry, hub *SSEHub, apiToken strin
 			"warnings": warnings,
 		})
 	})
+	// Evidence endpoints mirror the real server. store may be nil; the
+	// handlers degrade to persisted=false + empty record lists.
+	apiMux.HandleFunc("/api/evidence/clusters", evidenceClustersHandler(store))
+	apiMux.HandleFunc("/api/evidence/pairs", evidencePairsHandler(store))
+	apiMux.HandleFunc("/api/evidence/fixes", evidenceFixesHandler(store))
+	apiMux.HandleFunc("/api/evidence/summary", evidenceSummaryHandler(store))
 	wrapped := authWrap(apiMux, apiToken)
 	mux.Handle("/api/", wrapped)
 	mux.Handle("/events", wrapped)
@@ -345,5 +356,197 @@ func TestAPI_ClockSyncWarnings_MethodNotAllowed(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status=%d want 405", w.Code)
+	}
+}
+
+// openTestStore opens a fresh bbolt store in t.TempDir; t.Cleanup
+// closes it. Used by the Evidence-endpoint tests so each test owns its
+// own DB file and round-trips real records through the handlers.
+func openTestStore(t *testing.T) *EventStore {
+	t.Helper()
+	path := t.TempDir() + "/state.db"
+	s, err := OpenEventStore(path, 100)
+	if err != nil {
+		t.Fatalf("OpenEventStore: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// TestAPI_Evidence_Summary_NilStore exercises the no-state-db case:
+// every count is zero, persisted=false, schema_version=0.
+func TestAPI_Evidence_Summary_NilStore(t *testing.T) {
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithStore(t, r, nil, nil, "")
+	req := httptest.NewRequest(http.MethodGet, "/api/evidence/summary", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200", w.Code)
+	}
+	var got struct {
+		Persisted       bool           `json:"persisted"`
+		SchemaVersion   int            `json:"schema_version"`
+		ReplayAvailable bool           `json:"replay_available"`
+		Counts          map[string]int `json:"counts"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if got.Persisted {
+		t.Errorf("persisted=true with nil store")
+	}
+	if got.SchemaVersion != 0 || got.ReplayAvailable {
+		t.Errorf("nil store should report schema_version=0 / replay_available=false; got %+v", got)
+	}
+	for k, v := range got.Counts {
+		if v != 0 {
+			t.Errorf("count[%s]=%d, want 0", k, v)
+		}
+	}
+}
+
+// TestAPI_Evidence_Summary_Populated writes one of each record type and
+// confirms the summary counts pick them up.
+func TestAPI_Evidence_Summary_Populated(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.WriteClusterObservation(&ClusterObservationRecord{
+		From: "!a", PacketID: 1, ClusterTimeNs: 100,
+	}); err != nil {
+		t.Fatalf("write cluster: %v", err)
+	}
+	if err := s.WritePairSnapshot(&PairSnapshotRecord{
+		PairKey: "a|b", SnapshotTimeNs: 100,
+	}); err != nil {
+		t.Fatalf("write pair: %v", err)
+	}
+	if err := s.WriteSolvedFix(&SolvedFixRecord{
+		From: "!a", PacketID: 1, EventTimeNs: 100,
+	}); err != nil {
+		t.Fatalf("write fix: %v", err)
+	}
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithStore(t, r, nil, s, "")
+	req := httptest.NewRequest(http.MethodGet, "/api/evidence/summary", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200", w.Code)
+	}
+	var got struct {
+		Persisted       bool           `json:"persisted"`
+		SchemaVersion   int            `json:"schema_version"`
+		ReplayAvailable bool           `json:"replay_available"`
+		Counts          map[string]int `json:"counts"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if !got.Persisted || got.SchemaVersion < 3 || !got.ReplayAvailable {
+		t.Errorf("populated store: persisted=%v schema=%d replay=%v",
+			got.Persisted, got.SchemaVersion, got.ReplayAvailable)
+	}
+	for _, k := range []string{"cluster_observations", "pair_snapshots", "solved_fixes"} {
+		if got.Counts[k] != 1 {
+			t.Errorf("counts[%s]=%d, want 1", k, got.Counts[k])
+		}
+	}
+}
+
+// TestAPI_Evidence_Clusters_RoundTrip writes three cluster records at
+// known times and verifies the range query bounds.
+func TestAPI_Evidence_Clusters_RoundTrip(t *testing.T) {
+	s := openTestStore(t)
+	for i, ts := range []uint64{1_000_000_000, 2_000_000_000, 3_000_000_000} {
+		if err := s.WriteClusterObservation(&ClusterObservationRecord{
+			From: "!a", PacketID: uint32(i), ClusterTimeNs: ts,
+		}); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithStore(t, r, nil, s, "")
+
+	// Default range = last hour, ending now. All three fall in the past
+	// (the timestamps above are in 1970-1971); they should NOT appear.
+	req := httptest.NewRequest(http.MethodGet, "/api/evidence/clusters", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("default range status=%d want 200", w.Code)
+	}
+	var def struct {
+		Persisted bool                       `json:"persisted"`
+		Count     int                        `json:"count"`
+		Records   []ClusterObservationRecord `json:"records"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&def)
+	if !def.Persisted {
+		t.Errorf("persisted=false; want true (store provided)")
+	}
+	if def.Count != 0 {
+		t.Errorf("default range got %d records; want 0 (timestamps in 1970)", def.Count)
+	}
+
+	// Explicit range that brackets the second record only.
+	req = httptest.NewRequest(http.MethodGet,
+		"/api/evidence/clusters?start_ns=1500000000&end_ns=2500000000", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("range status=%d want 200", w.Code)
+	}
+	var rng struct {
+		Count   int                        `json:"count"`
+		Records []ClusterObservationRecord `json:"records"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&rng)
+	if rng.Count != 1 || rng.Records[0].ClusterTimeNs != 2_000_000_000 {
+		t.Errorf("range scan got %d records (first=%+v); want exactly the middle record",
+			rng.Count, rng.Records)
+	}
+}
+
+// TestAPI_Evidence_Fixes_RoundTrip mirrors the clusters test with the
+// solved_fixes bucket so the fixes endpoint's encoding is exercised.
+func TestAPI_Evidence_Fixes_RoundTrip(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.WriteSolvedFix(&SolvedFixRecord{
+		EventTimeNs: 2_000_000_000, From: "!a", PacketID: 1, Lat: 39, Lon: -98, UncertaintyM: 5,
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithStore(t, r, nil, s, "")
+	req := httptest.NewRequest(http.MethodGet,
+		"/api/evidence/fixes?start_ns=1000000000&end_ns=3000000000", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200", w.Code)
+	}
+	var got struct {
+		Count   int               `json:"count"`
+		Records []SolvedFixRecord `json:"records"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if got.Count != 1 || got.Records[0].UncertaintyM != 5 {
+		t.Errorf("fixes range got %+v; want one record uncertainty=5", got)
+	}
+}
+
+// TestAPI_Evidence_BadRange returns 400 when start_ns can't parse or is
+// after end_ns.
+func TestAPI_Evidence_BadRange(t *testing.T) {
+	s := openTestStore(t)
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithStore(t, r, nil, s, "")
+	for _, q := range []string{
+		"?start_ns=notanumber",
+		"?start_ns=100&end_ns=50",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/evidence/clusters"+q, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			b, _ := io.ReadAll(w.Body)
+			t.Errorf("range %q status=%d want 400; body=%s", q, w.Code, b)
+		}
 	}
 }

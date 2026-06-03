@@ -545,7 +545,7 @@ func main() {
 
 	if *listen != "" {
 		go func() {
-			if err := startWebServer(ctx, *listen, hub, registry, *apiToken); err != nil {
+			if err := startWebServer(ctx, *listen, hub, registry, store, *apiToken); err != nil {
 				log.Printf("web: %v", err)
 				cancel()
 			}

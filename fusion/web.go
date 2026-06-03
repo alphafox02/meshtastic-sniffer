@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -209,7 +210,7 @@ func authWrap(next http.Handler, token string) http.Handler {
 // the dashboard HTML at / is always served without auth so the operator
 // can land on the page and the JS can pick up the token from a
 // `?token=<T>` query param.
-func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *Registry, apiToken string) error {
+func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *Registry, store *EventStore, apiToken string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -262,6 +263,16 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 			"warnings": warnings,
 		})
 	})
+
+	// Evidence read endpoints. The Evidence tab loads "what happened
+	// between start_ns and end_ns" from these by walking the time-keyed
+	// buckets we already persisted. Read-only -- no replay execution
+	// yet; that lands in a separate commit so this first slice can ship
+	// independently of solver-mutation work.
+	apiMux.HandleFunc("/api/evidence/clusters", evidenceClustersHandler(store))
+	apiMux.HandleFunc("/api/evidence/pairs", evidencePairsHandler(store))
+	apiMux.HandleFunc("/api/evidence/fixes", evidenceFixesHandler(store))
+	apiMux.HandleFunc("/api/evidence/summary", evidenceSummaryHandler(store))
 
 	apiMux.HandleFunc("/api/dealer-stats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -373,4 +384,189 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 		return err
 	}
 	return nil
+}
+
+// parseEvidenceRange extracts start_ns / end_ns query params with
+// sensible defaults: missing end_ns means "now"; missing start_ns means
+// "one hour before end_ns". Returns (start, end, err) where err is
+// non-nil only when a provided value fails to parse as uint64.
+//
+// One hour is the dashboard's default zoom; the API
+// mirrors that so a request without params returns the same window the
+// timeline starts on.
+func parseEvidenceRange(r *http.Request) (uint64, uint64, error) {
+	now := uint64(time.Now().UnixNano())
+	endStr := r.URL.Query().Get("end_ns")
+	end := now
+	if endStr != "" {
+		n, err := strconv.ParseUint(endStr, 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("end_ns: %w", err)
+		}
+		end = n
+	}
+	startStr := r.URL.Query().Get("start_ns")
+	var start uint64
+	if startStr != "" {
+		n, err := strconv.ParseUint(startStr, 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("start_ns: %w", err)
+		}
+		start = n
+	} else {
+		const oneHourNs = uint64(time.Hour / time.Nanosecond)
+		if end >= oneHourNs {
+			start = end - oneHourNs
+		}
+	}
+	if start > end {
+		return 0, 0, fmt.Errorf("start_ns (%d) > end_ns (%d)", start, end)
+	}
+	return start, end, nil
+}
+
+// evidenceClustersHandler serves persisted cluster_observations for the
+// Evidence tab timeline. Returns 200 + empty list when the store is nil
+// (clock-sync-disabled-mode dashboard) so the UI logic is uniform.
+func evidenceClustersHandler(store *EventStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		start, end, err := parseEvidenceRange(r)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var records []ClusterObservationRecord
+		if store != nil {
+			records, err = store.ReadClusterObservationsRange(start, end)
+			if err != nil {
+				jsonError(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		if records == nil {
+			records = []ClusterObservationRecord{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"start_ns":  start,
+			"end_ns":    end,
+			"persisted": store != nil,
+			"count":     len(records),
+			"records":   records,
+		})
+	}
+}
+
+// evidencePairsHandler serves pair_snapshots within the time range.
+func evidencePairsHandler(store *EventStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		start, end, err := parseEvidenceRange(r)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var records []PairSnapshotRecord
+		if store != nil {
+			records, err = store.ReadPairSnapshotsRange(start, end)
+			if err != nil {
+				jsonError(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		if records == nil {
+			records = []PairSnapshotRecord{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"start_ns":  start,
+			"end_ns":    end,
+			"persisted": store != nil,
+			"count":     len(records),
+			"records":   records,
+		})
+	}
+}
+
+// evidenceFixesHandler serves cached solved_fixes within the time range.
+func evidenceFixesHandler(store *EventStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		start, end, err := parseEvidenceRange(r)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var records []SolvedFixRecord
+		if store != nil {
+			records, err = store.ReadSolvedFixesRange(start, end)
+			if err != nil {
+				jsonError(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		if records == nil {
+			records = []SolvedFixRecord{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"start_ns":  start,
+			"end_ns":    end,
+			"persisted": store != nil,
+			"count":     len(records),
+			"records":   records,
+		})
+	}
+}
+
+// evidenceSummaryHandler exposes schema version, replay availability,
+// and bucket row counts so the dashboard can render a one-line "DB has
+// N clusters / N solves / replay v3" status. Used by the health strip
+// at first paint and on tab focus.
+func evidenceSummaryHandler(store *EventStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var (
+			schemaVer int
+			replay    bool
+			cnts      = map[string]int{
+				"cluster_observations": 0,
+				"pair_snapshots":       0,
+				"solved_fixes":         0,
+			}
+		)
+		if store != nil {
+			schemaVer = store.SchemaVersion()
+			replay = store.ReplayAvailable()
+			if n, err := store.CountClusterObservations(); err == nil {
+				cnts["cluster_observations"] = n
+			}
+			if n, err := store.CountPairSnapshots(); err == nil {
+				cnts["pair_snapshots"] = n
+			}
+			if n, err := store.CountSolvedFixes(); err == nil {
+				cnts["solved_fixes"] = n
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"persisted":        store != nil,
+			"schema_version":   schemaVer,
+			"replay_available": replay,
+			"counts":           cnts,
+		})
+	}
 }
