@@ -8,7 +8,7 @@
 // frames. That ring is lost when the fusion process exits. EventStore
 // mirrors the ring to disk so the next process startup preloads it.
 //
-// Storage layout (single bbolt file, schema_version=2):
+// Storage layout (single bbolt file, schema_version=3):
 //
 //	bucket "meta"
 //	  key:   "schema_version"  value: ASCII integer
@@ -18,18 +18,26 @@
 //	  key:   8-byte big-endian monotonic sequence number
 //	  value: raw event JSON bytes (same as the SSE wire format)
 //
-//	bucket "cluster_observations"   (schema v2; empty until write paths land)
+//	bucket "cluster_observations"   (schema v2)
 //	  key:   per-event composite (event_id | from | packet_id | cluster_time_ns)
 //	  value: JSON encoding the participating stations' raw Observations
 //	         (lat/lon/alt, PreambleLockTNs, StationTNs, TAccNs, SNR/RSSI,
 //	          freq/preset/SF/CR/BW) for replay re-solve.
 //
-//	bucket "pair_snapshots"         (schema v2; empty until write paths land)
+//	bucket "pair_snapshots"         (schema v2)
 //	  key:   snapshot_time_ns (8 BE bytes) | pair_key (variable; "A|B")
 //	  value: JSON {median_ns, mad_ns, sample_count, anchor_ids,
 //	              status_at_snapshot, last_anchor_time_ns, max_age_s}
 //	  notes: snapshot_time_ns is the RF event time (max preamble_lock_t_ns
 //	         of the anchor cluster that triggered the update), not wall clock.
+//
+//	bucket "solved_fixes"           (schema v3)
+//	  key:   event_time_ns (8 BE bytes) | "<from>|<packet_id>|<emission_seq>"
+//	  value: JSON encoding the MlatResult + cluster metadata at solve time:
+//	         lat, lon, uncertainty_m, station_count, iterations,
+//	         timestamp_class, timestamp_class_degraded, clock_sync_*,
+//	         and the raw GEOLOCATED wire JSON. Lets the Evidence tab
+//	         render historical solves without re-running Solve.
 //
 // Ring trimming: every Append checks the events bucket size and deletes
 // the oldest entries until count <= maxEntries. maxEntries defaults to
@@ -65,10 +73,11 @@ const (
 	metaBucket                = "meta"
 	clusterObservationsBucket = "cluster_observations"
 	pairSnapshotsBucket       = "pair_snapshots"
+	solvedFixesBucket         = "solved_fixes"
 
 	// Current schema version. Bumped when a future change requires a
 	// migration step beyond CreateBucketIfNotExists.
-	schemaVersion = 2
+	schemaVersion = 3
 
 	// Meta-bucket keys.
 	metaKeySchemaVersion = "schema_version"
@@ -114,6 +123,7 @@ func OpenEventStore(path string, maxEntries int) (*EventStore, error) {
 			metaBucket,
 			clusterObservationsBucket,
 			pairSnapshotsBucket,
+			solvedFixesBucket,
 		} {
 			if _, err := tx.CreateBucketIfNotExists([]byte(name)); err != nil {
 				return fmt.Errorf("create %s bucket: %w", name, err)
@@ -181,12 +191,11 @@ func (s *EventStore) SchemaVersion() int {
 }
 
 // ReplayAvailable reports whether the on-disk schema is at the version
-// that supports replay / re-solve. Currently equivalent to "schema
-// version >= 2," but the function exists so callers do not hardcode
-// the version number. Write paths for cluster_observations and
-// pair_snapshots land in the next two commits; until then this
-// returns true for any v2 file regardless of whether the new buckets
-// have content.
+// that supports replay / re-solve. Equivalent to "schema version >= 2"
+// (the version that introduced cluster_observations + pair_snapshots);
+// solved_fixes (v3) is additive on top and not required for the basic
+// "replay these cluster observations" path. The function exists so
+// callers do not hardcode the version number.
 func (s *EventStore) ReplayAvailable() bool {
 	return s.SchemaVersion() >= 2
 }
@@ -593,6 +602,149 @@ func (s *EventStore) CountPairSnapshots() (int, error) {
 	var n int
 	err := s.db.View(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(pairSnapshotsBucket))
+		if b == nil {
+			return nil
+		}
+		n = b.Stats().KeyN
+		return nil
+	})
+	return n, err
+}
+
+// ---- solved_fixes: cached MlatResult per RF event for the Evidence tab ----
+//
+// The dashboard's per-event detail panel should show "what was the solved
+// location, how trusted, which clock model" without re-running Solve just
+// to display history. solved_fixes mirrors what the live event loop
+// produced once into a sortable, time-keyed bucket so the timeline can
+// fetch a window's worth of fixes in one cursor walk.
+//
+// Modest v1 scope: no per-station residuals, no solver-internals redesign,
+// no DOP/geometry math. Cache the fields we already compute.
+
+// SolvedFixRecord is the on-disk shape of one solved_fixes row.
+// EmissionSeq disambiguates two distinct RF emissions of the same
+// (from, packet_id); SolutionTimeNs records when the live solver actually
+// ran (wall clock), distinct from EventTimeNs (RF event time, primary
+// sort key).
+type SolvedFixRecord struct {
+	EventTimeNs    uint64 `json:"event_time_ns"`
+	SolutionTimeNs uint64 `json:"solution_time_ns"`
+	From           string `json:"from"`
+	PacketID       uint32 `json:"packet_id"`
+	EmissionSeq    int    `json:"emission_seq,omitempty"`
+	ClusterKey     string `json:"cluster_key"`
+
+	Lat            float64 `json:"lat"`
+	Lon            float64 `json:"lon"`
+	UncertaintyM   float64 `json:"uncertainty_m"`
+	StationCount   int     `json:"station_count"`
+	Iterations     int     `json:"iterations"`
+	TimestampClass string  `json:"timestamp_class"`
+	Degraded       bool    `json:"timestamp_class_degraded,omitempty"`
+
+	ClockSyncPairCount   int     `json:"clock_sync_pair_count"`
+	ClockSyncResidualNs  float64 `json:"clock_sync_residual_ns"`
+	ClockSyncAnchorCount int     `json:"clock_sync_anchor_count"`
+	ClockSyncReference   string  `json:"clock_sync_reference,omitempty"`
+
+	// Optional metadata: the pair keys considered when solving this fix
+	// and the snapshot keys those offsets came from. Populated when
+	// readily available from clock-sync state; absent on solves that ran
+	// without clock-sync.
+	PairKeysConsidered   []string `json:"pair_keys_considered,omitempty"`
+	PairSnapshotKeysUsed []string `json:"pair_snapshot_keys_used,omitempty"`
+
+	// Raw GEOLOCATED wire JSON. Lets a replay UI display the exact event
+	// shape the live SSE feed published, without re-marshalling. Stored
+	// as a JSON-encoded string (base64 in the on-disk JSON) so the wire
+	// payload round-trips exactly.
+	RawGeolocatedJSON []byte `json:"raw_geolocated_json,omitempty"`
+}
+
+// solvedFixKey encodes a row key sortable by event_time_ns ascending.
+// Format mirrors clusterObsKey / pairSnapshotKey: 8 BE bytes of nanoseconds
+// then ASCII "|<from>|<packet_id>|<emission_seq>" so a time-range cursor
+// walk lands the right rows and per-emission disambiguation survives a
+// nanosecond collision between distinct same-(from,pid) emissions.
+func solvedFixKey(eventTimeNs uint64, from string, packetID uint32, emissionSeq int) []byte {
+	out := make([]byte, 0, 8+1+len(from)+1+10+1+10)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], eventTimeNs)
+	out = append(out, ts[:]...)
+	out = append(out, '|')
+	out = append(out, []byte(from)...)
+	out = append(out, '|')
+	out = strconv.AppendUint(out, uint64(packetID), 10)
+	out = append(out, '|')
+	out = strconv.AppendInt(out, int64(emissionSeq), 10)
+	return out
+}
+
+// WriteSolvedFix persists one SolvedFixRecord. Safe to call on a nil
+// EventStore (no-op, returns nil). Errors are returned but callers
+// typically log-and-continue so the live SSE publish path is unaffected.
+func (s *EventStore) WriteSolvedFix(rec *SolvedFixRecord) error {
+	if s == nil || s.db == nil || rec == nil {
+		return nil
+	}
+	payload, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("marshal solved fix: %w", err)
+	}
+	key := solvedFixKey(rec.EventTimeNs, rec.From, rec.PacketID, rec.EmissionSeq)
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(solvedFixesBucket))
+		if b == nil {
+			return errors.New("solved_fixes bucket missing")
+		}
+		return b.Put(key, payload)
+	})
+}
+
+// ReadSolvedFixesRange returns every record whose EventTimeNs falls in
+// [startNs, endNs]. One cursor pass; the key encoding puts the timestamp
+// first so seeking is O(log N) + iteration.
+func (s *EventStore) ReadSolvedFixesRange(startNs, endNs uint64) ([]SolvedFixRecord, error) {
+	if s == nil || s.db == nil || endNs < startNs {
+		return nil, nil
+	}
+	var out []SolvedFixRecord
+	var startKey [8]byte
+	binary.BigEndian.PutUint64(startKey[:], startNs)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(solvedFixesBucket))
+		if b == nil {
+			return nil
+		}
+		c := b.Cursor()
+		for k, v := c.Seek(startKey[:]); k != nil; k, v = c.Next() {
+			if len(k) < 8 {
+				continue
+			}
+			ts := binary.BigEndian.Uint64(k[:8])
+			if ts > endNs {
+				break
+			}
+			var rec SolvedFixRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return fmt.Errorf("unmarshal solved fix at ts=%d: %w", ts, err)
+			}
+			out = append(out, rec)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// CountSolvedFixes returns the on-disk row count for the bucket.
+func (s *EventStore) CountSolvedFixes() (int, error) {
+	if s == nil || s.db == nil {
+		return 0, nil
+	}
+	var n int
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(solvedFixesBucket))
 		if b == nil {
 			return nil
 		}

@@ -199,29 +199,29 @@ func TestSSEHub_HydratesFromStore(t *testing.T) {
 // and creates the cluster_observations + pair_snapshots buckets.
 // Re-opening the same file is a no-op for the version field (no
 // downgrade, no duplicate write).
-func TestEventStore_SchemaV2(t *testing.T) {
+func TestEventStore_SchemaV3(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.db")
 	s, err := OpenEventStore(path, 100)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if got := s.SchemaVersion(); got != 2 {
-		t.Errorf("SchemaVersion=%d, want 2", got)
+	if got := s.SchemaVersion(); got != 3 {
+		t.Errorf("SchemaVersion=%d, want 3", got)
 	}
 	if !s.ReplayAvailable() {
-		t.Error("ReplayAvailable should be true at v2")
+		t.Error("ReplayAvailable should be true at v3 (>=2)")
 	}
 	s.Close()
 
-	// Re-open: version stays at 2, no error, buckets still present.
+	// Re-open: version stays at 3, no error, buckets still present.
 	s2, err := OpenEventStore(path, 100)
 	if err != nil {
 		t.Fatalf("re-open: %v", err)
 	}
 	defer s2.Close()
-	if got := s2.SchemaVersion(); got != 2 {
-		t.Errorf("re-open SchemaVersion=%d, want 2", got)
+	if got := s2.SchemaVersion(); got != 3 {
+		t.Errorf("re-open SchemaVersion=%d, want 3", got)
 	}
 }
 
@@ -470,5 +470,144 @@ func TestPairSnapshot_FeedClusterEmits(t *testing.T) {
 	}
 	if got := sc.cs.FeedCluster(spoof); len(got) != 0 {
 		t.Errorf("non-anchor cluster returned %d records, want 0", len(got))
+	}
+}
+
+// TestSolvedFix_RoundTrip writes a few solved fixes with different event
+// times and reads them back through ReadSolvedFixesRange. Verifies the
+// time-sorted key encoding survives EmissionSeq disambiguation, JSON
+// preserves all v1 fields, and the cursor walk bounds work.
+func TestSolvedFix_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	s, err := OpenEventStore(path, 100)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	mk := func(eventNs uint64, from string, pid uint32, seq int) *SolvedFixRecord {
+		return &SolvedFixRecord{
+			EventTimeNs:          eventNs,
+			SolutionTimeNs:       eventNs + 500_000_000,
+			From:                 from,
+			PacketID:             pid,
+			EmissionSeq:          seq,
+			ClusterKey:           fmt.Sprintf("%s|%d|%d", from, pid, seq),
+			Lat:                  39.0,
+			Lon:                  -98.0,
+			UncertaintyM:         42.5,
+			StationCount:         3,
+			Iterations:           7,
+			TimestampClass:       "sync",
+			Degraded:             false,
+			ClockSyncPairCount:   2,
+			ClockSyncResidualNs:  1234.0,
+			ClockSyncAnchorCount: 1,
+			ClockSyncReference:   "alpha",
+			PairKeysConsidered:   []string{"alpha|bravo", "alpha|charlie"},
+			PairSnapshotKeysUsed: []string{"alpha|bravo"},
+			RawGeolocatedJSON:    []byte(`{"event":"GEOLOCATED"}`),
+		}
+	}
+
+	// Two emissions of the same (from, packet_id), then a different event.
+	recs := []*SolvedFixRecord{
+		mk(1_700_000_000_000_000_000, "!aaaa1111", 100, 0),
+		mk(1_700_000_005_000_000_000, "!aaaa1111", 100, 1), // relay of the same pid
+		mk(1_700_000_010_000_000_000, "!bbbb2222", 101, 0),
+	}
+	for _, rec := range recs {
+		if err := s.WriteSolvedFix(rec); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if n, _ := s.CountSolvedFixes(); n != 3 {
+		t.Fatalf("CountSolvedFixes=%d, want 3", n)
+	}
+
+	got, err := s.ReadSolvedFixesRange(0, ^uint64(0))
+	if err != nil {
+		t.Fatalf("read all: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("read all len=%d, want 3", len(got))
+	}
+	// Time-sorted: emission seq=0, seq=1, then different pid.
+	for i, want := range recs {
+		g := got[i]
+		if g.EventTimeNs != want.EventTimeNs {
+			t.Errorf("read[%d].EventTimeNs=%d, want %d", i, g.EventTimeNs, want.EventTimeNs)
+		}
+		if g.From != want.From || g.PacketID != want.PacketID {
+			t.Errorf("read[%d] = (%s,%d), want (%s,%d)", i, g.From, g.PacketID, want.From, want.PacketID)
+		}
+		if g.EmissionSeq != want.EmissionSeq {
+			t.Errorf("read[%d].EmissionSeq=%d, want %d", i, g.EmissionSeq, want.EmissionSeq)
+		}
+		if g.UncertaintyM != want.UncertaintyM || g.StationCount != want.StationCount {
+			t.Errorf("read[%d] solve fields mismatch", i)
+		}
+		if g.ClockSyncReference != want.ClockSyncReference {
+			t.Errorf("read[%d].ClockSyncReference=%q, want %q", i, g.ClockSyncReference, want.ClockSyncReference)
+		}
+		if len(g.PairKeysConsidered) != len(want.PairKeysConsidered) {
+			t.Errorf("read[%d] pair keys len=%d, want %d", i, len(g.PairKeysConsidered), len(want.PairKeysConsidered))
+		}
+		if !bytes.Equal(g.RawGeolocatedJSON, want.RawGeolocatedJSON) {
+			t.Errorf("read[%d] raw JSON mismatch: got %s, want %s", i, g.RawGeolocatedJSON, want.RawGeolocatedJSON)
+		}
+	}
+
+	// Range scan bounds: a tight window around the second record
+	got, err = s.ReadSolvedFixesRange(1_700_000_003_000_000_000, 1_700_000_007_000_000_000)
+	if err != nil {
+		t.Fatalf("range: %v", err)
+	}
+	if len(got) != 1 || got[0].EmissionSeq != 1 {
+		t.Errorf("range scan got %d records (want 1, EmissionSeq=1); first=%+v", len(got), got)
+	}
+}
+
+// TestSolvedFix_NilStore ensures the Write/Read/Count methods are nil-safe
+// so a fusion process running without --state-db never panics.
+func TestSolvedFix_NilStore(t *testing.T) {
+	var s *EventStore
+	if err := s.WriteSolvedFix(&SolvedFixRecord{From: "!x"}); err != nil {
+		t.Errorf("nil store write: got err %v, want nil", err)
+	}
+	got, err := s.ReadSolvedFixesRange(0, 1)
+	if err != nil || len(got) != 0 {
+		t.Errorf("nil store read: got %v, %v; want nil, nil", got, err)
+	}
+	if n, err := s.CountSolvedFixes(); n != 0 || err != nil {
+		t.Errorf("nil store count: got %d, %v; want 0, nil", n, err)
+	}
+}
+
+// TestSolvedFix_EmissionSeqDisambiguation verifies that two solved fixes
+// for the same (from, packet_id) at the same event_time_ns -- a worst-case
+// nanosecond collision -- do NOT clobber each other in the bucket because
+// EmissionSeq is part of the key.
+func TestSolvedFix_EmissionSeqDisambiguation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	s, err := OpenEventStore(path, 100)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	const ts = uint64(1_700_000_000_000_000_000)
+	a := &SolvedFixRecord{EventTimeNs: ts, From: "!aa", PacketID: 1, EmissionSeq: 0, Lat: 39, Lon: -98}
+	b := &SolvedFixRecord{EventTimeNs: ts, From: "!aa", PacketID: 1, EmissionSeq: 1, Lat: 40, Lon: -97}
+	if err := s.WriteSolvedFix(a); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	if err := s.WriteSolvedFix(b); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	if n, _ := s.CountSolvedFixes(); n != 2 {
+		t.Fatalf("CountSolvedFixes=%d after two same-ts writes; want 2 (EmissionSeq must disambiguate)", n)
 	}
 }

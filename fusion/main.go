@@ -653,7 +653,20 @@ loop:
 					 * Anchor traffic is calibration data, not a target --
 					 * suppress GEOLOCATED for declared anchors. */
 					if globalClockSync == nil || !globalClockSync.IsAnchor(c.Frame.From) {
-						if g := tryGeolocate(c); g != nil {
+						g, fix := tryGeolocate(c)
+						if g != nil {
+							/* Persist the solved fix BEFORE publishing
+							 * the SSE event. A crash between persist and
+							 * publish leaves the on-disk truth intact;
+							 * the reverse would publish a fix the
+							 * Evidence tab could later fail to find.
+							 * Best-effort: errors logged, never block.
+							 * No-op when state DB is not attached. */
+							if store != nil && fix != nil {
+								if err := store.WriteSolvedFix(fix); err != nil {
+									log.Printf("solved_fixes: %v", err)
+								}
+							}
 							hub.Publish(g)
 						}
 					}
@@ -677,10 +690,16 @@ loop:
 
 // tryGeolocate runs the mlat solver on a cluster's observations.
 // Filters out observations without a station position or timestamp,
-// runs Solve when 3+ usable observations remain, and returns a
-// JSON-encoded GEOLOCATED event for the SSE hub. Returns nil when
-// there's nothing to publish (insufficient data, solver failure).
-func tryGeolocate(c *Cluster) []byte {
+// runs Solve when 3+ usable observations remain, and returns both the
+// JSON-encoded GEOLOCATED event for the SSE hub AND the structured
+// SolvedFixRecord that the persistence layer caches into solved_fixes.
+// Returns (nil, nil) when there's nothing to publish (insufficient data,
+// solver failure).
+//
+// Both return values are populated when a solve succeeded so the caller
+// can persist the record before publishing the SSE event -- a crash
+// between the two leaves the on-disk truth intact.
+func tryGeolocate(c *Cluster) ([]byte, *SolvedFixRecord) {
 	usable := make([]MlatObservation, 0, len(c.Observations))
 	// If clock-sync is active and at least one pair touching this
 	// cluster has converged, apply the median pair offset to shift
@@ -719,15 +738,18 @@ func tryGeolocate(c *Cluster) []byte {
 		})
 	}
 	if len(usable) < 3 {
-		return nil
+		return nil, nil
 	}
 	res, err := Solve(usable)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	// Tag the result with the dominant class observed across all
 	// usable observations, and surface clock-sync diagnostics if any
-	// pairs were converged.
+	// pairs were converged. Collect the pair keys actually consulted
+	// for this solve so solved_fixes can record exactly which clock
+	// model contributed -- the Evidence tab uses these for replay.
+	var pairKeysConsidered, pairSnapshotKeysUsed []string
 	if globalClockSync != nil && refStation != "" {
 		pairCount, maxMAD := 0, 0.0
 		anchorIDs := map[string]struct{}{}
@@ -743,6 +765,8 @@ func tryGeolocate(c *Cluster) []byte {
 			if o.Station == refStation {
 				continue
 			}
+			pk := PairKey(refStation, o.Station)
+			pairKeysConsidered = append(pairKeysConsidered, pk)
 			_, cls := globalClockSync.CorrectAndClassify(o, refStation)
 			if cls != TimestampSync {
 				continue
@@ -752,6 +776,7 @@ func tryGeolocate(c *Cluster) []byte {
 				if snap.MadNs > maxMAD {
 					maxMAD = snap.MadNs
 				}
+				pairSnapshotKeysUsed = append(pairSnapshotKeysUsed, pk)
 			}
 		}
 		// Tally anchors that contributed to any pair STILL converged at
@@ -814,9 +839,40 @@ func tryGeolocate(c *Cluster) []byte {
 	}
 	b, err := json.Marshal(out)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
-	return b
+	// EventTimeNs: prefer the cluster's max preamble_lock_t_ns (RF event
+	// time, same anchor used by ClusterObservationRecord.ClusterTimeNs);
+	// fall back to wall-clock first-seen for clusters with no lock-bearing
+	// observation at all. Keeps solved_fixes sortable in the same timeline
+	// as cluster_observations and pair_snapshots.
+	eventTimeNs := c.MaxPreambleLockTNs
+	if eventTimeNs == 0 {
+		eventTimeNs = uint64(c.FirstSeen.UnixNano())
+	}
+	rec := &SolvedFixRecord{
+		EventTimeNs:          eventTimeNs,
+		SolutionTimeNs:       uint64(time.Now().UnixNano()),
+		From:                 c.Frame.From,
+		PacketID:             c.Frame.PacketID,
+		EmissionSeq:          c.EmissionSeq,
+		ClusterKey:           c.Key,
+		Lat:                  res.Lat,
+		Lon:                  res.Lon,
+		UncertaintyM:         res.UncertaintyM,
+		StationCount:         res.StationCount,
+		Iterations:           res.Iterations,
+		TimestampClass:       res.WorstTimestampCls.String(),
+		Degraded:             res.Degraded,
+		ClockSyncPairCount:   res.ClockSyncPairCount,
+		ClockSyncResidualNs:  res.ClockSyncResidualNs,
+		ClockSyncAnchorCount: res.ClockSyncAnchorCount,
+		ClockSyncReference:   res.ClockSyncReference,
+		PairKeysConsidered:   pairKeysConsidered,
+		PairSnapshotKeysUsed: pairSnapshotKeysUsed,
+		RawGeolocatedJSON:    append([]byte(nil), b...),
+	}
+	return b, rec
 }
 
 // globalClockSync is the per-process clock-sync state. nil when
