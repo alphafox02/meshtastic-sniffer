@@ -240,9 +240,17 @@ button.danger:hover{background:var(--err-hover)}
 #ev-timeline{flex:1;overflow-y:auto;padding:2px 0;min-height:0}
 #ev-timeline .ev-empty{color:var(--text-muted);padding:20px 14px;text-align:center;
   font-size:var(--text-sm);line-height:1.5}
-.ev-row{display:grid;grid-template-columns:72px auto auto 80px 1fr;gap:var(--space-2);
+.ev-row{display:grid;grid-template-columns:72px auto auto 80px 1fr auto;gap:var(--space-2);
   padding:6px var(--space-3);border-bottom:1px solid var(--border-soft);cursor:pointer;
   font-size:var(--text-sm);align-items:center;line-height:1.3}
+.ev-row .ev-action{background:transparent;border:1px solid var(--border);color:var(--text-3);
+  padding:2px 7px;border-radius:var(--radius);font-size:var(--text-xs);cursor:pointer;
+  font-family:inherit;text-transform:none;letter-spacing:0;font-weight:400;white-space:nowrap}
+.ev-row .ev-action:hover{color:var(--accent);border-color:var(--accent)}
+.ev-row .ev-action[disabled]{opacity:0.5;cursor:wait}
+.ev-row .ev-action.replayed{color:var(--ok);border-color:var(--ok)}
+.ev-row .ev-replay-tag{color:var(--ok);font-size:var(--text-xs);font-weight:600;
+  text-transform:uppercase;letter-spacing:0.05em;margin-left:6px}
 .ev-row:hover{background:var(--bg-panel)}
 .ev-row.selected{background:var(--bg-selected);border-left:3px solid var(--accent);padding-left:9px}
 .ev-row .ev-time{color:var(--text-3);font-variant-numeric:tabular-nums;font-size:var(--text-xs)}
@@ -931,6 +939,26 @@ es.onmessage=(e)=>{
     noteGeolocated(p);
     return;
   }
+  // REPLAY_GEOLOCATED is the event-time re-solve result. Distinct from
+  // live GEOLOCATED so the timeline keeps replay derivations separate
+  // from real solves. Stash by source_event_id; the Evidence tab reads
+  // evidenceReplays on every re-render.
+  if(p.event==='REPLAY_GEOLOCATED' && p.source_event_id){
+    evidenceReplays.set(p.source_event_id, p);
+    // If the Evidence tab is currently showing, re-render so the
+    // replayed row picks up the REPLAY badge and the detail pane
+    // refreshes if this row is selected. evidenceRefresh would be
+    // overkill (network round-trip); just re-render from cached data.
+    if (document.getElementById('evidence').classList.contains('active')) {
+      evidenceRenderTimeline();
+      // Re-render detail if currently selected this row.
+      if (evidenceSelected === p.source_event_id) {
+        const sel = document.querySelector('#ev-timeline .ev-row.selected');
+        if (sel) sel.click();
+      }
+    }
+    return;
+  }
   // STATS heartbeat from a sniffer: 5 s cadence per sensor with msps +
   // cumulative frames/decrypted. Use it to surface per-sensor health.
   if(p.event==='STATS' && p.station){
@@ -1106,7 +1134,17 @@ function escHtml(s){return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&
 
 let evidenceZoom = '1h';
 let evidenceData = { summary: null, fixes: [], clusters: [], pairs: [], warnings: [] };
-let evidenceSelected = null; // {kind, id} of the currently-highlighted row
+let evidenceSelected = null; // source_event_id of the currently-highlighted row
+
+// evidenceReplays: ephemeral REPLAY_GEOLOCATED results, keyed by
+// source_event_id. Not persisted -- replays are derivations the operator
+// can re-run, so a page reload clears them. Stored only so the timeline
+// + detail pane can show "yes, this event was just replayed" without a
+// round trip.
+const evidenceReplays = new Map();
+function evidenceRowKey(from, pid, seq, eventTimeNs){
+  return from + '|' + pid + '|' + (seq || 0) + '|' + eventTimeNs;
+}
 
 // Evidence map: dedicated Leaflet instance (NOT the Live map). The two
 // maps have different jobs: Live is real-time situational awareness,
@@ -1317,14 +1355,15 @@ function evidenceRenderTimeline(){
   for (const c of evidenceData.clusters) {
     const k = c.from + '|' + c.packet_id + '|' + (c.emission_seq || 0);
     const fix = fixByKey.get(k);
+    const obsCount = (c.observations || []).length;
     rows.push({
       timeNs: c.cluster_time_ns,
       kind: fix ? 'solved' : (c.low_trust ? 'degraded' : 'target'),
       from: c.from,
       packetId: c.packet_id,
       emissionSeq: c.emission_seq || 0,
-      summary: ((c.observations||[]).length) + ' station' +
-        (((c.observations||[]).length === 1) ? '' : 's') +
+      stationCount: obsCount,
+      summary: obsCount + ' station' + (obsCount === 1 ? '' : 's') +
         (c.preset ? (' · ' + c.preset) : '') +
         (c.low_trust ? ' · low-trust' : '') +
         ((c.station_dupes_suppressed||0) > 0 ? (' · dupes=' + c.station_dupes_suppressed) : ''),
@@ -1343,6 +1382,7 @@ function evidenceRenderTimeline(){
       from: fix.from,
       packetId: fix.packet_id,
       emissionSeq: fix.emission_seq || 0,
+      stationCount: fix.station_count || 0,
       summary: 'solved · ' + (fix.station_count||0) + ' stations · ±' +
         Math.round(fix.uncertainty_m||0) + ' m',
       trust: fix.timestamp_class,
@@ -1377,16 +1417,76 @@ function evidenceRenderTimeline(){
     const trustClass = r.trust ? 'ev-trust ev-trust-'+r.trust : 'ev-trust';
     const trustText = r.trust ? r.trust.toUpperCase() : '';
     const tstr = (new Date(Number(r.timeNs)/1e6)).toLocaleTimeString([], {hour12:false});
+    const rowKey = evidenceRowKey(r.from, r.packetId, r.emissionSeq, r.timeNs);
+    const replay = evidenceReplays.get(rowKey);
+    // Re-solve button is only meaningful when we have persisted cluster
+    // observations with enough stations for the solver. A bare fix row
+    // (no cluster) can't be re-solved because the raw observations are
+    // missing from the bucket.
+    const canReplay = r.cluster && (r.stationCount || 0) >= 3;
+    const replayedTag = replay
+      ? ' <span class="ev-replay-tag">REPLAY</span>'
+      : '';
+    const actionHtml = canReplay
+      ? '<button class="ev-action'+(replay?' replayed':'')+'" data-event-id="'+
+          escHtml(rowKey)+'">Replay</button>'
+      : '<span></span>';
     row.innerHTML =
       '<div class="ev-time">'+escHtml(tstr)+'</div>' +
       '<div class="ev-kind ev-kind-'+r.kind+'">'+escHtml(r.kind)+'</div>' +
       '<div class="ev-from">'+escHtml(r.from)+(r.emissionSeq>0?(':#'+r.emissionSeq):'')+'</div>' +
-      '<div class="'+trustClass+'">'+escHtml(trustText)+'</div>' +
-      '<div class="ev-summary">'+escHtml(r.summary)+'</div>';
-    const rowKey = r.from + '|' + r.packetId + '|' + r.emissionSeq;
+      '<div class="'+trustClass+'">'+escHtml(trustText)+replayedTag+'</div>' +
+      '<div class="ev-summary">'+escHtml(r.summary)+'</div>' +
+      actionHtml;
     row.addEventListener('click', () => evidenceShowDetail(r, row));
+    const btn = row.querySelector('.ev-action');
+    if (btn) {
+      btn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        evidenceReplay(r, btn);
+      });
+    }
     if (evidenceSelected === rowKey) row.classList.add('selected');
     tl.appendChild(row);
+  }
+}
+
+// evidenceReplay POSTs /api/resolve for the given row. The result lands
+// asynchronously via the REPLAY_GEOLOCATED SSE event; this fn only fires
+// the request and gives the operator instant feedback that the action is
+// in flight. The button is intentionally not disabled forever -- if
+// nothing comes back within a few seconds, the operator can retry.
+async function evidenceReplay(r, btn){
+  btn.disabled = true;
+  const wasText = btn.textContent;
+  btn.textContent = 'Replaying...';
+  try {
+    const resp = await fetch(authUrl('/api/resolve'), {
+      method: 'POST',
+      headers: authHeaders({'Content-Type':'application/json'}),
+      body: JSON.stringify({
+        from: r.from,
+        packet_id: r.packetId,
+        emission_seq: r.emissionSeq,
+        event_time_ns: Number(r.timeNs),
+        mode: 'event_time',
+      }),
+    });
+    if (!resp.ok) {
+      const errText = (await resp.text()).slice(0, 200);
+      btn.textContent = 'Replay failed';
+      btn.title = errText;
+      setTimeout(() => { btn.textContent = wasText; btn.disabled = false; btn.title = ''; }, 3000);
+      return;
+    }
+    // Success ack: the REPLAY_GEOLOCATED SSE event will re-enable the
+    // button + update the row when it arrives. If the SSE arrives before
+    // we get here (rare), evidenceRenderTimeline will have already
+    // re-rendered with the replayed state.
+    setTimeout(() => { btn.disabled = false; btn.textContent = wasText; }, 1500);
+  } catch (e) {
+    btn.textContent = 'Replay error';
+    setTimeout(() => { btn.textContent = wasText; btn.disabled = false; }, 3000);
   }
 }
 
@@ -1394,10 +1494,10 @@ function evidenceShowDetail(r, rowEl){
   // Highlight selected row.
   document.querySelectorAll('#ev-timeline .ev-row').forEach(x=>x.classList.remove('selected'));
   rowEl.classList.add('selected');
-  evidenceSelected = r.from + '|' + r.packetId + '|' + r.emissionSeq;
+  evidenceSelected = evidenceRowKey(r.from, r.packetId, r.emissionSeq, r.timeNs);
   // Pan + open popup for the matching map marker. No-op when the row is
   // an unsolved cluster (no fix -> no marker on the map).
-  evidenceHighlightFix(evidenceSelected);
+  evidenceHighlightFix(r.from + '|' + r.packetId + '|' + r.emissionSeq);
   const host = document.getElementById('ev-detail');
   let html = '';
   html += '<h4>Event</h4>';
@@ -1449,6 +1549,28 @@ function evidenceShowDetail(r, rowEl){
   if (!r.fix && !(r.cluster && r.cluster.observations && r.cluster.observations.length)) {
     html += '<div class="ev-empty" style="padding-top:20px">No persisted detail for this event yet.</div>';
   }
+
+  const replay = evidenceReplays.get(evidenceRowKey(r.from, r.packetId, r.emissionSeq, r.timeNs));
+  if (replay) {
+    html += '<h4>Replay (event-time)</h4>';
+    html += kv('replay_mode', replay.replay_mode || '');
+    html += kv('clock_model_time_ns', String(replay.clock_model_time_ns || ''));
+    html += kv('lat / lon', (replay.lat||0).toFixed(6) + ', ' + (replay.lon||0).toFixed(6));
+    html += kv('uncertainty', '±' + (replay.uncertainty_m || 0).toFixed(1) + ' m');
+    html += kv('station_count', String(replay.station_count || 0));
+    html += kv('iterations', String(replay.iterations || 0));
+    html += kv('timestamp_class', (replay.timestamp_class || '') +
+      (replay.timestamp_class_degraded ? ' (degraded)' : ''));
+    if (replay.clock_sync_reference) {
+      html += kv('clock_sync_reference', replay.clock_sync_reference);
+    }
+    if (replay.pair_snapshot_keys_used && replay.pair_snapshot_keys_used.length) {
+      for (const k of replay.pair_snapshot_keys_used) {
+        html += '<div class="kv"><span class="k">pair_snapshot</span><span class="v">'+escHtml(k)+'</span></div>';
+      }
+    }
+  }
+
   host.innerHTML = html;
 }
 

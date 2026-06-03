@@ -274,6 +274,11 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 	apiMux.HandleFunc("/api/evidence/fixes", evidenceFixesHandler(store))
 	apiMux.HandleFunc("/api/evidence/summary", evidenceSummaryHandler(store))
 
+	// POST /api/resolve: event-time replay solver. Loads persisted
+	// evidence + historical pair-offset snapshot and emits a
+	// REPLAY_GEOLOCATED SSE event with the recomputed fix.
+	apiMux.HandleFunc("/api/resolve", resolveHandler(store, hub))
+
 	apiMux.HandleFunc("/api/dealer-stats", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)

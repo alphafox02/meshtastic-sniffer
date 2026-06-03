@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -96,6 +97,7 @@ func newAPIHandlerWithStore(t *testing.T, registry *Registry, hub *SSEHub, store
 	apiMux.HandleFunc("/api/evidence/pairs", evidencePairsHandler(store))
 	apiMux.HandleFunc("/api/evidence/fixes", evidenceFixesHandler(store))
 	apiMux.HandleFunc("/api/evidence/summary", evidenceSummaryHandler(store))
+	apiMux.HandleFunc("/api/resolve", resolveHandler(store, hub))
 	wrapped := authWrap(apiMux, apiToken)
 	mux.Handle("/api/", wrapped)
 	mux.Handle("/events", wrapped)
@@ -528,6 +530,219 @@ func TestAPI_Evidence_Fixes_RoundTrip(t *testing.T) {
 	_ = json.NewDecoder(w.Body).Decode(&got)
 	if got.Count != 1 || got.Records[0].UncertaintyM != 5 {
 		t.Errorf("fixes range got %+v; want one record uncertainty=5", got)
+	}
+}
+
+// newAPIHandlerWithHub mirrors newAPIHandlerWithStore but also wires a
+// real SSEHub so the resolve endpoint can publish REPLAY_GEOLOCATED.
+func newAPIHandlerWithHub(t *testing.T, registry *Registry, hub *SSEHub, store *EventStore, apiToken string) http.Handler {
+	return newAPIHandlerWithStore(t, registry, hub, store, apiToken)
+}
+
+// drainHubHistory reads everything currently in the hub's history ring.
+// Used in resolve tests to verify the REPLAY_GEOLOCATED event hit the
+// publisher path without spinning up a real /events SSE client.
+func drainHubHistory(hub *SSEHub) [][]byte {
+	hub.mu.Lock()
+	defer hub.mu.Unlock()
+	out := make([][]byte, 0, hub.histLen)
+	start := 0
+	if hub.histLen == sseHistorySize {
+		start = hub.histHead
+	}
+	for i := 0; i < hub.histLen; i++ {
+		idx := (start + i) % sseHistorySize
+		if hub.history[idx] != nil {
+			out = append(out, hub.history[idx])
+		}
+	}
+	return out
+}
+
+// seedResolveFixture writes one cluster_observations row + two pair
+// snapshots into the store so a /api/resolve event_time call has
+// something to chew on. Returns the event_time_ns it wrote at.
+func seedResolveFixture(t *testing.T, s *EventStore) uint64 {
+	t.Helper()
+	const eventNs = uint64(1_780_000_000_000_000_000)
+	rec := &ClusterObservationRecord{
+		From: "!aabbccdd", PacketID: 100, EmissionSeq: 0,
+		ClusterTimeNs:   eventNs,
+		FirstSeenWallNs: eventNs + 1_000,
+		Preset:          "MediumFast",
+		Observations: []ClusterObservationStation{
+			{
+				Station: "alpha", StationLat: 39.010, StationLon: -98.010,
+				StationTNs: eventNs + 5_000_000, StationTAccNs: 1_000_000,
+				PreambleLockTNs: eventNs, SnrDB: 8,
+			},
+			{
+				Station: "bravo", StationLat: 39.000, StationLon: -98.012,
+				StationTNs: eventNs + 5_000_000, StationTAccNs: 1_000_000,
+				PreambleLockTNs: eventNs + 20_000, SnrDB: 6,
+			},
+			{
+				Station: "delta", StationLat: 38.988, StationLon: -98.002,
+				StationTNs: eventNs + 5_000_000, StationTAccNs: 1_000_000,
+				PreambleLockTNs: eventNs + 25_000, SnrDB: 7,
+			},
+		},
+	}
+	if err := s.WriteClusterObservation(rec); err != nil {
+		t.Fatalf("seed cluster: %v", err)
+	}
+	for _, ps := range []*PairSnapshotRecord{
+		{
+			PairKey: "alpha|bravo", SnapshotTimeNs: eventNs,
+			LastAnchorTimeNs: eventNs - 1_000_000_000,
+			MedianNs:         20_000, MadNs: 500, SampleCount: 12,
+			AnchorIDs:        []string{"!cafe"},
+			StatusAtSnapshot: "converged",
+			MaxAgeS:          600,
+		},
+		{
+			PairKey: "alpha|delta", SnapshotTimeNs: eventNs,
+			LastAnchorTimeNs: eventNs - 1_000_000_000,
+			MedianNs:         25_000, MadNs: 600, SampleCount: 11,
+			AnchorIDs:        []string{"!cafe"},
+			StatusAtSnapshot: "converged",
+			MaxAgeS:          600,
+		},
+	} {
+		if err := s.WritePairSnapshot(ps); err != nil {
+			t.Fatalf("seed pair: %v", err)
+		}
+	}
+	return eventNs
+}
+
+// TestAPI_Resolve_Happy: seeded cluster + pair snapshots, POST resolve,
+// expect 200 + REPLAY_GEOLOCATED on the hub with correct source/mode/
+// clock_model_time_ns fields and a sane solve.
+func TestAPI_Resolve_Happy(t *testing.T) {
+	s := openTestStore(t)
+	eventNs := seedResolveFixture(t, s)
+	hub := newSSEHub()
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithHub(t, r, hub, s, "")
+
+	body := fmt.Sprintf(`{"from":"!aabbccdd","packet_id":100,"emission_seq":0,"event_time_ns":%d,"mode":"event_time"}`, eventNs)
+	req := httptest.NewRequest(http.MethodPost, "/api/resolve", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200; body=%s", w.Code, w.Body.String())
+	}
+	var ack struct {
+		Queued        bool   `json:"queued"`
+		SourceEventID string `json:"source_event_id"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&ack)
+	if !ack.Queued {
+		t.Errorf("queued=false")
+	}
+	wantID := fmt.Sprintf("!aabbccdd|100|0|%d", eventNs)
+	if ack.SourceEventID != wantID {
+		t.Errorf("source_event_id=%q want %q", ack.SourceEventID, wantID)
+	}
+
+	pubs := drainHubHistory(hub)
+	if len(pubs) != 1 {
+		t.Fatalf("hub got %d events, want 1", len(pubs))
+	}
+	var ev replayEvent
+	if err := json.Unmarshal(pubs[0], &ev); err != nil {
+		t.Fatalf("decode pub: %v -- raw=%s", err, pubs[0])
+	}
+	if ev.Event != "REPLAY_GEOLOCATED" {
+		t.Errorf("event=%q want REPLAY_GEOLOCATED", ev.Event)
+	}
+	if ev.SourceEventID != wantID {
+		t.Errorf("event.source_event_id=%q want %q", ev.SourceEventID, wantID)
+	}
+	if ev.ReplayMode != "event_time" {
+		t.Errorf("replay_mode=%q want event_time", ev.ReplayMode)
+	}
+	if ev.ClockModelTimeNs != eventNs {
+		t.Errorf("clock_model_time_ns=%d want %d", ev.ClockModelTimeNs, eventNs)
+	}
+	if ev.StationCount != 3 {
+		t.Errorf("station_count=%d want 3", ev.StationCount)
+	}
+	if ev.TimestampClass != "sync" {
+		t.Errorf("timestamp_class=%q want sync (snapshots are converged)", ev.TimestampClass)
+	}
+}
+
+// TestAPI_Resolve_EventNotFound: cluster_observations row for the given
+// composite key doesn't exist -> 404.
+func TestAPI_Resolve_EventNotFound(t *testing.T) {
+	s := openTestStore(t)
+	hub := newSSEHub()
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithHub(t, r, hub, s, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/resolve",
+		strings.NewReader(`{"from":"!missing","packet_id":1,"event_time_ns":12345,"mode":"event_time"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("status=%d want 404; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestAPI_Resolve_NoStateDB: store is nil -> 503 (replay needs persistence).
+func TestAPI_Resolve_NoStateDB(t *testing.T) {
+	hub := newSSEHub()
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithHub(t, r, hub, nil, "")
+	req := httptest.NewRequest(http.MethodPost, "/api/resolve",
+		strings.NewReader(`{"from":"!a","packet_id":1,"event_time_ns":1,"mode":"event_time"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status=%d want 503", w.Code)
+	}
+}
+
+// TestAPI_Resolve_BadInputs: missing fields -> 400; bad JSON -> 400;
+// unknown mode -> 400; wrong method -> 405.
+func TestAPI_Resolve_BadInputs(t *testing.T) {
+	s := openTestStore(t)
+	hub := newSSEHub()
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithHub(t, r, hub, s, "")
+	cases := []struct {
+		name string
+		method, body string
+		want int
+	}{
+		{"wrong method", http.MethodGet, "", http.StatusMethodNotAllowed},
+		{"bad JSON", http.MethodPost, "{this is not json", http.StatusBadRequest},
+		{"missing fields", http.MethodPost, `{"mode":"event_time"}`, http.StatusBadRequest},
+		{"missing event_time_ns", http.MethodPost, `{"from":"!a","packet_id":1,"mode":"event_time"}`, http.StatusBadRequest},
+		{"unknown mode", http.MethodPost, `{"from":"!a","packet_id":1,"event_time_ns":1,"mode":"future_mode"}`, http.StatusBadRequest},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var bodyR io.Reader
+			if c.body != "" {
+				bodyR = strings.NewReader(c.body)
+			}
+			req := httptest.NewRequest(c.method, "/api/resolve", bodyR)
+			if c.body != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != c.want {
+				b, _ := io.ReadAll(w.Body)
+				t.Errorf("%s status=%d want %d; body=%s", c.name, w.Code, c.want, b)
+			}
+		})
 	}
 }
 
