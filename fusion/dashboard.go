@@ -100,83 +100,100 @@ button.danger:hover{background:#991b1b}
   background:#1e293b;border-radius:3px;padding:8px 10px;margin-top:6px;white-space:pre-wrap;
   max-height:200px;overflow:auto}
 
-/* Evidence tab. Read-only timeline + per-event detail; first slice has
- * no replay/re-solve actions. */
+/* Evidence tab. Mirrors the Live tab's "map left, panes stacked right"
+ * grid so the operator's eye lands on geography first and
+ * the timeline + detail act as side cards. Top header holds the health
+ * strip and persistent warnings full-width above the work area. */
 #evidence.tab{padding:0;display:none;flex-direction:column}
 #evidence.tab.active{display:flex}
-#ev-health-strip{display:flex;gap:10px;padding:12px 18px 0 18px;flex-wrap:wrap}
-.ev-card{background:#1e293b;border:1px solid #334155;border-radius:4px;padding:8px 12px;
-  min-width:120px}
+#ev-header{flex:none;padding:10px 14px 6px;border-bottom:1px solid #334155}
+#ev-health-strip{display:flex;gap:10px;flex-wrap:wrap}
+.ev-card{background:#1e293b;border:1px solid #334155;border-radius:4px;padding:6px 10px;
+  min-width:108px}
 .ev-card .ev-label{color:#64748b;text-transform:uppercase;font-size:10px;letter-spacing:0.06em;
-  font-weight:600;margin-bottom:4px}
-.ev-card .ev-value{font-size:18px;font-variant-numeric:tabular-nums;font-weight:600;color:#e2e8f0}
-.ev-card .ev-sub{color:#94a3b8;font-size:11px;margin-top:2px}
+  font-weight:600;margin-bottom:2px}
+.ev-card .ev-value{font-size:15px;font-variant-numeric:tabular-nums;font-weight:600;color:#e2e8f0;
+  line-height:1.2}
+.ev-card .ev-sub{color:#94a3b8;font-size:10px;margin-top:2px}
 .ev-state-ready{color:#22c55e}
 .ev-state-degraded{color:#f59e0b}
 .ev-state-not_ready,.ev-state-no_anchor{color:#ef4444}
 .ev-state-stale{color:#a78bfa}
-#ev-warnings{padding:0 18px;margin-top:8px}
+#ev-warnings{margin-top:6px}
+#ev-persisted-banner{color:#94a3b8;font-size:12px;margin-top:6px}
 .ev-warn{background:#7f1d1d;color:#fecaca;border:1px solid #b91c1c;border-radius:3px;
-  padding:8px 12px;margin-top:6px;font-size:12px;line-height:1.45}
+  padding:6px 10px;margin-top:4px;font-size:11px;line-height:1.4}
 .ev-warn b{color:#fff}
-#ev-controls{display:flex;align-items:center;gap:14px;padding:10px 18px}
-#ev-controls .zoom-buttons{display:inline-flex;background:#1e293b;border:1px solid #334155;
-  border-radius:4px;overflow:hidden}
-#ev-controls .zoom-buttons button{background:transparent;color:#64748b;border:none;
-  padding:6px 12px;font-size:12px;cursor:pointer;border-right:1px solid #334155}
-#ev-controls .zoom-buttons button:last-child{border-right:none}
-#ev-controls .zoom-buttons button:hover{color:#94a3b8}
-#ev-controls .zoom-buttons button.active{background:#0f172a;color:#38bdf8}
-#ev-controls .ev-readout{color:#64748b;font-size:11px;font-variant-numeric:tabular-nums}
-#ev-controls .ev-refresh{background:#1e293b;border:1px solid #334155;color:#94a3b8;
-  padding:6px 12px;border-radius:3px;cursor:pointer;font-size:12px}
-#ev-controls .ev-refresh:hover{color:#e2e8f0}
-#ev-main{flex:1;display:flex;gap:0;border-top:1px solid #334155;overflow:hidden}
-#ev-timeline-pane{flex:1;display:flex;flex-direction:column;border-right:1px solid #334155;
-  overflow:hidden;min-width:0}
-#ev-timeline-pane h3{margin:0;padding:10px 14px;font-size:11px;text-transform:uppercase;
-  letter-spacing:0.08em;color:#64748b;border-bottom:1px solid #334155}
-#ev-timeline{flex:1;overflow-y:auto;padding:4px 0}
-#ev-timeline .ev-empty{color:#64748b;padding:30px 18px;text-align:center;font-size:12px}
-.ev-row{display:grid;grid-template-columns:88px 88px 130px 1fr 80px;gap:8px;
-  padding:8px 14px;border-bottom:1px solid #1e293b;cursor:pointer;font-size:12px;
-  align-items:center}
+#evidence-grid{flex:1;display:grid;grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr;
+  gap:1px;background:#334155;min-height:0}
+#ev-map-pane{grid-row:span 2;position:relative;background:#0f172a;min-width:0;min-height:0}
+#ev-map{position:absolute;inset:0}
+#ev-map-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  color:#64748b;font-size:12px;pointer-events:none;background:#0f172a;z-index:400;
+  text-align:center;padding:20px}
+.leaflet-container{background:#0f172a}
+.ev-pane{background:#0f172a;display:flex;flex-direction:column;overflow:hidden;min-width:0;
+  min-height:0}
+.ev-pane > h3{font-size:11px;color:#38bdf8;text-transform:uppercase;letter-spacing:1px;
+  margin:0;padding:8px 12px 4px;border-bottom:1px solid #334155;display:flex;align-items:center;
+  justify-content:space-between;gap:8px;flex:none;font-weight:600}
+.ev-pane-controls{display:flex;align-items:center;gap:8px}
+.ev-pane-controls .zoom-buttons{display:inline-flex;background:#1e293b;border:1px solid #334155;
+  border-radius:3px;overflow:hidden}
+.ev-pane-controls .zoom-buttons button{background:transparent;color:#64748b;border:none;
+  padding:3px 8px;font-size:10px;cursor:pointer;border-right:1px solid #334155;
+  text-transform:none;letter-spacing:0;font-weight:400}
+.ev-pane-controls .zoom-buttons button:last-child{border-right:none}
+.ev-pane-controls .zoom-buttons button:hover{color:#94a3b8}
+.ev-pane-controls .zoom-buttons button.active{background:#0f172a;color:#38bdf8}
+.ev-pane-controls .ev-readout{color:#64748b;font-size:10px;font-variant-numeric:tabular-nums;
+  text-transform:none;letter-spacing:0;font-weight:400}
+.ev-pane-controls .ev-refresh{background:transparent;border:1px solid #334155;color:#94a3b8;
+  padding:3px 8px;border-radius:3px;cursor:pointer;font-size:10px;
+  text-transform:none;letter-spacing:0;font-weight:400}
+.ev-pane-controls .ev-refresh:hover{color:#e2e8f0}
+#ev-timeline{flex:1;overflow-y:auto;padding:2px 0;min-height:0}
+#ev-timeline .ev-empty{color:#64748b;padding:20px 14px;text-align:center;font-size:11px;
+  line-height:1.5}
+.ev-row{display:grid;grid-template-columns:72px auto auto 80px 1fr;gap:8px;
+  padding:6px 12px;border-bottom:1px solid #1e293b;cursor:pointer;font-size:11px;
+  align-items:center;line-height:1.3}
 .ev-row:hover{background:#1e293b}
-.ev-row.selected{background:#0c4a6e;border-left:3px solid #38bdf8;padding-left:11px}
-.ev-row .ev-time{color:#94a3b8;font-variant-numeric:tabular-nums;font-size:11px}
-.ev-row .ev-kind{font-size:10px;text-transform:uppercase;letter-spacing:0.06em;font-weight:600;
-  padding:3px 6px;border-radius:2px;text-align:center}
+.ev-row.selected{background:#0c4a6e;border-left:3px solid #38bdf8;padding-left:9px}
+.ev-row .ev-time{color:#94a3b8;font-variant-numeric:tabular-nums;font-size:10px}
+.ev-row .ev-kind{font-size:9px;text-transform:uppercase;letter-spacing:0.05em;font-weight:600;
+  padding:2px 5px;border-radius:2px;text-align:center;white-space:nowrap}
 .ev-row .ev-kind-anchor{background:#1d4ed8;color:#dbeafe}
-.ev-row .ev-kind-target{background:#1e293b;color:#94a3b8}
+.ev-row .ev-kind-target{background:#1e293b;color:#94a3b8;border:1px solid #334155}
 .ev-row .ev-kind-solved{background:#166534;color:#dcfce7}
 .ev-row .ev-kind-degraded{background:#854d0e;color:#fef3c7}
-.ev-row .ev-from{color:#e2e8f0;font-family:'SF Mono',Consolas,monospace;font-size:11px}
-.ev-row .ev-summary{color:#94a3b8;font-size:11px;overflow:hidden;text-overflow:ellipsis;
+.ev-row .ev-from{color:#e2e8f0;font-family:'SF Mono',Consolas,monospace;font-size:10px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ev-row .ev-trust{font-size:9px;text-align:left;text-transform:uppercase;letter-spacing:0.04em;
+  font-weight:600;white-space:nowrap}
+.ev-row .ev-summary{color:#94a3b8;font-size:10px;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}
-.ev-row .ev-trust{font-size:10px;text-align:right;text-transform:uppercase;letter-spacing:0.05em;
-  font-weight:600}
 .ev-trust-sample{color:#22c55e}
 .ev-trust-sync{color:#38bdf8}
 .ev-trust-software_lock{color:#f59e0b}
 .ev-trust-frame{color:#fb923c}
 .ev-trust-degraded{color:#ef4444}
-#ev-detail-pane{flex:0 0 380px;display:flex;flex-direction:column;overflow:hidden;min-width:0}
-#ev-detail-pane h3{margin:0;padding:10px 14px;font-size:11px;text-transform:uppercase;
-  letter-spacing:0.08em;color:#64748b;border-bottom:1px solid #334155}
-#ev-detail{flex:1;overflow-y:auto;padding:14px;font-size:12px;color:#cbd5e1}
-#ev-detail .ev-empty{color:#64748b;text-align:center;padding-top:40px;font-size:12px}
-#ev-detail h4{margin:14px 0 6px 0;font-size:11px;text-transform:uppercase;letter-spacing:0.06em;
+#ev-detail{flex:1;overflow-y:auto;padding:10px 12px;font-size:11px;color:#cbd5e1}
+#ev-detail .ev-empty{color:#64748b;text-align:center;padding-top:30px;font-size:11px;line-height:1.5}
+#ev-detail h4{margin:10px 0 4px 0;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;
   color:#64748b;font-weight:600}
 #ev-detail h4:first-child{margin-top:0}
-#ev-detail .kv{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px dotted #1e293b}
-#ev-detail .kv .k{color:#64748b;font-size:11px}
-#ev-detail .kv .v{color:#e2e8f0;font-size:12px;font-variant-numeric:tabular-nums;
-  font-family:'SF Mono',Consolas,monospace}
-#ev-detail table.ev-stations{width:100%;border-collapse:collapse;margin-top:4px;font-size:11px}
-#ev-detail table.ev-stations th{color:#64748b;text-transform:uppercase;font-size:10px;
-  letter-spacing:0.05em;text-align:left;padding:4px 6px;border-bottom:1px solid #334155}
-#ev-detail table.ev-stations td{color:#cbd5e1;padding:4px 6px;border-bottom:1px dotted #1e293b;
-  font-family:'SF Mono',Consolas,monospace;font-size:11px}
+#ev-detail .kv{display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px dotted #1e293b;
+  gap:8px}
+#ev-detail .kv .k{color:#64748b;font-size:10px;white-space:nowrap}
+#ev-detail .kv .v{color:#e2e8f0;font-size:11px;font-variant-numeric:tabular-nums;
+  font-family:'SF Mono',Consolas,monospace;text-align:right;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#ev-detail table.ev-stations{width:100%;border-collapse:collapse;margin-top:4px;font-size:10px}
+#ev-detail table.ev-stations th{color:#64748b;text-transform:uppercase;font-size:9px;
+  letter-spacing:0.05em;text-align:left;padding:3px 5px;border-bottom:1px solid #334155}
+#ev-detail table.ev-stations td{color:#cbd5e1;padding:3px 5px;border-bottom:1px dotted #1e293b;
+  font-family:'SF Mono',Consolas,monospace;font-size:10px}
 </style></head><body>
 <div id="bar">
   <span class="title">meshtastic-fusion</span>
@@ -217,56 +234,64 @@ button.danger:hover{background:#991b1b}
 </div>
 
 <div id="evidence" class="tab">
-  <div id="ev-health-strip">
-    <div class="ev-card">
-      <div class="ev-label">TDOA</div>
-      <div class="ev-value" id="ev-tdoa-state">--</div>
-      <div class="ev-sub" id="ev-tdoa-sub">checking</div>
+  <div id="ev-header">
+    <div id="ev-health-strip">
+      <div class="ev-card">
+        <div class="ev-label">TDOA</div>
+        <div class="ev-value" id="ev-tdoa-state">--</div>
+        <div class="ev-sub" id="ev-tdoa-sub">checking</div>
+      </div>
+      <div class="ev-card">
+        <div class="ev-label">Sensors</div>
+        <div class="ev-value" id="ev-sensors-count">0</div>
+        <div class="ev-sub" id="ev-sensors-sub">alive</div>
+      </div>
+      <div class="ev-card">
+        <div class="ev-label">Anchors</div>
+        <div class="ev-value" id="ev-anchors-count">0</div>
+        <div class="ev-sub" id="ev-anchors-sub">declared</div>
+      </div>
+      <div class="ev-card">
+        <div class="ev-label">Clock Pairs</div>
+        <div class="ev-value" id="ev-pairs-count">0</div>
+        <div class="ev-sub" id="ev-pairs-sub">converged</div>
+      </div>
+      <div class="ev-card">
+        <div class="ev-label">DB Rows</div>
+        <div class="ev-value" id="ev-db-clusters">0</div>
+        <div class="ev-sub" id="ev-db-sub">clusters / 0 fixes</div>
+      </div>
+      <div class="ev-card">
+        <div class="ev-label">Schema</div>
+        <div class="ev-value" id="ev-schema">--</div>
+        <div class="ev-sub" id="ev-schema-sub">replay disabled</div>
+      </div>
     </div>
-    <div class="ev-card">
-      <div class="ev-label">Sensors</div>
-      <div class="ev-value" id="ev-sensors-count">0</div>
-      <div class="ev-sub" id="ev-sensors-sub">alive</div>
-    </div>
-    <div class="ev-card">
-      <div class="ev-label">Anchors</div>
-      <div class="ev-value" id="ev-anchors-count">0</div>
-      <div class="ev-sub" id="ev-anchors-sub">declared</div>
-    </div>
-    <div class="ev-card">
-      <div class="ev-label">Clock Pairs</div>
-      <div class="ev-value" id="ev-pairs-count">0</div>
-      <div class="ev-sub" id="ev-pairs-sub">converged</div>
-    </div>
-    <div class="ev-card">
-      <div class="ev-label">DB Rows</div>
-      <div class="ev-value" id="ev-db-clusters">0</div>
-      <div class="ev-sub" id="ev-db-sub">clusters / 0 fixes</div>
-    </div>
-    <div class="ev-card">
-      <div class="ev-label">Schema</div>
-      <div class="ev-value" id="ev-schema">--</div>
-      <div class="ev-sub" id="ev-schema-sub">replay disabled</div>
-    </div>
+    <div id="ev-persisted-banner" style="display:none"></div>
+    <div id="ev-warnings"></div>
   </div>
-  <div id="ev-persisted-banner" style="display:none;padding:10px 18px 0;color:#94a3b8;font-size:12px"></div>
-  <div id="ev-warnings"></div>
-  <div id="ev-controls">
-    <div class="zoom-buttons" id="ev-zoom">
-      <button data-zoom="15m">15m</button>
-      <button data-zoom="1h" class="active">1h</button>
-      <button data-zoom="6h">6h</button>
-      <button data-zoom="24h">24h</button>
+  <div id="evidence-grid">
+    <div id="ev-map-pane">
+      <div id="ev-map"></div>
+      <div id="ev-map-empty">No solved fixes in this window.<br>Solved emitter positions plot here as TDOA solves arrive.</div>
     </div>
-    <span class="ev-readout" id="ev-range-readout">last 1h</span>
-    <button class="ev-refresh" onclick="evidenceRefresh()">Refresh</button>
-  </div>
-  <div id="ev-main">
-    <div id="ev-timeline-pane">
-      <h3>Timeline</h3>
+    <div class="ev-pane" id="ev-timeline-pane">
+      <h3>
+        <span>Timeline</span>
+        <span class="ev-pane-controls">
+          <div class="zoom-buttons" id="ev-zoom">
+            <button data-zoom="15m">15m</button>
+            <button data-zoom="1h" class="active">1h</button>
+            <button data-zoom="6h">6h</button>
+            <button data-zoom="24h">24h</button>
+          </div>
+          <span class="ev-readout" id="ev-range-readout">last 1h</span>
+          <button class="ev-refresh" onclick="evidenceRefresh()">↻</button>
+        </span>
+      </h3>
       <div id="ev-timeline"><div class="ev-empty">Loading…</div></div>
     </div>
-    <div id="ev-detail-pane">
+    <div class="ev-pane" id="ev-detail-pane">
       <h3>Detail</h3>
       <div id="ev-detail"><div class="ev-empty">Click a timeline row to see per-event detail: station participation, clock-sync snapshot, solve summary.</div></div>
     </div>
@@ -367,7 +392,11 @@ function showTab(name){
     document.getElementById('tab-'+t).classList.toggle('active',t===name);
   }
   if(name==='sensors') refreshSensors();
-  if(name==='evidence') evidenceRefresh();
+  if(name==='evidence') {
+    evidenceMapInit();
+    setTimeout(()=>{ if (evidenceMap) evidenceMap.invalidateSize(); }, 60);
+    evidenceRefresh();
+  }
   if(name==='topology') topoStart(); else if (typeof topoStop==='function') topoStop();
   if(name==='live') setTimeout(()=>map.invalidateSize(),60);
 }
@@ -992,7 +1021,22 @@ let evidenceZoom = '1h';
 let evidenceData = { summary: null, fixes: [], clusters: [], pairs: [], warnings: [] };
 let evidenceSelected = null; // {kind, id} of the currently-highlighted row
 
+// Evidence map: dedicated Leaflet instance (NOT the Live map).
+// the two maps have different jobs -- Live is real-time situational
+// awareness, Evidence is post-hoc investigation. Sharing the Leaflet helper
+// is fine; sharing the map state is not.
+let evidenceMap = null;
+const evidenceMarkers = new Map(); // rowKey -> {marker, fix}
+let evidenceMapAutoFit = false;
+
 const ZOOM_NS = { '15m': 15*60*1e9, '1h': 60*60*1e9, '6h': 6*60*60*1e9, '24h': 24*60*60*1e9 };
+
+function evidenceMapInit(){
+  if (evidenceMap) return;
+  evidenceMap = L.map('ev-map', { zoomControl: true }).setView([39.5, -98.0], 4);
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+    { maxZoom: 19, attribution: '(c) OSM (c) CARTO' }).addTo(evidenceMap);
+}
 
 document.querySelectorAll('#ev-zoom button').forEach(b=>{
   b.addEventListener('click', ()=>{
@@ -1035,7 +1079,74 @@ async function evidenceRefresh(){
   };
   evidenceRenderHealth();
   evidenceRenderWarnings();
+  evidenceRenderMap();
   evidenceRenderTimeline();
+}
+
+// evidenceRenderMap repopulates the Evidence-tab map from the current
+// fixes list. Pins are tinted by trust class (sync vs software_lock /
+// frame); the currently-selected timeline row's pin is larger and
+// styled in cyan. Auto-fits the map bounds on first render with
+// content, then leaves the view alone so a user pan/zoom is not
+// repeatedly reset by refreshes.
+function evidenceRenderMap(){
+  if (!evidenceMap) return;
+  evidenceMarkers.forEach(m => m.marker.remove());
+  evidenceMarkers.clear();
+  const fixes = evidenceData.fixes || [];
+  const emptyOverlay = document.getElementById('ev-map-empty');
+  if (fixes.length === 0) {
+    if (emptyOverlay) emptyOverlay.style.display = 'flex';
+    return;
+  }
+  if (emptyOverlay) emptyOverlay.style.display = 'none';
+  const TRUST_COLOR = {
+    sample: '#22c55e',
+    sync: '#38bdf8',
+    software_lock: '#f59e0b',
+    frame: '#fb923c',
+  };
+  const latlngs = [];
+  for (const f of fixes) {
+    if (typeof f.lat !== 'number' || typeof f.lon !== 'number') continue;
+    if (f.lat === 0 && f.lon === 0) continue;
+    const color = TRUST_COLOR[f.timestamp_class] || '#94a3b8';
+    const m = L.circleMarker([f.lat, f.lon], {
+      radius: 7, color: color, weight: 2, fillColor: color, fillOpacity: 0.45,
+    }).addTo(evidenceMap);
+    const lockStr = f.timestamp_class ? f.timestamp_class.toUpperCase() : '';
+    m.bindPopup('<b>' + escHtml(f.from) + '</b>' +
+      (f.emission_seq > 0 ? (' #'+f.emission_seq) : '') +
+      '<br>±' + (f.uncertainty_m||0).toFixed(1) + ' m · ' + (f.station_count||0) + ' stations' +
+      (lockStr ? ('<br><span style="color:'+color+'">'+escHtml(lockStr)+'</span>') : ''));
+    const rowKey = f.from + '|' + f.packet_id + '|' + (f.emission_seq || 0);
+    m.on('click', () => {
+      evidenceSelected = rowKey;
+      // Re-render timeline so the matching row highlights, then scroll to it.
+      evidenceRenderTimeline();
+      const sel = document.querySelector('#ev-timeline .ev-row.selected');
+      if (sel) sel.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
+    evidenceMarkers.set(rowKey, { marker: m, fix: f });
+    latlngs.push([f.lat, f.lon]);
+  }
+  // Auto-fit once. After the first non-empty render leave panning alone so
+  // an operator who zoomed in to inspect a fix doesn't get yanked away on
+  // the next refresh.
+  if (!evidenceMapAutoFit && latlngs.length > 0) {
+    evidenceMap.fitBounds(latlngs, { padding: [40, 40], maxZoom: 14 });
+    evidenceMapAutoFit = true;
+  }
+}
+
+// evidenceHighlightFix pans the Evidence map to a fix and pops its popup.
+// Called when a timeline row is clicked.
+function evidenceHighlightFix(rowKey){
+  if (!evidenceMap) return;
+  const entry = evidenceMarkers.get(rowKey);
+  if (!entry) return;
+  evidenceMap.panTo(entry.marker.getLatLng(), { animate: true });
+  entry.marker.openPopup();
 }
 
 function evidenceRenderHealth(){
@@ -1183,8 +1294,8 @@ function evidenceRenderTimeline(){
       '<div class="ev-time">'+escHtml(tstr)+'</div>' +
       '<div class="ev-kind ev-kind-'+r.kind+'">'+escHtml(r.kind)+'</div>' +
       '<div class="ev-from">'+escHtml(r.from)+(r.emissionSeq>0?(':#'+r.emissionSeq):'')+'</div>' +
-      '<div class="ev-summary">'+escHtml(r.summary)+'</div>' +
-      '<div class="'+trustClass+'">'+escHtml(trustText)+'</div>';
+      '<div class="'+trustClass+'">'+escHtml(trustText)+'</div>' +
+      '<div class="ev-summary">'+escHtml(r.summary)+'</div>';
     const rowKey = r.from + '|' + r.packetId + '|' + r.emissionSeq;
     row.addEventListener('click', () => evidenceShowDetail(r, row));
     if (evidenceSelected === rowKey) row.classList.add('selected');
@@ -1197,6 +1308,9 @@ function evidenceShowDetail(r, rowEl){
   document.querySelectorAll('#ev-timeline .ev-row').forEach(x=>x.classList.remove('selected'));
   rowEl.classList.add('selected');
   evidenceSelected = r.from + '|' + r.packetId + '|' + r.emissionSeq;
+  // Pan + open popup for the matching map marker. No-op when the row is
+  // an unsolved cluster (no fix -> no marker on the map).
+  evidenceHighlightFix(evidenceSelected);
   const host = document.getElementById('ev-detail');
   let html = '';
   html += '<h4>Event</h4>';
