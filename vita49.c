@@ -140,26 +140,35 @@ static void vrt_handle_context(const uint8_t *vrt, size_t vrt_len,
     if (have_sr) {
         fprintf(stderr, "vita49: context reports sample_rate=%.0f Hz\n",
                 ctx_samp_rate);
-        if (samp_rate == 0.0 || opt_sample_rate == 0) {
+        if (opt_sample_rate == 0) {
             /* User didn't set --rate; adopt the context value so the
-             * channelizer comes up correctly without operator intervention. */
+             * channelizer comes up correctly without operator intervention.
+             * Test against opt_sample_rate, not samp_rate: this runs before
+             * resolve_rf_defaults(), so samp_rate is still 0 here regardless
+             * of any --rate the user passed. */
             samp_rate = ctx_samp_rate;
             fprintf(stderr, "vita49: adopting sample_rate from context\n");
-        } else if (ctx_samp_rate - samp_rate > 1.0 || samp_rate - ctx_samp_rate > 1.0)
-            fprintf(stderr, "vita49: WARNING: source sample rate %.0f Hz "
-                    "differs from -r %.0f Hz\n", ctx_samp_rate, samp_rate);
+        } else {
+            double cli = (double)opt_sample_rate;
+            if (ctx_samp_rate - cli > 1.0 || cli - ctx_samp_rate > 1.0)
+                fprintf(stderr, "vita49: WARNING: source sample rate %.0f Hz "
+                        "differs from -r %.0f Hz\n", ctx_samp_rate, cli);
+        }
     }
 
     if (have_rf) {
         fprintf(stderr, "vita49: context reports rf_freq=%.0f Hz\n",
                 rf_freq_hz);
-        if (center_freq == 0.0 || opt_center_freq_hz == 0) {
+        if (opt_center_freq_hz == 0) {
             center_freq = rf_freq_hz;
             fprintf(stderr, "vita49: adopting center_freq from context\n");
-        } else if (rf_freq_hz - center_freq > 1.0 || center_freq - rf_freq_hz > 1.0)
-            fprintf(stderr, "vita49: WARNING: source RF freq %.0f Hz "
-                    "differs from center_freq %.0f Hz\n",
-                    rf_freq_hz, center_freq);
+        } else {
+            double cli = (double)opt_center_freq_hz;
+            if (rf_freq_hz - cli > 1.0 || cli - rf_freq_hz > 1.0)
+                fprintf(stderr, "vita49: WARNING: source RF freq %.0f Hz "
+                        "differs from center_freq %.0f Hz\n",
+                        rf_freq_hz, cli);
+        }
     }
 }
 

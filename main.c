@@ -1636,14 +1636,23 @@ static uint32_t backend_default_rate(sdr_backend_t b)
 
 static void resolve_rf_defaults(void)
 {
-    /* User-specified rate wins; otherwise pick from the backend table. */
+    /* Precedence: an explicit CLI flag wins; otherwise keep any value the
+     * VITA-49 listener already adopted from an IF-context packet (it writes
+     * samp_rate / center_freq directly before we run); only then fall back to
+     * the backend/region default. The bare clobber here used to wipe the
+     * adopted context rate back to the backend default (0 for VITA-49),
+     * turning a context-supplied stream into a fatal "rate not set" error. */
     if (opt_sample_rate) {
         samp_rate = (double)opt_sample_rate;
-    } else {
+    } else if (samp_rate == 0.0) {
         samp_rate = (double)backend_default_rate(opt_sdr_backend);
     }
-    center_freq = (double)opt_center_freq_hz;
-    if (center_freq != 0.0) return;
+
+    if (opt_center_freq_hz != 0) {
+        center_freq = (double)opt_center_freq_hz;
+        return;
+    }
+    if (center_freq != 0.0) return;  /* adopted from VITA-49 context */
 
     /* Derive: place center at the midpoint of the (region, preset) coverage. */
     const mesh_region_t *r = mesh_lookup_region(opt_region ? opt_region : "US");
