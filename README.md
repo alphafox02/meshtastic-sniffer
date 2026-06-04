@@ -117,7 +117,8 @@ CMake prints which backends it found. Run `./meshtastic-sniffer --list` to confi
 # Replay an IQ file:
 ./meshtastic-sniffer --file=capture.cf32 --keys=default
 
-# Network IQ in (VITA-49):
+# Network IQ in (VITA-49): rate, RF freq, and IQ format are taken from the
+# sender's IF-context packets -- add --iq-format only if the sender omits it.
 ./meshtastic-sniffer --vita49=4991 --keys=default
 
 # List attached SDRs:
@@ -144,7 +145,7 @@ The number of channels demodulated at once is set by the SDR's analog bandwidth 
 | Airspy R2 / Mini | 10 MHz | One BW group + adjacent presets |
 | RTL-SDR (R820T) | 2.0 MHz | One BW group, ~8 LongFast slots |
 | SoapySDR (LimeSDR, PlutoSDR, ...) | varies | Per-device |
-| VITA-49 / VRT (network) | varies | Sample rate + freq from the IF-context packets |
+| VITA-49 / VRT (network) | varies | Sample rate, freq + IQ format from the IF-context packets |
 | IQ file | — | `.sigmf-meta` sibling auto-loads rate/freq/format |
 
 `--list` enumerates everything attached.

@@ -115,6 +115,7 @@ extern int          opt_extra_freq_count;
 /* SDR / file input */
 extern char       *opt_input_file;       /* IQ file path for FILE backend */
 extern iq_format_t iq_format;            /* FMT_CI8 / FMT_CI16 / FMT_CF32 */
+extern bool        opt_iq_format_set;    /* true if --iq-format given on CLI */
 
 /* Per-backend gain controls */
 extern int  hackrf_lna_gain;             /* 0..40 step 8 */

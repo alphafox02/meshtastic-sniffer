@@ -3102,7 +3102,7 @@ static int run_live(void)
                 opt_sample_rate = (uint32_t)m.sample_rate;
             if (m.have_frequency && opt_center_freq_hz == 0)
                 opt_center_freq_hz = (uint64_t)m.frequency_hz;
-            if (m.have_datatype && iq_format == FMT_CI8)
+            if (m.have_datatype && !opt_iq_format_set)
                 iq_format = m.datatype;
             fprintf(stderr, "sigmf: loaded metadata for %s "
                             "(rate=%g freq=%g datatype=%d)\n",
