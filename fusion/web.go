@@ -455,6 +455,11 @@ func evidenceClustersHandler(store *EventStore) http.HandlerFunc {
 		if records == nil {
 			records = []ClusterObservationRecord{}
 		}
+		// Populate the string-form ns identifier so the browser has a
+		// precision-preserving handle to POST back to /api/resolve.
+		for i := range records {
+			records[i].ClusterTimeNsS = strconv.FormatUint(records[i].ClusterTimeNs, 10)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"start_ns":  start,
@@ -522,6 +527,10 @@ func evidenceFixesHandler(store *EventStore) http.HandlerFunc {
 		}
 		if records == nil {
 			records = []SolvedFixRecord{}
+		}
+		for i := range records {
+			records[i].EventTimeNsS = strconv.FormatUint(records[i].EventTimeNs, 10)
+			records[i].SolutionTimeNsS = strconv.FormatUint(records[i].SolutionTimeNs, 10)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{

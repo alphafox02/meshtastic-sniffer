@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -43,12 +44,53 @@ import (
 // ResolveRequest is the POST /api/resolve wire format. Fields mirror
 // the timeline-row keys the Evidence tab already has, so the UI button
 // just forwards what it already knows.
+//
+// EventTimeNs is decoded via UnmarshalJSON to accept either a JSON
+// number or a JSON string. The browser must send a string for any
+// timestamp past JS's safe-integer range (~9e15) -- a JSON number would
+// be silently rounded before transit and the backend's 1 ns key lookup
+// would miss the row.
 type ResolveRequest struct {
 	From        string `json:"from"`
 	PacketID    uint32 `json:"packet_id"`
 	EmissionSeq int    `json:"emission_seq,omitempty"`
 	EventTimeNs uint64 `json:"event_time_ns"`
-	Mode        string `json:"mode,omitempty"` // "event_time" (default) | "current_model" (deferred)
+	Mode        string `json:"mode,omitempty"` // "event_time" (default) | "current_model" (Advanced)
+}
+
+// UnmarshalJSON accepts event_time_ns as either a JSON number or a
+// base-10 JSON string so callers that care about precision can send
+// the string form. Other fields decode through the normal struct path.
+func (req *ResolveRequest) UnmarshalJSON(data []byte) error {
+	type rawReq struct {
+		From        string          `json:"from"`
+		PacketID    uint32          `json:"packet_id"`
+		EmissionSeq int             `json:"emission_seq,omitempty"`
+		EventTimeNs json.RawMessage `json:"event_time_ns"`
+		Mode        string          `json:"mode,omitempty"`
+	}
+	var r rawReq
+	if err := json.Unmarshal(data, &r); err != nil {
+		return err
+	}
+	req.From = r.From
+	req.PacketID = r.PacketID
+	req.EmissionSeq = r.EmissionSeq
+	req.Mode = r.Mode
+	raw := strings.TrimSpace(string(r.EventTimeNs))
+	if raw == "" || raw == "null" {
+		req.EventTimeNs = 0
+		return nil
+	}
+	if raw[0] == '"' && raw[len(raw)-1] == '"' {
+		raw = raw[1 : len(raw)-1]
+	}
+	n, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return fmt.Errorf("event_time_ns: %w", err)
+	}
+	req.EventTimeNs = n
+	return nil
 }
 
 func (req *ResolveRequest) eventID() string {

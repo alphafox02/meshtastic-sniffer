@@ -1372,12 +1372,20 @@ function evidenceRenderTimeline(){
     fixByKey.set(f.from + '|' + f.packet_id + '|' + (f.emission_seq || 0), f);
   }
   const rows = [];
+  // timeNs MUST be the *_s string form when available. The numeric
+  // event_time_ns / cluster_time_ns get rounded by JS when they exceed
+  // Number.MAX_SAFE_INTEGER (~9e15); current Unix nanosecond timestamps
+  // are ~1.7e18, well past that, so the rounded value won't match the
+  // exact bbolt key the backend uses for /api/resolve lookups. The
+  // backend populates ClusterTimeNsS / EventTimeNsS for new responses;
+  // older snapshots that lack it fall back to the numeric field for
+  // display only.
   for (const c of evidenceData.clusters) {
     const k = c.from + '|' + c.packet_id + '|' + (c.emission_seq || 0);
     const fix = fixByKey.get(k);
     const obsCount = (c.observations || []).length;
     rows.push({
-      timeNs: c.cluster_time_ns,
+      timeNs: c.cluster_time_ns_s || String(c.cluster_time_ns),
       kind: fix ? 'solved' : (c.low_trust ? 'degraded' : 'target'),
       from: c.from,
       packetId: c.packet_id,
@@ -1397,7 +1405,7 @@ function evidenceRenderTimeline(){
   // cluster row) still shows up so the timeline doesn't lie about solves.
   for (const fix of fixByKey.values()) {
     rows.push({
-      timeNs: fix.event_time_ns,
+      timeNs: fix.event_time_ns_s || String(fix.event_time_ns),
       kind: 'solved',
       from: fix.from,
       packetId: fix.packet_id,
@@ -1410,7 +1418,10 @@ function evidenceRenderTimeline(){
       fix: fix,
     });
   }
-  rows.sort((a,b) => Number(b.timeNs) - Number(a.timeNs)); // newest first
+  // timeNs is a base-10 string. All current Unix-ns timestamps are the
+  // same digit length (19), so lexicographic sort matches numeric order
+  // without needing BigInt or Number coercion.
+  rows.sort((a,b) => (b.timeNs > a.timeNs) ? 1 : ((b.timeNs < a.timeNs) ? -1 : 0));
   if (rows.length === 0) {
     const persisted = evidenceData.summary && evidenceData.summary.persisted;
     const total = persisted ?
@@ -1506,7 +1517,7 @@ async function evidenceReplay(r, btn, mode){
         from: r.from,
         packet_id: r.packetId,
         emission_seq: r.emissionSeq,
-        event_time_ns: Number(r.timeNs),
+        event_time_ns: r.timeNs,
         mode: mode,
       }),
     });

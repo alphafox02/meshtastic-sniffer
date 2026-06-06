@@ -826,6 +826,96 @@ func TestAPI_Resolve_CurrentModel_Happy(t *testing.T) {
 	}
 }
 
+// TestAPI_Resolve_AcceptsStringEventTimeNs: the resolve endpoint must
+// accept event_time_ns as a JSON string so callers can preserve full
+// 64-bit precision through environments (browsers, JS-based clients,
+// some JSON parsers) that round numbers past Number.MAX_SAFE_INTEGER.
+// Picks an event_time_ns with non-zero low bits below 2^53 so the
+// rounded form would differ from the exact form -- proves the handler
+// is not silently re-parsing through a float.
+func TestAPI_Resolve_AcceptsStringEventTimeNs(t *testing.T) {
+	s := openTestStore(t)
+	const eventNs = uint64(1_770_000_000_000_000_123)
+	rec := &ClusterObservationRecord{
+		From: "!stringevt", PacketID: 7, EmissionSeq: 0,
+		ClusterTimeNs:   eventNs,
+		FirstSeenWallNs: eventNs + 1,
+		Preset:          "MediumFast",
+		Observations: []ClusterObservationStation{
+			{Station: "alpha", StationLat: 39.010, StationLon: -98.010, StationTNs: eventNs + 5_000_000, StationTAccNs: 1_000_000, PreambleLockTNs: eventNs, SnrDB: 8},
+			{Station: "bravo", StationLat: 39.000, StationLon: -98.012, StationTNs: eventNs + 5_000_000, StationTAccNs: 1_000_000, PreambleLockTNs: eventNs + 20_000, SnrDB: 6},
+			{Station: "delta", StationLat: 38.988, StationLon: -98.002, StationTNs: eventNs + 5_000_000, StationTAccNs: 1_000_000, PreambleLockTNs: eventNs + 25_000, SnrDB: 7},
+		},
+	}
+	if err := s.WriteClusterObservation(rec); err != nil {
+		t.Fatalf("seed cluster: %v", err)
+	}
+	hub := newSSEHub()
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithHub(t, r, hub, s, "")
+
+	// String form -- this is what the UI now sends.
+	body := fmt.Sprintf(`{"from":"!stringevt","packet_id":7,"emission_seq":0,"event_time_ns":"%d","mode":"event_time"}`, eventNs)
+	req := httptest.NewRequest(http.MethodPost, "/api/resolve", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("string form status=%d want 200; body=%s", w.Code, w.Body.String())
+	}
+	var ack struct {
+		SourceEventID string `json:"source_event_id"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&ack)
+	wantID := fmt.Sprintf("!stringevt|7|0|%d", eventNs)
+	if ack.SourceEventID != wantID {
+		t.Errorf("source_event_id=%q want %q (event_time_ns lost precision through string round-trip)", ack.SourceEventID, wantID)
+	}
+
+	// Numeric form must also still work for older clients.
+	body2 := fmt.Sprintf(`{"from":"!stringevt","packet_id":7,"emission_seq":0,"event_time_ns":%d,"mode":"event_time"}`, eventNs)
+	req2 := httptest.NewRequest(http.MethodPost, "/api/resolve", strings.NewReader(body2))
+	req2.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("numeric form status=%d want 200; body=%s", w2.Code, w2.Body.String())
+	}
+}
+
+// TestAPI_Evidence_ClusterTimeNsS_Populated: the clusters endpoint
+// must include a string-form cluster_time_ns_s alongside the numeric
+// cluster_time_ns so the browser has a precision-preserving handle.
+func TestAPI_Evidence_ClusterTimeNsS_Populated(t *testing.T) {
+	s := openTestStore(t)
+	const ts = uint64(1_770_000_000_000_000_123)
+	if err := s.WriteClusterObservation(&ClusterObservationRecord{
+		From: "!a", PacketID: 1, ClusterTimeNs: ts,
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithStore(t, r, nil, s, "")
+	q := fmt.Sprintf("?start_ns=%d&end_ns=%d", ts-1, ts+1)
+	req := httptest.NewRequest(http.MethodGet, "/api/evidence/clusters"+q, nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200", w.Code)
+	}
+	var got struct {
+		Records []ClusterObservationRecord `json:"records"`
+	}
+	_ = json.NewDecoder(w.Body).Decode(&got)
+	if len(got.Records) != 1 {
+		t.Fatalf("records=%d want 1", len(got.Records))
+	}
+	wantS := fmt.Sprintf("%d", ts)
+	if got.Records[0].ClusterTimeNsS != wantS {
+		t.Errorf("cluster_time_ns_s=%q want %q", got.Records[0].ClusterTimeNsS, wantS)
+	}
+}
+
 // TestAPI_Resolve_BadInputs: missing fields -> 400; bad JSON -> 400;
 // unknown mode -> 400; wrong method -> 405.
 func TestAPI_Resolve_BadInputs(t *testing.T) {

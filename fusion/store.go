@@ -323,10 +323,17 @@ func ensureDir(dir string) error {
 // StationDupesSuppressed counts per-station collisions resolved by
 // keeping the better observation (higher class, then higher SNR).
 type ClusterObservationRecord struct {
-	From                   string                      `json:"from"`
-	PacketID               uint32                      `json:"packet_id"`
-	EmissionSeq            int                         `json:"emission_seq,omitempty"`
-	ClusterTimeNs          uint64                      `json:"cluster_time_ns"`
+	From          string `json:"from"`
+	PacketID      uint32 `json:"packet_id"`
+	EmissionSeq   int    `json:"emission_seq,omitempty"`
+	ClusterTimeNs uint64 `json:"cluster_time_ns"`
+	// ClusterTimeNsS mirrors ClusterTimeNs as a base-10 string. Unix
+	// nanosecond timestamps (~1.7e18) exceed JavaScript's safe-integer
+	// range (2^53 ~= 9e15); reading the numeric field in a browser
+	// silently rounds. Consumers that need an exact identifier (e.g.
+	// the Evidence-tab "Replay" button) must use the string form.
+	// Populated by the HTTP handler before encoding; never persisted.
+	ClusterTimeNsS         string                      `json:"cluster_time_ns_s,omitempty"`
 	FirstSeenWallNs        uint64                      `json:"first_seen_wall_ns"`
 	Preset                 string                      `json:"preset,omitempty"`
 	SF                     int                         `json:"sf,omitempty"`
@@ -629,11 +636,16 @@ func (s *EventStore) CountPairSnapshots() (int, error) {
 // sort key).
 type SolvedFixRecord struct {
 	EventTimeNs    uint64 `json:"event_time_ns"`
-	SolutionTimeNs uint64 `json:"solution_time_ns"`
-	From           string `json:"from"`
-	PacketID       uint32 `json:"packet_id"`
-	EmissionSeq    int    `json:"emission_seq,omitempty"`
-	ClusterKey     string `json:"cluster_key"`
+	// EventTimeNsS / SolutionTimeNsS mirror the uint64s as base-10
+	// strings. See ClusterObservationRecord.ClusterTimeNsS for why JS
+	// number precision forces string identifiers on the wire.
+	EventTimeNsS    string `json:"event_time_ns_s,omitempty"`
+	SolutionTimeNs  uint64 `json:"solution_time_ns"`
+	SolutionTimeNsS string `json:"solution_time_ns_s,omitempty"`
+	From            string `json:"from"`
+	PacketID        uint32 `json:"packet_id"`
+	EmissionSeq     int    `json:"emission_seq,omitempty"`
+	ClusterKey      string `json:"cluster_key"`
 
 	Lat            float64 `json:"lat"`
 	Lon            float64 `json:"lon"`
