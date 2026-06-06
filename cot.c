@@ -30,6 +30,40 @@ static struct sockaddr_in g_dst;
 static bool               g_active = false;
 static pthread_mutex_t    g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* xml_escape copies src to dst replacing XML metacharacters with their
+ * entity forms. NUL-terminates and truncates rather than overflowing.
+ * Callers should size dst generously -- worst case is '&' expanding to
+ * "&amp;" (5x). Source strings can be arbitrary user-controlled bytes
+ * (remote NODEINFO long_name, operator station-id, channel names);
+ * unescaped insertion into CoT XML attributes/text would corrupt the
+ * wire format for the ATAK receiver and in the worst case inject extra
+ * XML structure. */
+static void xml_escape(char *dst, size_t dst_sz, const char *src)
+{
+    if (!dst || dst_sz == 0) return;
+    size_t di = 0;
+    if (!src) { dst[0] = 0; return; }
+    for (; *src && di + 1 < dst_sz; ++src) {
+        const char *ent = NULL;
+        size_t      el = 0;
+        switch ((unsigned char)*src) {
+            case '<':  ent = "&lt;";   el = 4; break;
+            case '>':  ent = "&gt;";   el = 4; break;
+            case '&':  ent = "&amp;";  el = 5; break;
+            case '"':  ent = "&quot;"; el = 6; break;
+            case '\'': ent = "&apos;"; el = 6; break;
+        }
+        if (ent) {
+            if (di + el + 1 > dst_sz) break;
+            memcpy(dst + di, ent, el);
+            di += el;
+        } else {
+            dst[di++] = *src;
+        }
+    }
+    dst[di] = 0;
+}
+
 int cot_set_endpoint(const char *host, int port)
 {
     pthread_mutex_lock(&g_lock);
@@ -147,18 +181,25 @@ void cot_publish_atak(const mesh_event_t *ev, const mesh_atak_t *atak)
     iso8601_now(stale, sizeof(stale), 60);
 
     /* UID format: MESH[-<station>]-<callsign-or-!nodeid>. Multi-station
-     * deployments set --station-id so CoT UIDs don't collide across rxers. */
+     * deployments set --station-id so CoT UIDs don't collide across rxers.
+     * station-id and callsign are user-controlled (operator config, remote
+     * NODEINFO long_name); escape both before XML insertion to keep the
+     * CoT wire format honest even when a node names itself "<script>". */
     const char *station = (opt_station_id && *opt_station_id) ? opt_station_id : NULL;
-    char uid[96];
-    if (atak->callsign[0]) {
-        if (station) snprintf(uid, sizeof(uid), "MESH-%s-%s", station, atak->callsign);
-        else         snprintf(uid, sizeof(uid), "MESH-%s",    atak->callsign);
+    char esc_station[128] = "";
+    char esc_callsign[256] = "";
+    if (station) xml_escape(esc_station, sizeof(esc_station), station);
+    xml_escape(esc_callsign, sizeof(esc_callsign), atak->callsign);
+    char uid[512];
+    if (esc_callsign[0]) {
+        if (esc_station[0]) snprintf(uid, sizeof(uid), "MESH-%s-%s", esc_station, esc_callsign);
+        else                snprintf(uid, sizeof(uid), "MESH-%s",    esc_callsign);
     } else {
-        if (station) snprintf(uid, sizeof(uid), "MESH-%s-!%08x", station, ev->header.from);
-        else         snprintf(uid, sizeof(uid), "MESH-!%08x",    ev->header.from);
+        if (esc_station[0]) snprintf(uid, sizeof(uid), "MESH-%s-!%08x", esc_station, ev->header.from);
+        else                snprintf(uid, sizeof(uid), "MESH-!%08x",    ev->header.from);
     }
 
-    char xml[1024];
+    char xml[1536];
     int n = snprintf(xml, sizeof(xml),
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
         "<event version=\"2.0\" uid=\"%s\" type=\"%s\" time=\"%s\" start=\"%s\" stale=\"%s\" how=\"m-g\">"
@@ -173,7 +214,7 @@ void cot_publish_atak(const mesh_event_t *ev, const mesh_atak_t *atak)
         "</event>",
         uid, cot_type_for_atak(atak), now, now, stale,
         atak->lat_deg, atak->lon_deg, atak->altitude_hae_m,
-        atak->callsign[0] ? atak->callsign : uid,
+        esc_callsign[0] ? esc_callsign : uid,
         mesh_atak_team_name(atak->team), mesh_atak_role_name(atak->role),
         atak->speed_mps, atak->course_deg, atak->battery,
         ev->header.from);
@@ -186,50 +227,63 @@ void cot_publish_position(const mesh_event_t *ev, const mesh_position_t *pos)
     if (!g_active) return;
     if (!pos->have_lat || !pos->have_lon) return;
 
-    /* Look up callsign from NODEINFO cache; fall back to !nodeid. */
+    /* Look up callsign from NODEINFO cache; fall back to !nodeid.
+     * long_name is whatever the remote node set in its NODEINFO --
+     * arbitrary user-controlled bytes, must be entity-escaped before
+     * landing in CoT XML attributes/text. */
     node_record_t rec;
-    char callsign[NODE_DB_LONG_NAME];
+    char callsign_raw[NODE_DB_LONG_NAME];
     if (node_db_lookup(ev->header.from, &rec) && rec.long_name[0]) {
-        strncpy(callsign, rec.long_name, sizeof(callsign) - 1);
-        callsign[sizeof(callsign) - 1] = 0;
+        strncpy(callsign_raw, rec.long_name, sizeof(callsign_raw) - 1);
+        callsign_raw[sizeof(callsign_raw) - 1] = 0;
     } else {
-        snprintf(callsign, sizeof(callsign), "!%08x", ev->header.from);
+        snprintf(callsign_raw, sizeof(callsign_raw), "!%08x", ev->header.from);
     }
+    char callsign[sizeof(callsign_raw) * 6];
+    xml_escape(callsign, sizeof(callsign), callsign_raw);
 
     char now[40], stale[40];
     iso8601_now(now,   sizeof(now),    0);
     iso8601_now(stale, sizeof(stale), 300);
 
     const char *station = (opt_station_id && *opt_station_id) ? opt_station_id : NULL;
-    char uid[96];
-    if (station) snprintf(uid, sizeof(uid), "MESH-%s-!%08x", station, ev->header.from);
-    else         snprintf(uid, sizeof(uid), "MESH-!%08x", ev->header.from);
+    char esc_station[128] = "";
+    if (station) xml_escape(esc_station, sizeof(esc_station), station);
+    char uid[512];
+    if (esc_station[0]) snprintf(uid, sizeof(uid), "MESH-%s-!%08x", esc_station, ev->header.from);
+    else                snprintf(uid, sizeof(uid), "MESH-!%08x", ev->header.from);
 
     /* Build remarks string with all the operator-relevant context: which
      * preset/SF/CR/BW the frame came in on, RSSI/SNR if available, hop info,
      * and channel name when decryption matched. Lets a CoT consumer (ATAK)
-     * tell traffic on different physical pipes apart. */
-    char remarks[384];
+     * tell traffic on different physical pipes apart. Build in plain text
+     * first, then entity-escape the whole thing as one piece before the
+     * XML snprintf -- preset_name and channel_name are operator/key-spec
+     * controlled and have shown up with unusual characters in the wild. */
+    char remarks_raw[384];
     int rn = 0;
-    rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+    rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
                    "from=!%08x", ev->header.from);
     if (ev->preset_name[0])
-        rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+        rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
                        " preset=%s", ev->preset_name);
     if (ev->sf > 0)
-        rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+        rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
                        " SF%d/CR4-%d/BW%d", ev->sf, ev->cr, ev->bw_hz);
     if (ev->channel_name[0])
-        rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+        rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
                        " ch=%s", ev->channel_name);
     if (ev->rssi_db != 0.0f || ev->snr_db != 0.0f)
-        rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+        rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
                        " RSSI=%.1f SNR=%.1f", (double)ev->rssi_db, (double)ev->snr_db);
     if (ev->hop_limit || ev->hop_start)
-        rn += snprintf(remarks + rn, sizeof(remarks) - rn,
+        rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
                        " hop=%d/%d", ev->hop_limit, ev->hop_start);
+    (void)rn;
+    char remarks[sizeof(remarks_raw) * 6];
+    xml_escape(remarks, sizeof(remarks), remarks_raw);
 
-    char xml[1280];
+    char xml[2048];
     int n = snprintf(xml, sizeof(xml),
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
         "<event version=\"2.0\" uid=\"%s\" type=\"a-f-G-U-C\" time=\"%s\" start=\"%s\" stale=\"%s\" how=\"m-g\">"
