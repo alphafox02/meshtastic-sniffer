@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newAPIHandler builds the same wrapped /api/* mux that startWebServer
@@ -614,6 +615,70 @@ func seedResolveFixture(t *testing.T, s *EventStore) uint64 {
 		}
 	}
 	return eventNs
+}
+
+// TestAPI_Resolve_EventTime_StaleSnapshotNotApplied: when the only
+// pair snapshot at or before the event time is older than MaxAgeS,
+// event-time replay must NOT apply it. The result class should fall
+// back to software_lock instead of falsely labeling sync. Catches a
+// past bug where StatusAtSnapshot=="converged" alone was enough to
+// apply the offset, even on snapshots that should have aged out.
+func TestAPI_Resolve_EventTime_StaleSnapshotNotApplied(t *testing.T) {
+	s := openTestStore(t)
+	const eventNs = uint64(1_780_000_000_000_000_000)
+	rec := &ClusterObservationRecord{
+		From: "!aabbccdd", PacketID: 100, EmissionSeq: 0,
+		ClusterTimeNs:   eventNs,
+		FirstSeenWallNs: eventNs + 1_000,
+		Preset:          "MediumFast",
+		Observations: []ClusterObservationStation{
+			{Station: "alpha", StationLat: 39.010, StationLon: -98.010, StationTNs: eventNs + 5_000_000, StationTAccNs: 1_000_000, PreambleLockTNs: eventNs, SnrDB: 8},
+			{Station: "bravo", StationLat: 39.000, StationLon: -98.012, StationTNs: eventNs + 5_000_000, StationTAccNs: 1_000_000, PreambleLockTNs: eventNs + 20_000, SnrDB: 6},
+			{Station: "delta", StationLat: 38.988, StationLon: -98.002, StationTNs: eventNs + 5_000_000, StationTAccNs: 1_000_000, PreambleLockTNs: eventNs + 25_000, SnrDB: 7},
+		},
+	}
+	if err := s.WriteClusterObservation(rec); err != nil {
+		t.Fatalf("seed cluster: %v", err)
+	}
+	// Snapshots converged but their snapshot_time is 1 hour BEFORE the
+	// event, while MaxAgeS is only 600 s -> they were stale at the
+	// target event time and must NOT be applied.
+	staleSnapshotNs := eventNs - uint64(3600*time.Second)
+	for _, ps := range []*PairSnapshotRecord{
+		{PairKey: "alpha|bravo", SnapshotTimeNs: staleSnapshotNs, LastAnchorTimeNs: staleSnapshotNs, MedianNs: 20_000, MadNs: 500, SampleCount: 12, AnchorIDs: []string{"!cafe"}, StatusAtSnapshot: "converged", MaxAgeS: 600},
+		{PairKey: "alpha|delta", SnapshotTimeNs: staleSnapshotNs, LastAnchorTimeNs: staleSnapshotNs, MedianNs: 25_000, MadNs: 600, SampleCount: 11, AnchorIDs: []string{"!cafe"}, StatusAtSnapshot: "converged", MaxAgeS: 600},
+	} {
+		if err := s.WritePairSnapshot(ps); err != nil {
+			t.Fatalf("seed pair: %v", err)
+		}
+	}
+
+	hub := newSSEHub()
+	r := newTestRegistryUnauthed(t)
+	h := newAPIHandlerWithHub(t, r, hub, s, "")
+	body := fmt.Sprintf(`{"from":"!aabbccdd","packet_id":100,"emission_seq":0,"event_time_ns":%d,"mode":"event_time"}`, eventNs)
+	req := httptest.NewRequest(http.MethodPost, "/api/resolve", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d want 200; body=%s", w.Code, w.Body.String())
+	}
+	pubs := drainHubHistory(hub)
+	if len(pubs) != 1 {
+		t.Fatalf("hub got %d events, want 1", len(pubs))
+	}
+	var ev replayEvent
+	if err := json.Unmarshal(pubs[0], &ev); err != nil {
+		t.Fatalf("decode pub: %v", err)
+	}
+	if ev.TimestampClass == "sync" {
+		t.Errorf("timestamp_class=sync with snapshots aged %ds past MaxAgeS=600s; should fall back to software_lock",
+			3600-600)
+	}
+	if len(ev.PairSnapshotKeysUsed) != 0 {
+		t.Errorf("pair_snapshot_keys_used=%v; stale snapshots must not be applied", ev.PairSnapshotKeysUsed)
+	}
 }
 
 // TestAPI_Resolve_Happy: seeded cluster + pair snapshots, POST resolve,

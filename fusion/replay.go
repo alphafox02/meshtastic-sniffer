@@ -162,7 +162,21 @@ func resolveAtEventTime(store *EventStore, rec *ClusterObservationRecord) (
 			if err != nil {
 				return nil, nil, "", fmt.Errorf("pair snapshot lookup %s: %w", pk, err)
 			}
-			if ok && snap.StatusAtSnapshot == "converged" {
+			// Apply the snapshot only when it was converged AND was still
+			// fresh at the target event time. Without the freshness gate
+			// an old converged snapshot would silently label the replay
+			// as sync class using offsets that should have aged out --
+			// pairStatusNow does this gating in the live path, so honour
+			// the same MaxAgeS bound here.
+			fresh := false
+			if ok {
+				ageNs := int64(eventTimeNs) - int64(snap.SnapshotTimeNs)
+				maxAgeNs := int64(snap.MaxAgeS * float64(time.Second))
+				if ageNs >= 0 && ageNs <= maxAgeNs {
+					fresh = true
+				}
+			}
+			if ok && snap.StatusAtSnapshot == "converged" && fresh {
 				// Mirror clocksync.CorrectAndClassify: pair median is
 				// signed as (B.PreambleLockTNs - A.PreambleLockTNs)
 				// where A < B lex. Rebase obs onto refStation:
@@ -182,9 +196,9 @@ func resolveAtEventTime(store *EventStore, rec *ClusterObservationRecord) (
 				cls = TimestampSync
 				pairKeysUsed = append(pairKeysUsed, pk)
 			}
-			// If no converged snapshot at event time, fall back to raw
-			// software_lock (no correction). The result's WorstTimestampCls
-			// will surface the degradation honestly.
+			// If no converged-and-fresh snapshot at event time, fall back
+			// to raw software_lock (no correction). The result's
+			// WorstTimestampCls will surface the degradation honestly.
 		}
 		mlatObs = append(mlatObs, MlatObservation{
 			StationName:         o.Station,
