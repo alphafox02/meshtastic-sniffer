@@ -68,6 +68,7 @@ int           opt_extra_freq_count    = 0;
 /* SDR / file input */
 char       *opt_input_file = NULL;
 iq_format_t iq_format      = FMT_CI8;
+bool        opt_iq_format_set = false;
 
 /* Per-backend gain controls.
  *
@@ -176,15 +177,18 @@ void options_print_help(const char *prog)
         "  --vita49=[BIND:]PORT   listen for VITA-49 (VRT) UDP. PORT is required;\n"
         "                         BIND defaults to 0.0.0.0. Sender side must use:\n"
         "                           - VRT signal-data packets (network byte order, big-endian)\n"
-        "                           - matching --iq-format (ci8 default, ci16, or cf32)\n"
+        "                           - an --iq-format matching the payload, unless the\n"
+        "                             sender's IF-context declares the payload format\n"
         "                         VRL wrapper ('VRLP') is auto-detected (optional).\n"
-        "                         IF-context packets are auto-adopted: sample_rate (Q44.20)\n"
-        "                         and RF freq override missing CLI values, so a sender\n"
-        "                         that emits context can run with bare --vita49=PORT.\n"
+        "                         IF-context packets are auto-adopted: sample_rate (Q44.20),\n"
+        "                         RF freq, and data-packet payload format override missing\n"
+        "                         CLI values, so a sender that emits context can run with\n"
+        "                         bare --vita49=PORT.\n"
         "  --file=PATH            replay IQ file\n"
         "  --iq-format=FMT        cs8 (default) | cs16 | cf32. Used for raw file replay\n"
-        "                         AND for the VITA-49 payload format -- the sender's\n"
-        "                         sample type must match.\n"
+        "                         AND for the VITA-49 payload format. For VITA-49 this is\n"
+        "                         only needed when the sender's context omits the payload\n"
+        "                         format; an explicit value here always wins.\n"
         "\n"
         "RF:\n"
         "  --center=HZ            center frequency (default: region-derived)\n"
@@ -491,6 +495,7 @@ int options_parse(int argc, char **argv)
             else if (!strcasecmp(optarg, "cs16") || !strcasecmp(optarg, "ci16")) iq_format = FMT_CI16;
             else if (!strcasecmp(optarg, "cf32") || !strcasecmp(optarg, "fc32")) iq_format = FMT_CF32;
             else { fprintf(stderr, "unknown --iq-format=%s\n", optarg); return 2; }
+            opt_iq_format_set = true;
             break;
 
         case O_CENTER:  opt_center_freq_hz = strtoull(optarg, NULL, 10); break;

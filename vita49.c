@@ -5,7 +5,8 @@
  * VITA 49 (VRT) UDP input - receives IQ samples via VRT signal data packets
  *
  * Supports VRL-wrapped and unwrapped VRT packets, IF context extraction
- * (sample rate, RF frequency), and all three IQ formats (ci8, ci16, cf32).
+ * (sample rate, RF frequency, data-packet payload format), and all three IQ
+ * formats (ci8, ci16, cf32).
  *
  */
 
@@ -62,6 +63,7 @@ static uint64_t read_be64(const uint32_t *p)
 #define CIF_REF_LEVEL       (1u << 24)
 #define CIF_GAIN            (1u << 23)
 #define CIF_SAMPLE_RATE     (1u << 21)
+#define CIF_DATA_FORMAT     (1u << 15)
 
 static const struct { uint32_t bit; unsigned words; } cif_fields[] = {
     { 1u << 31, 1 },           /* context field change indicator */
@@ -75,7 +77,35 @@ static const struct { uint32_t bit; unsigned words; } cif_fields[] = {
     { CIF_GAIN,         1 },  /* gain */
     { 1u << 22, 1 },          /* over-range count */
     { CIF_SAMPLE_RATE,  2 },  /* sample rate */
+    { 1u << 20, 2 },          /* timestamp adjustment */
+    { 1u << 19, 1 },          /* timestamp calibration time */
+    { 1u << 18, 1 },          /* temperature */
+    { 1u << 17, 2 },          /* device identifier */
+    { 1u << 16, 1 },          /* state and event indicators */
+    { CIF_DATA_FORMAT,  2 },  /* data packet payload format */
 };
+
+static const char *iq_format_name(iq_format_t f)
+{
+    return f == FMT_CF32 ? "cf32" : f == FMT_CI16 ? "cs16" : "cs8";
+}
+
+/* Decode the first word of a VITA-49.0 Data Packet Payload Format field into
+ * one of our three supported IQ types. Returns 1 on a recognized mapping,
+ * 0 otherwise (caller leaves the format untouched). */
+static int payload_format_to_iq(uint32_t fw, iq_format_t *out)
+{
+    unsigned data_item_format = (fw >> 24) & 0x1F;  /* bits 28..24 */
+    unsigned packing_size     = ((fw >> 6) & 0x3F) + 1;  /* item packing field size, bits/component */
+
+    if (data_item_format == 0x1E) {        /* IEEE-754 single-precision float */
+        if (packing_size == 32) { *out = FMT_CF32; return 1; }
+    } else if (data_item_format == 0x00) { /* signed fixed-point */
+        if (packing_size == 8)  { *out = FMT_CI8;  return 1; }
+        if (packing_size == 16) { *out = FMT_CI16; return 1; }
+    }
+    return 0;
+}
 
 static void vrt_handle_context(const uint8_t *vrt, size_t vrt_len,
                                 int *ctx_logged)
@@ -109,6 +139,9 @@ static void vrt_handle_context(const uint8_t *vrt, size_t vrt_len,
     int have_rf = 0;
     double ctx_samp_rate = 0;
     int have_sr = 0;
+    iq_format_t ctx_fmt = FMT_CI8;
+    int have_fmt = 0;        /* payload-format field present and recognized */
+    int fmt_unsupported = 0; /* field present but not one of our three types */
 
     for (unsigned i = 0; i < sizeof(cif_fields)/sizeof(cif_fields[0]); i++) {
         if (!(cif0 & cif_fields[i].bit))
@@ -125,12 +158,16 @@ static void vrt_handle_context(const uint8_t *vrt, size_t vrt_len,
             uint64_t val = read_be64(&words[off_w]);
             ctx_samp_rate = (double)(int64_t)val / (1LL << 20);
             have_sr = 1;
+        } else if (cif_fields[i].bit == CIF_DATA_FORMAT) {
+            uint32_t fw = ntohl(words[off_w]);
+            if (payload_format_to_iq(fw, &ctx_fmt)) have_fmt = 1;
+            else fmt_unsupported = 1;
         }
 
         off_w += cif_fields[i].words;
     }
 
-    if (!have_rf && !have_sr)
+    if (!have_rf && !have_sr && !have_fmt && !fmt_unsupported)
         return;
 
     if (*ctx_logged)
@@ -140,26 +177,54 @@ static void vrt_handle_context(const uint8_t *vrt, size_t vrt_len,
     if (have_sr) {
         fprintf(stderr, "vita49: context reports sample_rate=%.0f Hz\n",
                 ctx_samp_rate);
-        if (samp_rate == 0.0 || opt_sample_rate == 0) {
+        if (opt_sample_rate == 0) {
             /* User didn't set --rate; adopt the context value so the
-             * channelizer comes up correctly without operator intervention. */
+             * channelizer comes up correctly without operator intervention.
+             * Test against opt_sample_rate, not samp_rate: this runs before
+             * resolve_rf_defaults(), so samp_rate is still 0 here regardless
+             * of any --rate the user passed. */
             samp_rate = ctx_samp_rate;
             fprintf(stderr, "vita49: adopting sample_rate from context\n");
-        } else if (ctx_samp_rate - samp_rate > 1.0 || samp_rate - ctx_samp_rate > 1.0)
-            fprintf(stderr, "vita49: WARNING: source sample rate %.0f Hz "
-                    "differs from -r %.0f Hz\n", ctx_samp_rate, samp_rate);
+        } else {
+            double cli = (double)opt_sample_rate;
+            if (ctx_samp_rate - cli > 1.0 || cli - ctx_samp_rate > 1.0)
+                fprintf(stderr, "vita49: WARNING: source sample rate %.0f Hz "
+                        "differs from -r %.0f Hz\n", ctx_samp_rate, cli);
+        }
     }
 
     if (have_rf) {
         fprintf(stderr, "vita49: context reports rf_freq=%.0f Hz\n",
                 rf_freq_hz);
-        if (center_freq == 0.0 || opt_center_freq_hz == 0) {
+        if (opt_center_freq_hz == 0) {
             center_freq = rf_freq_hz;
             fprintf(stderr, "vita49: adopting center_freq from context\n");
-        } else if (rf_freq_hz - center_freq > 1.0 || center_freq - rf_freq_hz > 1.0)
-            fprintf(stderr, "vita49: WARNING: source RF freq %.0f Hz "
-                    "differs from center_freq %.0f Hz\n",
-                    rf_freq_hz, center_freq);
+        } else {
+            double cli = (double)opt_center_freq_hz;
+            if (rf_freq_hz - cli > 1.0 || cli - rf_freq_hz > 1.0)
+                fprintf(stderr, "vita49: WARNING: source RF freq %.0f Hz "
+                        "differs from center_freq %.0f Hz\n",
+                        rf_freq_hz, cli);
+        }
+    }
+
+    if (have_fmt) {
+        fprintf(stderr, "vita49: context reports payload format=%s\n",
+                iq_format_name(ctx_fmt));
+        if (!opt_iq_format_set) {
+            /* User didn't pin --iq-format; adopt the context value so the
+             * sample type matches the sender without operator intervention. */
+            iq_format = ctx_fmt;
+            fprintf(stderr, "vita49: adopting payload format from context\n");
+        } else if (ctx_fmt != iq_format) {
+            fprintf(stderr, "vita49: WARNING: source payload format %s "
+                    "differs from --iq-format %s\n",
+                    iq_format_name(ctx_fmt), iq_format_name(iq_format));
+        }
+    } else if (fmt_unsupported && !opt_iq_format_set) {
+        fprintf(stderr, "vita49: WARNING: context payload format is not one of "
+                "cs8/cs16/cf32; keeping --iq-format %s\n",
+                iq_format_name(iq_format));
     }
 }
 
