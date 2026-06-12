@@ -573,12 +573,14 @@ struct lora_decoder {
  * is paid once per process, then a static int gate is consulted. */
 static int framesync_enabled(void)
 {
-    static int cached = -1;
-    if (cached < 0) {
+    static _Atomic int cached = -1;
+    int v = atomic_load_explicit(&cached, memory_order_acquire);
+    if (v < 0) {
         const char *e = getenv("MESHTASTIC_DEBUG_FRAMESYNC");
-        cached = (e && e[0] == '1') ? 1 : 0;
+        v = (e && e[0] == '1') ? 1 : 0;
+        atomic_store_explicit(&cached, v, memory_order_release);
     }
-    return cached;
+    return v;
 }
 
 static void build_chirps(fftwf_complex *up, fftwf_complex *down, int N)
@@ -1203,13 +1205,18 @@ static void state_tick(lora_decoder_t *d)
      * in the env (legacy) or -vvv on the command line. Useful for cross-
      * validating against the upstream RX. */
     extern int verbose;
-    static int trace_check = 0, trace_on = 0, trace_count = 0;
-    if (!trace_check) {
+    static _Atomic int trace_check = 0;
+    static _Atomic int trace_on    = 0;
+    static _Atomic int trace_count = 0;
+    if (!atomic_load_explicit(&trace_check, memory_order_acquire)) {
         const char *e = getenv("MESHTASTIC_LORA_TRACE");
-        trace_on = (e && *e == '1') || (verbose >= 3);
-        trace_check = 1;
+        atomic_store_explicit(&trace_on,
+                              (e && *e == '1') || (verbose >= 3),
+                              memory_order_relaxed);
+        atomic_store_explicit(&trace_check, 1, memory_order_release);
     }
-    if (trace_on && trace_count++ < 2000) {
+    if (atomic_load_explicit(&trace_on, memory_order_relaxed) &&
+        atomic_fetch_add_explicit(&trace_count, 1, memory_order_relaxed) < 2000) {
         fprintf(stderr, "[lora] state=%d sym=%u peak=%.2f snr=%.2f\n",
                 d->state, sym, peak, peak / (noise > 0 ? noise : 1));
     }

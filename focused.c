@@ -92,7 +92,10 @@ struct focused_worker {
     atomic_int run;            /* 1 = thread alive, 0 = drain remainder + exit */
     atomic_int state;          /* focused_state_t */
     int       sticky;          /* 1 = never fall back to IDLE (manual focus) */
-    double    hold_down_s;     /* DECODING -> HOLD_DOWN and HOLD_DOWN -> IDLE timer */
+    _Atomic double hold_down_s; /* DECODING -> HOLD_DOWN and HOLD_DOWN -> IDLE timer.
+                                 * Written by arm() from external threads, read on every
+                                 * hysteresis tick of the worker outside the arm-pending
+                                 * release window. */
     atomic_uint_fast64_t last_frame_mono_us;
     atomic_uint_fast64_t hold_down_start_us;
     uint64_t   start_sample;
@@ -483,20 +486,21 @@ static void *focused_thread(void *arg)
 
         /* Hysteresis transitions; sticky workers (manual focus) skip
          * them entirely and stay in DECODING for the whole run. */
-        if (!w->sticky && w->hold_down_s > 0.0) {
+        double hd_s = atomic_load(&w->hold_down_s);
+        if (!w->sticky && hd_s > 0.0) {
             uint64_t now = mono_us();
             uint64_t last = atomic_load(&w->last_frame_mono_us);
             double idle_s = (double)(now - last) * 1e-6;
-            if (st == FOCUSED_STATE_DECODING && idle_s > w->hold_down_s) {
+            if (st == FOCUSED_STATE_DECODING && idle_s > hd_s) {
                 atomic_store(&w->state, FOCUSED_STATE_HOLD_DOWN);
                 atomic_store(&w->hold_down_start_us, now);
                 fprintf(stderr, "focused[%s]: DECODING -> HOLD_DOWN "
                                 "(%.1fs idle, hd=%.1fs)\n",
-                        w->label_buf, idle_s, w->hold_down_s);
+                        w->label_buf, idle_s, hd_s);
             } else if (st == FOCUSED_STATE_HOLD_DOWN) {
                 uint64_t hd_start = atomic_load(&w->hold_down_start_us);
                 double in_hd_s = (double)(now - hd_start) * 1e-6;
-                if (in_hd_s > w->hold_down_s) {
+                if (in_hd_s > hd_s) {
                     atomic_store(&w->state, FOCUSED_STATE_IDLE);
                     fprintf(stderr, "focused[%s]: HOLD_DOWN -> IDLE "
                                     "(%.1fs in hold-down)\n",
@@ -594,7 +598,7 @@ focused_worker_t *focused_worker_create(const focused_cfg_t *cfg)
     w->arm_mono_us = 0;
     w->arm_clamped_to_oldest = false;
     w->sticky      = 0;
-    w->hold_down_s = 0.0;
+    atomic_init(&w->hold_down_s, 0.0);
     w->cursor      = 0;
 
     /* If cfg specifies an initial slot (legacy single-worker create
@@ -662,7 +666,7 @@ void focused_worker_arm(focused_worker_t *w,
 {
     if (!w) return;
     w->start_sample = start_sample;
-    w->hold_down_s  = hold_down_s > 0.0 ? hold_down_s : 5.0;
+    atomic_store(&w->hold_down_s, hold_down_s > 0.0 ? hold_down_s : 5.0);
     atomic_store(&w->last_frame_mono_us, mono_us());
     /* Flip state to DECODING synchronously so the pool dispatcher's
      * "find an IDLE worker" loop sees this worker as busy on the

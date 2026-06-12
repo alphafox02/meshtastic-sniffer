@@ -227,6 +227,11 @@ typedef struct {
     char     preset_name[24];
 } chan_stat_t;
 static chan_stat_t g_chan_stats[CHANNELIZER_MAX_CHANNELS];
+/* Guards the non-atomic fields in chan_stat_t -- snr_db_sum (double) and
+ * snr_db_count (int). frames/bytes are already atomics. Contention is
+ * negligible: writer is the dedup drainer once per emit, reader is the
+ * stats heartbeat once a second. */
+static pthread_mutex_t g_chan_stats_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---- Sample pump: decouple SDR recv from DSP -------------------------
  *
@@ -837,7 +842,7 @@ static void on_mesh_event(const mesh_event_t *ev, void *user) {
  * expired by handing its best-SNR replica to mesh_packet_decode_with_radio.
  * The decode runs OUTSIDE the dedup mutex so the decrypt + publish
  * path doesn't serialize against incoming replicas. */
-static volatile bool g_dedup_drainer_run = false;
+static atomic_bool g_dedup_drainer_run = false;
 static pthread_t     g_dedup_drainer_tid;
 
 static void dedup_emit_locked(const dedup_entry_t *e)
@@ -854,8 +859,10 @@ static void dedup_emit_locked(const dedup_entry_t *e)
         __atomic_add_fetch(&g_chan_stats[channel_id].frames, 1, __ATOMIC_RELAXED);
         __atomic_add_fetch(&g_chan_stats[channel_id].bytes,
                            e->best_payload_len, __ATOMIC_RELAXED);
+        pthread_mutex_lock(&g_chan_stats_mu);
         g_chan_stats[channel_id].snr_db_sum   += (double)e->best_meta.snr_db;
         g_chan_stats[channel_id].snr_db_count += 1;
+        pthread_mutex_unlock(&g_chan_stats_mu);
     }
     /* PCAP output: write the wire-shape frame (16-byte radio header +
      * still-encrypted payload) before any decrypt attempt, with the
@@ -911,7 +918,7 @@ static void *dedup_drainer_thread(void *arg)
      * emit. That keeps lock-hold time bounded and decoupled from the
      * decode/publish path which can block on mqtt/web/stdout. */
     dedup_entry_t batch[DEDUP_DRAIN_BATCH];
-    while (g_dedup_drainer_run) {
+    while (atomic_load_explicit(&g_dedup_drainer_run, memory_order_acquire)) {
         usleep(5000); /* 5 ms tick = ~6 ticks per window */
         uint64_t now_us = dedup_monotonic_us();
         atomic_store_explicit(&g_drainer_last_tick_us, now_us, memory_order_relaxed);
@@ -935,13 +942,13 @@ static void *dedup_drainer_thread(void *arg)
 
 static void dedup_drainer_start(void)
 {
-    g_dedup_drainer_run = true;
+    atomic_store_explicit(&g_dedup_drainer_run, true, memory_order_release);
     pthread_create(&g_dedup_drainer_tid, NULL, dedup_drainer_thread, NULL);
 }
 
 static void dedup_drainer_stop(void)
 {
-    g_dedup_drainer_run = false;
+    atomic_store_explicit(&g_dedup_drainer_run, false, memory_order_release);
     pthread_join(g_dedup_drainer_tid, NULL);
     /* Single locked sweep, emit outside the lock. */
     dedup_entry_t batch[DEDUP_RING_SIZE];
@@ -1372,8 +1379,11 @@ static void *stats_thread(void *arg)
                     int n_ch = channelizer_num_channels(g_channelizer);
                     for (int i = 0; i < n_ch && i < CHANNELIZER_MAX_CHANNELS; ++i) {
                         chan_stat_t *cs = &g_chan_stats[i];
-                        double avg_snr = cs->snr_db_count
-                            ? cs->snr_db_sum / (double)cs->snr_db_count : 0.0;
+                        pthread_mutex_lock(&g_chan_stats_mu);
+                        double snr_sum = cs->snr_db_sum;
+                        int    snr_n   = cs->snr_db_count;
+                        pthread_mutex_unlock(&g_chan_stats_mu);
+                        double avg_snr = snr_n ? snr_sum / (double)snr_n : 0.0;
                         fprintf(sf, "%s{\"id\":%d", i ? "," : "", i);
                         if (cs->preset_name[0])
                             fprintf(sf, ",\"preset\":\"%s\"", cs->preset_name);
