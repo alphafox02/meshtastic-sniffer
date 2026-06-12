@@ -298,7 +298,7 @@ void cot_publish_position(const mesh_event_t *ev, const mesh_position_t *pos)
         uid, now, now, stale,
         pos->lat_deg, pos->lon_deg, pos->have_alt ? pos->altitude_m : 0,
         callsign,
-        pos->ground_speed_mps, pos->ground_track,
+        pos->ground_speed_mps, pos->ground_track_x100 / 100u,
         remarks);
     if (n > 0) send_xml(xml, (size_t)n);
 }

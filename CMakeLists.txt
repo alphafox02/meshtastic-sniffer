@@ -306,6 +306,17 @@ add_executable(test_iq_ring
 target_link_libraries(test_iq_ring PRIVATE Threads::Threads)
 set_property(TARGET test_iq_ring PROPERTY C_STANDARD 99)
 
+# test_position_decode: regression test for the meshtastic.Position
+# protobuf decoder. Hand-encoded fixture exercises sfixed32 lat/lon,
+# fixed32 time, sint32 altitude_hae, and the uint32 fields whose field
+# numbers were previously shifted (HDOP vs sats_in_view, etc).
+add_executable(test_position_decode
+    ${PROJECT_SOURCE_DIR}/tests/test_position_decode.c
+    ${PROJECT_SOURCE_DIR}/mesh_decoders.c
+    ${PROJECT_SOURCE_DIR}/protobuf.c)
+target_link_libraries(test_position_decode PRIVATE m)
+set_property(TARGET test_position_decode PROPERTY C_STANDARD 99)
+
 # focused_demo: scan-then-focus Phase 2 prototype. One shared file reader
 # streams cs8 IQ into N independent focused-decode workers, each with its
 # own DDC chain (mixer + LPF + decim) and lora_decoder_t. Bypasses the

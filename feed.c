@@ -276,13 +276,29 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
         case MESH_PORT_POSITION: {
             mesh_position_t p;
             if (mesh_decode_position(ev->payload, ev->payload_len, &p)) {
-                if (p.have_lat) jw_field_f64(j, "lat", p.lat_deg);
-                if (p.have_lon) jw_field_f64(j, "lon", p.lon_deg);
-                if (p.have_alt) jw_field_i32(j, "alt_m", p.altitude_m);
-                if (p.time_unix)   jw_field_u32(j, "time", p.time_unix);
-                if (p.sats_in_view) jw_field_u32(j, "sats", p.sats_in_view);
-                if (p.ground_speed_mps) jw_field_u32(j, "speed_mps", p.ground_speed_mps);
-                if (p.ground_track) jw_field_u32(j, "track_deg", p.ground_track);
+                if (p.have_lat)             jw_field_f64(j, "lat", p.lat_deg);
+                if (p.have_lon)             jw_field_f64(j, "lon", p.lon_deg);
+                if (p.have_alt)             jw_field_i32(j, "alt_m", p.altitude_m);
+                if (p.have_alt_hae)         jw_field_i32(j, "alt_hae_m", p.altitude_hae_m);
+                if (p.have_alt_geosep)      jw_field_i32(j, "alt_geoidal_sep_m", p.altitude_geoidal_separation_m);
+                if (p.have_time)            jw_field_u32(j, "time", p.time);
+                if (p.have_timestamp)       jw_field_u32(j, "timestamp", p.timestamp);
+                if (p.timestamp_millis_adjust) jw_field_i32(j, "timestamp_ms_adj", p.timestamp_millis_adjust);
+                if (p.location_source)      jw_field_u32(j, "loc_src", p.location_source);
+                if (p.altitude_source)      jw_field_u32(j, "alt_src", p.altitude_source);
+                if (p.pdop_x100)            jw_field_f64(j, "pdop", (double)p.pdop_x100 / 100.0);
+                if (p.hdop_x100)            jw_field_f64(j, "hdop", (double)p.hdop_x100 / 100.0);
+                if (p.vdop_x100)            jw_field_f64(j, "vdop", (double)p.vdop_x100 / 100.0);
+                if (p.gps_accuracy_mm)      jw_field_u32(j, "gps_accuracy_mm", p.gps_accuracy_mm);
+                if (p.have_ground_speed)    jw_field_u32(j, "speed_mps", p.ground_speed_mps);
+                if (p.have_ground_track)    jw_field_f64(j, "track_deg", (double)p.ground_track_x100 / 100.0);
+                if (p.fix_quality)          jw_field_u32(j, "fix_quality", p.fix_quality);
+                if (p.fix_type)             jw_field_u32(j, "fix_type", p.fix_type);
+                if (p.sats_in_view)         jw_field_u32(j, "sats", p.sats_in_view);
+                if (p.sensor_id)            jw_field_u32(j, "sensor_id", p.sensor_id);
+                if (p.next_update_s)        jw_field_u32(j, "next_update_s", p.next_update_s);
+                if (p.seq_number)           jw_field_u32(j, "seq", p.seq_number);
+                if (p.precision_bits)       jw_field_u32(j, "precision_bits", p.precision_bits);
                 /* CoT republish for any positioned node, named via node_db cache. */
                 cot_publish_position(ev, &p);
                 /* Geofence transitions: ENTRY / EXIT events when this

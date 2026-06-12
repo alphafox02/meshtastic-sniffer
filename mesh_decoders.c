@@ -30,7 +30,26 @@ static float u32_as_float(uint32_t v)
     return f;
 }
 
-/* ---- POSITION_APP -- meshtastic.Position ---- */
+/* ---- POSITION_APP -- meshtastic.Position ----
+ *
+ * Field tag and wire type discipline:
+ *   1  sfixed32 latitude_i               -> wire type 5 (fixed32), signed
+ *   2  sfixed32 longitude_i              -> wire type 5 (fixed32), signed
+ *   3  int32    altitude (MSL)           -> wire type 0 (varint)
+ *   4  fixed32  time (sender wall)       -> wire type 5 (fixed32), unsigned
+ *   5  LocSource location_source         -> wire type 0 (varint)
+ *   6  AltSource altitude_source         -> wire type 0 (varint)
+ *   7  fixed32  timestamp (GPS fix)      -> wire type 5 (fixed32), unsigned
+ *   8  int32    timestamp_millis_adjust  -> wire type 0 (varint), signed
+ *   9  sint32   altitude_hae             -> wire type 0 (varint), zigzag
+ *  10  sint32   altitude_geoidal_sep     -> wire type 0 (varint), zigzag
+ *  11..23 uint32 fields per the proto   -> wire type 0 (varint)
+ *
+ * Wire-type-aware: if a tag comes in with an unexpected wire type for its
+ * field number, the value is skipped rather than misparsed. This avoids
+ * the prior class of bug where field 1 was read as varint even though
+ * sfixed32 is wire-type 5 (always returned 0,0 in practice).
+ */
 bool mesh_decode_position(const uint8_t *buf, size_t len, mesh_position_t *out)
 {
     if (!buf || !out) return false;
@@ -40,34 +59,96 @@ bool mesh_decode_position(const uint8_t *buf, size_t len, mesh_position_t *out)
     while (p < end) {
         uint32_t fld, wt;
         if (!pb_read_tag(&p, end, &fld, &wt)) return false;
+        uint32_t f32; uint64_t v;
         switch (fld) {
-        case 1: { uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->lat_deg  = (double)pb_zigzag32((uint32_t)v) * 1e-7;
-                  out->have_lat = true; break; }
-        case 2: { uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->lon_deg  = (double)pb_zigzag32((uint32_t)v) * 1e-7;
-                  out->have_lon = true; break; }
-        case 3: { uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->altitude_m = (int32_t)v;
-                  out->have_alt = true; break; }
-        case 9: { uint32_t v; if (!pb_read_fixed32(&p, end, &v)) return false;
-                  out->time_unix = v; break; }
-        case 5: { uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->location_source = (uint32_t)v; break; }
-        case 12:{ uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->sats_in_view = (uint32_t)v; break; }
-        case 15:{ uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->pdop_x100 = (uint32_t)v; break; }
-        case 16:{ uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->ground_speed_mps = (uint32_t)v; break; }
-        case 17:{ uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->ground_track = (uint32_t)v; break; }
-        case 18:{ uint64_t v; if (!pb_read_varint(&p, end, &v)) return false;
-                  out->precision_bits = (uint32_t)v; break; }
-        default: if (!pb_skip_value(&p, end, wt)) return false; break;
+        /* sfixed32 lat/lon: 4 bytes little-endian, two's-complement signed,
+         * scaled 1e-7 to degrees. */
+        case 1:
+            if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->lat_deg  = (double)(int32_t)f32 * 1e-7;
+            out->have_lat = true; break;
+        case 2:
+            if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->lon_deg  = (double)(int32_t)f32 * 1e-7;
+            out->have_lon = true; break;
+        case 3:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->altitude_m = (int32_t)v;
+            out->have_alt = true; break;
+        case 4:
+            if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->time = f32;
+            out->have_time = true; break;
+        case 5:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->location_source = (uint32_t)v; break;
+        case 6:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->altitude_source = (uint32_t)v; break;
+        case 7:
+            if (wt != 5 || !pb_read_fixed32(&p, end, &f32)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->timestamp = f32;
+            out->have_timestamp = true; break;
+        case 8:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->timestamp_millis_adjust = (int32_t)v; break;
+        /* sint32 fields: varint + zigzag */
+        case 9:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->altitude_hae_m = pb_zigzag32((uint32_t)v);
+            out->have_alt_hae = true; break;
+        case 10:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->altitude_geoidal_separation_m = pb_zigzag32((uint32_t)v);
+            out->have_alt_geosep = true; break;
+        /* uint32 varint fields 11..23 */
+        case 11:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->pdop_x100 = (uint32_t)v; break;
+        case 12:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->hdop_x100 = (uint32_t)v; break;
+        case 13:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->vdop_x100 = (uint32_t)v; break;
+        case 14:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->gps_accuracy_mm = (uint32_t)v; break;
+        case 15:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->ground_speed_mps = (uint32_t)v;
+            out->have_ground_speed = true; break;
+        case 16:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->ground_track_x100 = (uint32_t)v;
+            out->have_ground_track = true; break;
+        case 17:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->fix_quality = (uint32_t)v; break;
+        case 18:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->fix_type = (uint32_t)v; break;
+        case 19:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->sats_in_view = (uint32_t)v; break;
+        case 20:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->sensor_id = (uint32_t)v; break;
+        case 21:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->next_update_s = (uint32_t)v; break;
+        case 22:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->seq_number = (uint32_t)v; break;
+        case 23:
+            if (wt != 0 || !pb_read_varint(&p, end, &v)) { if (!pb_skip_value(&p, end, wt)) return false; break; }
+            out->precision_bits = (uint32_t)v; break;
+        default:
+            if (!pb_skip_value(&p, end, wt)) return false;
+            break;
         }
     }
-    return out->have_lat || out->have_lon || out->time_unix != 0;
+    return out->have_lat || out->have_lon || out->have_time || out->have_timestamp;
 }
 
 /* ---- NODEINFO_APP -- meshtastic.User ---- */

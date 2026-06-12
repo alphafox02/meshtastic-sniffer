@@ -17,18 +17,46 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ---- POSITION_APP (port 3) ---- */
+/* ---- POSITION_APP (port 3) ---- meshtastic.Position
+ *
+ * Field numbers, wire types, and units mirror the current upstream proto
+ * (meshtastic/protobufs mesh.proto, "message Position"). lat_i/lon_i are
+ * sfixed32 -- 4 raw little-endian bytes per side, two's-complement
+ * signed -- not varint+zigzag; altitude_hae and altitude_geoidal_separation
+ * are sint32 (varint+zigzag, signed-magnitude). Everything else is plain
+ * varint (uint32 or int32) or fixed32 per the proto.
+ *
+ * have_* flags are per-field so a consumer can tell "0 explicit" from
+ * "0 because the sender didn't include this field." Required for the JSON
+ * feed not to lie when a node only sends partial Position. */
 typedef struct mesh_position {
-    bool     have_lat, have_lon, have_alt;
-    double   lat_deg, lon_deg;
-    int32_t  altitude_m;
-    uint32_t time_unix;
-    uint32_t sats_in_view;
-    uint32_t pdop_x100;       /* PDOP * 100 */
-    uint32_t ground_speed_mps;
-    uint32_t ground_track;    /* degrees */
-    uint32_t precision_bits;
-    uint32_t location_source; /* enum LocationSource */
+    bool     have_lat, have_lon;
+    bool     have_alt, have_alt_hae, have_alt_geosep;
+    bool     have_time, have_timestamp;
+    bool     have_ground_speed, have_ground_track;
+
+    double   lat_deg, lon_deg;             /* sfixed32 fields 1,2 * 1e-7 -> degrees */
+    int32_t  altitude_m;                   /* int32  field 3:  MSL altitude (meters) */
+    uint32_t time;                         /* fixed32 field 4: sender wall-clock when message was sent (epoch s) */
+    uint32_t location_source;              /* enum    field 5:  LocSource */
+    uint32_t altitude_source;              /* enum    field 6:  AltSource */
+    uint32_t timestamp;                    /* fixed32 field 7:  actual GPS-fix timestamp (epoch s) */
+    int32_t  timestamp_millis_adjust;      /* int32   field 8:  ms adjustment relative to `timestamp` */
+    int32_t  altitude_hae_m;               /* sint32  field 9:  HAE altitude (meters) */
+    int32_t  altitude_geoidal_separation_m;/* sint32  field 10: geoid separation (meters) */
+    uint32_t pdop_x100;                    /* uint32  field 11: PDOP * 100 */
+    uint32_t hdop_x100;                    /* uint32  field 12: HDOP * 100 */
+    uint32_t vdop_x100;                    /* uint32  field 13: VDOP * 100 */
+    uint32_t gps_accuracy_mm;              /* uint32  field 14: hardware constant (mm) */
+    uint32_t ground_speed_mps;             /* uint32  field 15: m/s */
+    uint32_t ground_track_x100;            /* uint32  field 16: 1/100 degrees */
+    uint32_t fix_quality;                  /* uint32  field 17: NMEA fix quality */
+    uint32_t fix_type;                     /* uint32  field 18: NMEA fix type (2D/3D) */
+    uint32_t sats_in_view;                 /* uint32  field 19 */
+    uint32_t sensor_id;                    /* uint32  field 20 */
+    uint32_t next_update_s;                /* uint32  field 21: expected seconds until next update */
+    uint32_t seq_number;                   /* uint32  field 22 */
+    uint32_t precision_bits;               /* uint32  field 23 */
 } mesh_position_t;
 bool mesh_decode_position(const uint8_t *buf, size_t len, mesh_position_t *out);
 
