@@ -572,8 +572,8 @@ const char *mesh_atak_team_name(int team)
 const char *mesh_atak_role_name(int role)
 {
     static const char *names[] = {
-        "TeamMember","TeamLead","HQ","Sniper","Medic","ForwardObserver",
-        "RTO","K9"
+        "Unspecified","TeamMember","TeamLead","HQ","Sniper","Medic",
+        "ForwardObserver","RTO","K9"
     };
     if (role < 0 || role >= (int)(sizeof(names)/sizeof(names[0]))) return "Unknown";
     return names[role];
