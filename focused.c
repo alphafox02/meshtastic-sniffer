@@ -211,6 +211,18 @@ static void focused_process_chunk(focused_worker_t *w,
         lora_decoder_set_stream_cursor(w->dec, chunk_start_sdr_idx,
                                        (uint32_t)w->decim);
     }
+    /* Hot loop. The delay buffer is laid out as two contiguous copies
+     * of the n_taps-wide window so the inner FIR can walk
+     * delay[delay_head .. delay_head + n_taps - 1] without a wrap or
+     * a per-tap modulo. Same idea as the PFB's reversed-and-duplicated
+     * dly[] (see ARCHITECTURE.md); the compiler can auto-vectorise the
+     * dot product once it is contiguous. */
+    const int n_taps = w->n_taps;
+    const int decim  = w->decim;
+    const float       * __restrict taps  = w->taps;
+    float complex     * __restrict delay = w->delay;
+    int delay_head = w->delay_head;
+    int decim_phase = w->decim_phase;
     for (size_t i = 0; i < n; ++i) {
         float ii, qq;
         if (format == SAMPLE_FMT_FLOAT) { ii = sf32[2*i+0]; qq = sf32[2*i+1]; }
@@ -226,21 +238,26 @@ static void focused_process_chunk(focused_worker_t *w,
              * so the rotation does not drift in magnitude. */
             phasor = phasor / sqrtf(mag2);
         }
-        w->delay[w->delay_head] = mixed;
-        w->delay_head = (w->delay_head + 1) % w->n_taps;
-        if (++w->decim_phase >= w->decim) {
-            w->decim_phase = 0;
+        /* Mirror the newest sample into both halves of the duplicated
+         * delay buffer so the FIR window stays contiguous regardless
+         * of where delay_head is. */
+        delay[delay_head]            = mixed;
+        delay[delay_head + n_taps]   = mixed;
+        if (++delay_head == n_taps) delay_head = 0;
+        if (++decim_phase >= decim) {
+            decim_phase = 0;
             float complex acc = 0.0f + 0.0f * I;
-            int idx = w->delay_head;
-            for (int t = 0; t < w->n_taps; ++t) {
-                acc += w->delay[idx] * w->taps[t];
-                idx = (idx + 1) % w->n_taps;
+            const float complex *win = &delay[delay_head];
+            for (int t = 0; t < n_taps; ++t) {
+                acc += win[t] * taps[t];
             }
             one_out = acc;
             lora_decoder_feed(w->dec, &one_out, 1);
             atomic_fetch_add(&w->samples_to_decoder, 1);
         }
     }
+    w->delay_head  = delay_head;
+    w->decim_phase = decim_phase;
     w->mix_phasor = phasor;
     w->phasor_renorm_count = renorm_count;
 }
@@ -281,7 +298,7 @@ static int focused_apply_slot_locked(focused_worker_t *w)
      * just rebuild the LPF shape for the new BW. */
     w->n_taps = build_lpf(w->n_taps > 0 ? w->n_taps : FOCUSED_LPF_TAPS,
                           sr, (double)w->cur_bw_hz * 0.5, w->taps);
-    memset(w->delay, 0, sizeof(float complex) * (size_t)w->n_taps);
+    memset(w->delay, 0, sizeof(float complex) * (size_t)(2 * w->n_taps));
     w->delay_head = 0;
     /* Decoder is bound to (sf, cr, bw, os) at create -- destroy and
      * recreate when any of those change. */
@@ -524,11 +541,15 @@ focused_worker_t *focused_worker_create(const focused_cfg_t *cfg)
     pthread_mutex_init(&w->cfg_mu, NULL);
 
     /* Allocate taps + delay at max length once; build_lpf() inside
-     * focused_apply_slot_locked() reshapes them per slot. */
+     * focused_apply_slot_locked() reshapes them per slot. The delay
+     * buffer is sized at 2 * n_taps so we can mirror each newly mixed
+     * sample into both halves; that lets the FIR walk a contiguous
+     * window without per-tap modulo (same trick as the PFB's
+     * dly[]). */
     w->n_taps = FOCUSED_LPF_TAPS;
     w->taps   = malloc(sizeof(float) * (size_t)w->n_taps);
     if (!w->taps) { pthread_mutex_destroy(&w->cfg_mu); free(w); return NULL; }
-    w->delay  = calloc((size_t)w->n_taps, sizeof(float complex));
+    w->delay  = calloc((size_t)(2 * w->n_taps), sizeof(float complex));
     if (!w->delay) {
         free(w->taps); pthread_mutex_destroy(&w->cfg_mu); free(w); return NULL;
     }
