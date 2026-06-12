@@ -892,14 +892,13 @@ const char *mesh_storeforward_rr_name(uint32_t rr)
     case 5:   return "ROUTER_BUSY";
     case 6:   return "ROUTER_HISTORY";
     case 7:   return "ROUTER_STATS";
-    case 8:   return "ROUTER_TEXT_BROADCAST";
-    case 9:   return "ROUTER_TEXT_DIRECT";
+    case 8:   return "ROUTER_TEXT_DIRECT";
+    case 9:   return "ROUTER_TEXT_BROADCAST";
     case 64:  return "CLIENT_ERROR";
     case 65:  return "CLIENT_HISTORY";
     case 66:  return "CLIENT_STATS";
     case 67:  return "CLIENT_PING";
     case 68:  return "CLIENT_PONG";
-    case 69:  return "CLIENT_TEXT";
     case 106: return "CLIENT_ABORT";
     default:  return NULL;
     }
