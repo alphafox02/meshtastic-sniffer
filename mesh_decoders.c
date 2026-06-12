@@ -869,6 +869,53 @@ static void parse_packed_uint32(const uint8_t *bp, size_t blen,
     }
 }
 
+/* Accept both packed (wt=2, length-delimited block of varints) and
+ * unpacked (wt=0, one varint per repetition) encodings for a repeated
+ * scalar field. proto3 senders may emit either form for the same
+ * field, so a decoder that hard-codes wt=2 mis-reads unpacked frames. */
+static bool append_repeated_u32(const uint8_t **pp, const uint8_t *end,
+                                uint32_t wt, uint32_t *arr,
+                                int *arr_len, int cap)
+{
+    if (wt == 0) {
+        uint64_t v;
+        if (!pb_read_varint(pp, end, &v)) return false;
+        if (*arr_len < cap) arr[(*arr_len)++] = (uint32_t)v;
+        return true;
+    }
+    if (wt == 2) {
+        const uint8_t *bp; size_t blen;
+        if (!pb_read_length(pp, end, &bp, &blen)) return false;
+        parse_packed_uint32(bp, blen, arr, arr_len, cap);
+        return true;
+    }
+    return pb_skip_value(pp, end, wt);
+}
+
+static bool append_repeated_i8(const uint8_t **pp, const uint8_t *end,
+                               uint32_t wt, int8_t *arr,
+                               int *arr_len, int cap)
+{
+    if (wt == 0) {
+        uint64_t v;
+        if (!pb_read_varint(pp, end, &v)) return false;
+        if (*arr_len < cap) arr[(*arr_len)++] = (int8_t)(int32_t)v;
+        return true;
+    }
+    if (wt == 2) {
+        const uint8_t *bp; size_t blen;
+        if (!pb_read_length(pp, end, &bp, &blen)) return false;
+        const uint8_t *q = bp, *qend = bp + blen;
+        while (q < qend && *arr_len < cap) {
+            uint64_t v;
+            if (!pb_read_varint(&q, qend, &v)) break;
+            arr[(*arr_len)++] = (int8_t)(int32_t)v;
+        }
+        return true;
+    }
+    return pb_skip_value(pp, end, wt);
+}
+
 bool mesh_decode_traceroute(const uint8_t *buf, size_t len, mesh_traceroute_t *out)
 {
     if (!buf || !out) return false;
@@ -877,38 +924,19 @@ bool mesh_decode_traceroute(const uint8_t *buf, size_t len, mesh_traceroute_t *o
     while (p < end) {
         uint32_t fld, wt;
         if (!pb_read_tag(&p, end, &fld, &wt)) return false;
-        const uint8_t *bp; size_t blen;
+        bool ok;
         switch (fld) {
-        case 1: if (!pb_read_length(&p, end, &bp, &blen)) return false;
-                parse_packed_uint32(bp, blen, out->route, &out->route_len, 16); break;
-        case 2: if (!pb_read_length(&p, end, &bp, &blen)) return false;
-                {
-                    int i = 0;
-                    const uint8_t *q = bp, *qend = bp + blen;
-                    while (q < qend && i < 16) {
-                        uint64_t v;
-                        if (!pb_read_varint(&q, qend, &v)) break;
-                        out->snr_towards[i++] = (int8_t)(int32_t)v;
-                    }
-                    out->snr_towards_len = i;
-                }
-                break;
-        case 3: if (!pb_read_length(&p, end, &bp, &blen)) return false;
-                parse_packed_uint32(bp, blen, out->route_back, &out->route_back_len, 16); break;
-        case 4: if (!pb_read_length(&p, end, &bp, &blen)) return false;
-                {
-                    int i = 0;
-                    const uint8_t *q = bp, *qend = bp + blen;
-                    while (q < qend && i < 16) {
-                        uint64_t v;
-                        if (!pb_read_varint(&q, qend, &v)) break;
-                        out->snr_back[i++] = (int8_t)(int32_t)v;
-                    }
-                    out->snr_back_len = i;
-                }
-                break;
-        default: if (!pb_skip_value(&p, end, wt)) return false; break;
+        case 1: ok = append_repeated_u32(&p, end, wt,
+                                         out->route, &out->route_len, 16); break;
+        case 2: ok = append_repeated_i8(&p, end, wt,
+                                        out->snr_towards, &out->snr_towards_len, 16); break;
+        case 3: ok = append_repeated_u32(&p, end, wt,
+                                         out->route_back, &out->route_back_len, 16); break;
+        case 4: ok = append_repeated_i8(&p, end, wt,
+                                        out->snr_back, &out->snr_back_len, 16); break;
+        default: ok = pb_skip_value(&p, end, wt); break;
         }
+        if (!ok) return false;
     }
     return out->route_len > 0 || out->route_back_len > 0;
 }

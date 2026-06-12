@@ -230,6 +230,43 @@ static void test_power_metrics_ch8(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Traceroute decoder accepts UNPACKED repeated scalars.              */
+/* proto3 lets a sender encode `repeated uint32 route` as one         */
+/* tag+varint per element; the decoder used to assume wt=2 (packed)   */
+/* only and silently misparsed unpacked traces.                       */
+/* ------------------------------------------------------------------ */
+static const uint8_t TRACEROUTE_UNPACKED_FIXTURE[] = {
+    0x08, 0x0A, 0x08, 0x14, 0x08, 0x1E, 0x10, 0xFB, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x10, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0x01, 0x18, 0x1E, 0x18, 0x14, 0x18, 0x0A, 0x20, 0xFD,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
+};
+
+static void test_traceroute_unpacked(void)
+{
+    mesh_traceroute_t t;
+    bool ok = mesh_decode_traceroute(TRACEROUTE_UNPACKED_FIXTURE,
+                                     sizeof(TRACEROUTE_UNPACKED_FIXTURE), &t);
+    CHECK(ok, "mesh_decode_traceroute returned false on unpacked form");
+    CHECK(t.route_len == 3, "route_len: got %d want 3", t.route_len);
+    CHECK(t.route[0] == 10 && t.route[1] == 20 && t.route[2] == 30,
+          "route bytes desync'd: got %u,%u,%u want 10,20,30",
+          t.route[0], t.route[1], t.route[2]);
+    CHECK(t.snr_towards_len == 2,
+          "snr_towards_len: got %d want 2", t.snr_towards_len);
+    CHECK(t.snr_towards[0] == -5 && t.snr_towards[1] == -2,
+          "snr_towards: got %d,%d want -5,-2",
+          (int)t.snr_towards[0], (int)t.snr_towards[1]);
+    CHECK(t.route_back_len == 3, "route_back_len: got %d want 3", t.route_back_len);
+    CHECK(t.route_back[0] == 30 && t.route_back[1] == 20 && t.route_back[2] == 10,
+          "route_back: got %u,%u,%u want 30,20,10",
+          t.route_back[0], t.route_back[1], t.route_back[2]);
+    CHECK(t.snr_back_len == 1 && t.snr_back[0] == -3,
+          "snr_back: got len=%d val=%d want 1,-3",
+          t.snr_back_len, (int)t.snr_back[0]);
+}
+
+/* ------------------------------------------------------------------ */
 /* 6. TAKPacket wrapping GeoChat surfaces receipt_for_uid +           */
 /*    receipt_type so receipts are distinguishable from regular chat. */
 /* ------------------------------------------------------------------ */
@@ -267,6 +304,7 @@ int main(void)
     test_telemetry_host();
     test_telemetry_traffic();
     test_power_metrics_ch8();
+    test_traceroute_unpacked();
     test_atak_geochat_receipt();
 
     if (fails) {
