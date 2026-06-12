@@ -410,17 +410,18 @@ bool mesh_decode_waypoint(const uint8_t *buf, size_t len, mesh_waypoint_t *out)
         const uint8_t *bp; size_t blen; uint64_t v;
         switch (fld) {
         case 1: if (!pb_read_varint(&p, end, &v)) return false; out->id = (uint32_t)v; break;
-        case 2: if (!pb_read_varint(&p, end, &v)) return false;
-                out->lat_deg = (double)pb_zigzag32((uint32_t)v) * 1e-7; out->have_lat = true; break;
-        case 3: if (!pb_read_varint(&p, end, &v)) return false;
-                out->lon_deg = (double)pb_zigzag32((uint32_t)v) * 1e-7; out->have_lon = true; break;
+        case 2: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return false;
+                  out->lat_deg = (double)(int32_t)f * 1e-7; out->have_lat = true; break; }
+        case 3: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return false;
+                  out->lon_deg = (double)(int32_t)f * 1e-7; out->have_lon = true; break; }
         case 4: if (!pb_read_varint(&p, end, &v)) return false; out->expire = (uint32_t)v; break;
         case 5: if (!pb_read_varint(&p, end, &v)) return false; out->locked_to = (uint32_t)v; break;
         case 6: if (!pb_read_length(&p, end, &bp, &blen)) return false;
                 copy_str(out->name, sizeof(out->name), bp, blen); break;
         case 7: if (!pb_read_length(&p, end, &bp, &blen)) return false;
                 copy_str(out->description, sizeof(out->description), bp, blen); break;
-        case 8: if (!pb_read_varint(&p, end, &v)) return false; out->icon = (uint32_t)v; break;
+        case 8: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return false;
+                  out->icon = f; break; }
         default: if (!pb_skip_value(&p, end, wt)) return false; break;
         }
     }
@@ -517,9 +518,9 @@ bool mesh_decode_mapreport(const uint8_t *buf, size_t len, mesh_mapreport_t *out
         case 7: if (!pb_read_varint(&p, end, &v)) return false; out->modem_preset = (uint32_t)v; break;
         case 8: if (!pb_read_varint(&p, end, &v)) return false; out->has_default_channel = (uint32_t)v; break;
         case 9: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return false;
-                  out->lat_deg = (double)pb_zigzag32(f) * 1e-7; out->have_lat = true; break; }
+                  out->lat_deg = (double)(int32_t)f * 1e-7; out->have_lat = true; break; }
         case 10:{ uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return false;
-                  out->lon_deg = (double)pb_zigzag32(f) * 1e-7; out->have_lon = true; break; }
+                  out->lon_deg = (double)(int32_t)f * 1e-7; out->have_lon = true; break; }
         case 11:if (!pb_read_varint(&p, end, &v)) return false; out->altitude_m = (int32_t)v; break;
         case 12:if (!pb_read_varint(&p, end, &v)) return false; out->position_precision = (uint32_t)v; break;
         case 13:if (!pb_read_varint(&p, end, &v)) return false; out->num_online_local_nodes = (uint32_t)v; break;
@@ -630,12 +631,12 @@ static void parse_pli(const uint8_t *buf, size_t len, mesh_atak_t *out)
         uint32_t fld, wt; uint64_t v;
         if (!pb_read_tag(&p, end, &fld, &wt)) return;
         switch (fld) {
-        case 1: if (!pb_read_varint(&p, end, &v)) return;
-                out->lat_deg = (double)pb_zigzag32((uint32_t)v) * 1e-7;
-                out->have_lat = true; break;
-        case 2: if (!pb_read_varint(&p, end, &v)) return;
-                out->lon_deg = (double)pb_zigzag32((uint32_t)v) * 1e-7;
-                out->have_lon = true; break;
+        case 1: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return;
+                  out->lat_deg = (double)(int32_t)f * 1e-7;
+                  out->have_lat = true; break; }
+        case 2: { uint32_t f; if (!pb_read_fixed32(&p, end, &f)) return;
+                  out->lon_deg = (double)(int32_t)f * 1e-7;
+                  out->have_lon = true; break; }
         case 3: if (!pb_read_varint(&p, end, &v)) return;
                 out->altitude_hae_m = (int32_t)v; break;
         case 4: if (!pb_read_varint(&p, end, &v)) return;
