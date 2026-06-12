@@ -111,6 +111,23 @@ typedef struct mesh_telemetry {
     float    ch1_voltage, ch1_current;
     float    ch2_voltage, ch2_current;
     float    ch3_voltage, ch3_current;
+
+    bool     have_local_stats;
+    uint32_t local_uptime_s;
+    float    local_channel_utilization;
+    float    local_air_util_tx;
+    uint32_t local_num_packets_tx;
+    uint32_t local_num_packets_rx;
+    uint32_t local_num_packets_rx_bad;
+    uint32_t local_num_online_nodes;
+    uint32_t local_num_total_nodes;
+    uint32_t local_num_rx_dupe;
+    uint32_t local_num_tx_relay;
+    uint32_t local_num_tx_relay_canceled;
+    uint32_t local_heap_total_bytes;
+    uint32_t local_heap_free_bytes;
+    uint32_t local_num_tx_dropped;
+    int32_t  local_noise_floor_dbm;
 } mesh_telemetry_t;
 bool mesh_decode_telemetry(const uint8_t *buf, size_t len, mesh_telemetry_t *out);
 

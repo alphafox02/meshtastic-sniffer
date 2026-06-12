@@ -309,6 +309,34 @@ static void parse_power_metrics(const uint8_t *buf, size_t len, mesh_telemetry_t
     out->have_power = true;
 }
 
+static void parse_local_stats(const uint8_t *buf, size_t len, mesh_telemetry_t *out)
+{
+    const uint8_t *p = buf, *end = buf + len;
+    while (p < end) {
+        uint32_t fld, wt; uint64_t v; uint32_t f32;
+        if (!pb_read_tag(&p, end, &fld, &wt)) return;
+        switch (fld) {
+        case 1:  if (!pb_read_varint(&p, end, &v)) return; out->local_uptime_s = (uint32_t)v; break;
+        case 2:  if (!pb_read_fixed32(&p, end, &f32)) return; out->local_channel_utilization = u32_as_float(f32); break;
+        case 3:  if (!pb_read_fixed32(&p, end, &f32)) return; out->local_air_util_tx = u32_as_float(f32); break;
+        case 4:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_packets_tx = (uint32_t)v; break;
+        case 5:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_packets_rx = (uint32_t)v; break;
+        case 6:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_packets_rx_bad = (uint32_t)v; break;
+        case 7:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_online_nodes = (uint32_t)v; break;
+        case 8:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_total_nodes = (uint32_t)v; break;
+        case 9:  if (!pb_read_varint(&p, end, &v)) return; out->local_num_rx_dupe = (uint32_t)v; break;
+        case 10: if (!pb_read_varint(&p, end, &v)) return; out->local_num_tx_relay = (uint32_t)v; break;
+        case 11: if (!pb_read_varint(&p, end, &v)) return; out->local_num_tx_relay_canceled = (uint32_t)v; break;
+        case 12: if (!pb_read_varint(&p, end, &v)) return; out->local_heap_total_bytes = (uint32_t)v; break;
+        case 13: if (!pb_read_varint(&p, end, &v)) return; out->local_heap_free_bytes = (uint32_t)v; break;
+        case 14: if (!pb_read_varint(&p, end, &v)) return; out->local_num_tx_dropped = (uint32_t)v; break;
+        case 15: if (!pb_read_varint(&p, end, &v)) return; out->local_noise_floor_dbm = (int32_t)(int64_t)v; break;
+        default: if (!pb_skip_value(&p, end, wt)) return; break;
+        }
+    }
+    out->have_local_stats = true;
+}
+
 bool mesh_decode_telemetry(const uint8_t *buf, size_t len, mesh_telemetry_t *out)
 {
     if (!buf || !out) return false;
@@ -328,6 +356,8 @@ bool mesh_decode_telemetry(const uint8_t *buf, size_t len, mesh_telemetry_t *out
                 parse_env_metrics(bp, blen, out); any = true; break;
         case 5: if (!pb_read_length(&p, end, &bp, &blen)) return any;
                 parse_power_metrics(bp, blen, out); any = true; break;
+        case 6: if (!pb_read_length(&p, end, &bp, &blen)) return any;
+                parse_local_stats(bp, blen, out); any = true; break;
         default: if (!pb_skip_value(&p, end, wt)) return any; break;
         }
     }

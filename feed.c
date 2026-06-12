@@ -373,6 +373,27 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                     jw_putc(j, '}');
                     jw_close_array(j);
                 }
+                if (t.have_local_stats) {
+                    jw_open_array(j, "local_stats");
+                    jw_array_sep(j); jw_putc(j, '{'); j->first_field = true;
+                    if (t.local_uptime_s)              jw_field_u32(j, "uptime_s",        t.local_uptime_s);
+                    if (t.local_channel_utilization)   jw_field_f32(j, "ch_util",         t.local_channel_utilization);
+                    if (t.local_air_util_tx)           jw_field_f32(j, "air_tx",          t.local_air_util_tx);
+                    if (t.local_num_packets_tx)        jw_field_u32(j, "pkts_tx",         t.local_num_packets_tx);
+                    if (t.local_num_packets_rx)        jw_field_u32(j, "pkts_rx",         t.local_num_packets_rx);
+                    if (t.local_num_packets_rx_bad)    jw_field_u32(j, "pkts_rx_bad",     t.local_num_packets_rx_bad);
+                    if (t.local_num_online_nodes)      jw_field_u32(j, "nodes_online",    t.local_num_online_nodes);
+                    if (t.local_num_total_nodes)       jw_field_u32(j, "nodes_total",     t.local_num_total_nodes);
+                    if (t.local_num_rx_dupe)           jw_field_u32(j, "rx_dupe",         t.local_num_rx_dupe);
+                    if (t.local_num_tx_relay)          jw_field_u32(j, "tx_relay",        t.local_num_tx_relay);
+                    if (t.local_num_tx_relay_canceled) jw_field_u32(j, "tx_relay_cancel", t.local_num_tx_relay_canceled);
+                    if (t.local_heap_total_bytes)      jw_field_u32(j, "heap_total",      t.local_heap_total_bytes);
+                    if (t.local_heap_free_bytes)       jw_field_u32(j, "heap_free",       t.local_heap_free_bytes);
+                    if (t.local_num_tx_dropped)        jw_field_u32(j, "tx_dropped",      t.local_num_tx_dropped);
+                    if (t.local_noise_floor_dbm)       jw_field_i32(j, "noise_floor_dbm", t.local_noise_floor_dbm);
+                    jw_putc(j, '}');
+                    jw_close_array(j);
+                }
             }
             break;
         }
