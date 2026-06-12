@@ -562,9 +562,8 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
             mesh_remote_hw_t h;
             if (mesh_decode_remote_hw(ev->payload, ev->payload_len, &h)) {
                 if (h.type) jw_field_u32(j, "hw_type", h.type);
-                if (h.gpio_mask)  jw_field_u32(j, "hw_gpio_mask",  (uint32_t)h.gpio_mask);
-                if (h.gpio_value) jw_field_u32(j, "hw_gpio_value", (uint32_t)h.gpio_value);
-                if (h.txid)       jw_field_u32(j, "hw_txid", h.txid);
+                if (h.gpio_mask)  jw_field_u64(j, "hw_gpio_mask",  h.gpio_mask);
+                if (h.gpio_value) jw_field_u64(j, "hw_gpio_value", h.gpio_value);
             }
             break;
         }

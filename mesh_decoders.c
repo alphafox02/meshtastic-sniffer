@@ -801,7 +801,6 @@ bool mesh_decode_traceroute(const uint8_t *buf, size_t len, mesh_traceroute_t *o
  *   1 type           (varint, enum)
  *   2 gpio_mask      (varint uint64)
  *   3 gpio_value     (varint uint64)
- *   4 txid           (varint uint32)
  */
 bool mesh_decode_remote_hw(const uint8_t *buf, size_t len, mesh_remote_hw_t *out)
 {
@@ -816,7 +815,6 @@ bool mesh_decode_remote_hw(const uint8_t *buf, size_t len, mesh_remote_hw_t *out
         case 1: if (!pb_read_varint(&p, end, &v)) return false; out->type = (uint32_t)v; break;
         case 2: if (!pb_read_varint(&p, end, &v)) return false; out->gpio_mask = v; break;
         case 3: if (!pb_read_varint(&p, end, &v)) return false; out->gpio_value = v; break;
-        case 4: if (!pb_read_varint(&p, end, &v)) return false; out->txid = (uint32_t)v; break;
         default: if (!pb_skip_value(&p, end, wt)) return false; break;
         }
     }

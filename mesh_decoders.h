@@ -291,14 +291,13 @@ bool mesh_decode_traceroute(const uint8_t *buf, size_t len, mesh_traceroute_t *o
 
 /* ---- REMOTE_HARDWARE_APP (port 2) ----
  *
- * HardwareMessage: { type enum, gpio_mask uint64, gpio_value uint64,
- * txid uint32 }. Surfaced fields let an observer see a remote-GPIO
- * RPC happening (read/write/notify) without making policy on it. */
+ * HardwareMessage: { type enum, gpio_mask uint64, gpio_value uint64 }.
+ * Surfaced fields let an observer see a remote-GPIO RPC happening
+ * (read/write/notify) without making policy on it. */
 typedef struct mesh_remote_hw {
     uint32_t type;       /* HardwareMessage.Type enum */
     uint64_t gpio_mask;
     uint64_t gpio_value;
-    uint32_t txid;
 } mesh_remote_hw_t;
 bool mesh_decode_remote_hw(const uint8_t *buf, size_t len, mesh_remote_hw_t *out);
 
