@@ -389,6 +389,37 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                     jw_putc(j, '}');
                     jw_close_array(j);
                 }
+                if (t.have_air_quality) {
+                    jw_open_array(j, "air_quality");
+                    jw_array_sep(j); jw_putc(j, '{'); j->first_field = true;
+                    if (t.aq_pm10_standard)    jw_field_u32(j, "pm10_std",   t.aq_pm10_standard);
+                    if (t.aq_pm25_standard)    jw_field_u32(j, "pm25_std",   t.aq_pm25_standard);
+                    if (t.aq_pm100_standard)   jw_field_u32(j, "pm100_std",  t.aq_pm100_standard);
+                    if (t.aq_pm10_env)         jw_field_u32(j, "pm10_env",   t.aq_pm10_env);
+                    if (t.aq_pm25_env)         jw_field_u32(j, "pm25_env",   t.aq_pm25_env);
+                    if (t.aq_pm100_env)        jw_field_u32(j, "pm100_env",  t.aq_pm100_env);
+                    if (t.aq_particles_03um)   jw_field_u32(j, "p_03um",     t.aq_particles_03um);
+                    if (t.aq_particles_05um)   jw_field_u32(j, "p_05um",     t.aq_particles_05um);
+                    if (t.aq_particles_10um)   jw_field_u32(j, "p_10um",     t.aq_particles_10um);
+                    if (t.aq_particles_25um)   jw_field_u32(j, "p_25um",     t.aq_particles_25um);
+                    if (t.aq_particles_50um)   jw_field_u32(j, "p_50um",     t.aq_particles_50um);
+                    if (t.aq_particles_100um)  jw_field_u32(j, "p_100um",    t.aq_particles_100um);
+                    if (t.aq_co2)              jw_field_u32(j, "co2_ppm",    t.aq_co2);
+                    if (t.aq_co2_temperature_c)jw_field_f32(j, "co2_temp_c", t.aq_co2_temperature_c);
+                    if (t.aq_co2_humidity)     jw_field_f32(j, "co2_hum",    t.aq_co2_humidity);
+                    if (t.aq_formaldehyde_ppb) jw_field_f32(j, "ch2o_ppb",   t.aq_formaldehyde_ppb);
+                    if (t.aq_form_humidity)    jw_field_f32(j, "ch2o_hum",   t.aq_form_humidity);
+                    if (t.aq_form_temperature_c) jw_field_f32(j, "ch2o_temp_c", t.aq_form_temperature_c);
+                    if (t.aq_pm40_standard)    jw_field_u32(j, "pm40_std",   t.aq_pm40_standard);
+                    if (t.aq_particles_40um)   jw_field_u32(j, "p_40um",     t.aq_particles_40um);
+                    if (t.aq_pm_temperature_c) jw_field_f32(j, "pm_temp_c",  t.aq_pm_temperature_c);
+                    if (t.aq_pm_humidity)      jw_field_f32(j, "pm_hum",     t.aq_pm_humidity);
+                    if (t.aq_pm_voc_idx)       jw_field_f32(j, "pm_voc",     t.aq_pm_voc_idx);
+                    if (t.aq_pm_nox_idx)       jw_field_f32(j, "pm_nox",     t.aq_pm_nox_idx);
+                    if (t.aq_particles_tps)    jw_field_f32(j, "p_tps_um",   t.aq_particles_tps);
+                    jw_putc(j, '}');
+                    jw_close_array(j);
+                }
                 if (t.have_local_stats) {
                     jw_open_array(j, "local_stats");
                     jw_array_sep(j); jw_putc(j, '{'); j->first_field = true;

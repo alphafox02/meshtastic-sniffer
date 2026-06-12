@@ -321,6 +321,44 @@ static void parse_power_metrics(const uint8_t *buf, size_t len, mesh_telemetry_t
     out->have_power = true;
 }
 
+static void parse_air_quality(const uint8_t *buf, size_t len, mesh_telemetry_t *out)
+{
+    const uint8_t *p = buf, *end = buf + len;
+    while (p < end) {
+        uint32_t fld, wt; uint64_t v; uint32_t f32;
+        if (!pb_read_tag(&p, end, &fld, &wt)) return;
+        switch (fld) {
+        case 1:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm10_standard = (uint32_t)v; break;
+        case 2:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm25_standard = (uint32_t)v; break;
+        case 3:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm100_standard = (uint32_t)v; break;
+        case 4:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm10_env = (uint32_t)v; break;
+        case 5:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm25_env = (uint32_t)v; break;
+        case 6:  if (!pb_read_varint(&p, end, &v)) return; out->aq_pm100_env = (uint32_t)v; break;
+        case 7:  if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_03um = (uint32_t)v; break;
+        case 8:  if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_05um = (uint32_t)v; break;
+        case 9:  if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_10um = (uint32_t)v; break;
+        case 10: if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_25um = (uint32_t)v; break;
+        case 11: if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_50um = (uint32_t)v; break;
+        case 12: if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_100um = (uint32_t)v; break;
+        case 13: if (!pb_read_varint(&p, end, &v)) return; out->aq_co2 = (uint32_t)v; break;
+        case 14: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_co2_temperature_c = u32_as_float(f32); break;
+        case 15: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_co2_humidity = u32_as_float(f32); break;
+        case 16: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_formaldehyde_ppb = u32_as_float(f32); break;
+        case 17: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_form_humidity = u32_as_float(f32); break;
+        case 18: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_form_temperature_c = u32_as_float(f32); break;
+        case 19: if (!pb_read_varint(&p, end, &v)) return; out->aq_pm40_standard = (uint32_t)v; break;
+        case 20: if (!pb_read_varint(&p, end, &v)) return; out->aq_particles_40um = (uint32_t)v; break;
+        case 21: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_pm_temperature_c = u32_as_float(f32); break;
+        case 22: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_pm_humidity = u32_as_float(f32); break;
+        case 23: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_pm_voc_idx = u32_as_float(f32); break;
+        case 24: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_pm_nox_idx = u32_as_float(f32); break;
+        case 25: if (!pb_read_fixed32(&p, end, &f32)) return; out->aq_particles_tps = u32_as_float(f32); break;
+        default: if (!pb_skip_value(&p, end, wt)) return; break;
+        }
+    }
+    out->have_air_quality = true;
+}
+
 static void parse_local_stats(const uint8_t *buf, size_t len, mesh_telemetry_t *out)
 {
     const uint8_t *p = buf, *end = buf + len;
@@ -366,6 +404,8 @@ bool mesh_decode_telemetry(const uint8_t *buf, size_t len, mesh_telemetry_t *out
                 parse_device_metrics(bp, blen, out); any = true; break;
         case 3: if (!pb_read_length(&p, end, &bp, &blen)) return any;
                 parse_env_metrics(bp, blen, out); any = true; break;
+        case 4: if (!pb_read_length(&p, end, &bp, &blen)) return any;
+                parse_air_quality(bp, blen, out); any = true; break;
         case 5: if (!pb_read_length(&p, end, &bp, &blen)) return any;
                 parse_power_metrics(bp, blen, out); any = true; break;
         case 6: if (!pb_read_length(&p, end, &bp, &blen)) return any;

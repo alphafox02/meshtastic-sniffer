@@ -119,6 +119,25 @@ typedef struct mesh_telemetry {
     float    ch7_voltage, ch7_current;
     float    ch8_voltage, ch8_current;
 
+    bool     have_air_quality;
+    uint32_t aq_pm10_standard, aq_pm25_standard, aq_pm100_standard;
+    uint32_t aq_pm10_env,      aq_pm25_env,      aq_pm100_env;
+    uint32_t aq_particles_03um, aq_particles_05um, aq_particles_10um;
+    uint32_t aq_particles_25um, aq_particles_50um, aq_particles_100um;
+    uint32_t aq_co2;
+    float    aq_co2_temperature_c;
+    float    aq_co2_humidity;
+    float    aq_formaldehyde_ppb;
+    float    aq_form_humidity;
+    float    aq_form_temperature_c;
+    uint32_t aq_pm40_standard;
+    uint32_t aq_particles_40um;
+    float    aq_pm_temperature_c;
+    float    aq_pm_humidity;
+    float    aq_pm_voc_idx;
+    float    aq_pm_nox_idx;
+    float    aq_particles_tps;
+
     bool     have_local_stats;
     uint32_t local_uptime_s;
     float    local_channel_utilization;

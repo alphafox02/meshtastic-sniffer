@@ -88,6 +88,31 @@ static void test_storeforward_rr_labels(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* AirQualityMetrics: Telemetry envelope dispatches field 4.          */
+/* ------------------------------------------------------------------ */
+static const uint8_t TELEMETRY_AIR_QUALITY_FIXTURE[] = {
+    0x22, 0x12, 0x10, 0x0C, 0x28, 0x0A, 0x68, 0xE0, 0x03, 0x75, 0x00, 0x00,
+    0xB4, 0x41, 0xBD, 0x01, 0x00, 0x00, 0xBF, 0x42,
+};
+
+static void test_telemetry_air_quality(void)
+{
+    mesh_telemetry_t t;
+    bool ok = mesh_decode_telemetry(TELEMETRY_AIR_QUALITY_FIXTURE,
+                                    sizeof(TELEMETRY_AIR_QUALITY_FIXTURE), &t);
+    CHECK(ok, "mesh_decode_telemetry returned false on AirQuality payload");
+    CHECK(t.have_air_quality, "have_air_quality not set");
+    CHECK(t.aq_pm25_standard == 12u, "aq_pm25_standard: got %u want 12", t.aq_pm25_standard);
+    CHECK(t.aq_pm25_env == 10u,      "aq_pm25_env: got %u want 10",      t.aq_pm25_env);
+    CHECK(t.aq_co2 == 480u,          "aq_co2: got %u want 480",          t.aq_co2);
+    CHECK(t.aq_co2_temperature_c > 22.49f && t.aq_co2_temperature_c < 22.51f,
+          "aq_co2_temperature_c: got %.4f want ~22.5", (double)t.aq_co2_temperature_c);
+    CHECK(t.aq_pm_voc_idx > 95.49f && t.aq_pm_voc_idx < 95.51f,
+          "aq_pm_voc_idx: got %.4f want ~95.5 (field 23 -> 2-byte tag path)",
+          (double)t.aq_pm_voc_idx);
+}
+
+/* ------------------------------------------------------------------ */
 /* 4. Telemetry envelope dispatches LocalStats (oneof field 6).       */
 /* ------------------------------------------------------------------ */
 static const uint8_t TELEMETRY_LOCAL_STATS_FIXTURE[] = {
@@ -172,6 +197,7 @@ int main(void)
     test_neighborinfo_last_rx_time_fixed32();
     test_atak_role_table();
     test_storeforward_rr_labels();
+    test_telemetry_air_quality();
     test_telemetry_local_stats();
     test_power_metrics_ch8();
     test_atak_geochat_receipt();
