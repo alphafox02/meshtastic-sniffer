@@ -177,6 +177,8 @@ bool mesh_decode_user(const uint8_t *buf, size_t len, mesh_user_t *out)
         case 8: if (!pb_read_length(&p, end, &bp, &blen)) return false;
                 if (blen <= sizeof(out->public_key)) { memcpy(out->public_key, bp, blen); out->have_public_key = true; }
                 break;
+        case 9: if (!pb_read_varint(&p, end, &v)) return false;
+                out->is_unmessagable = v != 0; out->have_is_unmessagable = true; break;
         default: if (!pb_skip_value(&p, end, wt)) return false; break;
         }
     }

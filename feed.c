@@ -317,6 +317,8 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                 if (u.hw_model)      jw_field_u32(j, "hw_model",   u.hw_model);
                 if (u.role)          jw_field_u32(j, "role",       u.role);
                 if (u.is_licensed)   jw_field_bool(j, "licensed",  true);
+                if (u.have_is_unmessagable)
+                    jw_field_bool(j, "unmessagable", u.is_unmessagable);
                 node_db_remember(ev->header.from, u.long_name, u.short_name,
                                  u.hw_model, u.role);
             }

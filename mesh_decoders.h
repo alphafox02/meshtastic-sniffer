@@ -72,6 +72,8 @@ typedef struct mesh_user {
     uint32_t role;            /* enum Role */
     uint8_t  public_key[32];
     bool     have_public_key;
+    bool     is_unmessagable;
+    bool     have_is_unmessagable;
 } mesh_user_t;
 bool mesh_decode_user(const uint8_t *buf, size_t len, mesh_user_t *out);
 
