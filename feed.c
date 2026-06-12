@@ -370,6 +370,20 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                     jw_array_sep(j); jw_putc(j, '{'); j->first_field = true;
                     if (t.ch1_voltage) jw_field_f32(j, "ch1_v", t.ch1_voltage);
                     if (t.ch1_current) jw_field_f32(j, "ch1_a", t.ch1_current);
+                    if (t.ch2_voltage) jw_field_f32(j, "ch2_v", t.ch2_voltage);
+                    if (t.ch2_current) jw_field_f32(j, "ch2_a", t.ch2_current);
+                    if (t.ch3_voltage) jw_field_f32(j, "ch3_v", t.ch3_voltage);
+                    if (t.ch3_current) jw_field_f32(j, "ch3_a", t.ch3_current);
+                    if (t.ch4_voltage) jw_field_f32(j, "ch4_v", t.ch4_voltage);
+                    if (t.ch4_current) jw_field_f32(j, "ch4_a", t.ch4_current);
+                    if (t.ch5_voltage) jw_field_f32(j, "ch5_v", t.ch5_voltage);
+                    if (t.ch5_current) jw_field_f32(j, "ch5_a", t.ch5_current);
+                    if (t.ch6_voltage) jw_field_f32(j, "ch6_v", t.ch6_voltage);
+                    if (t.ch6_current) jw_field_f32(j, "ch6_a", t.ch6_current);
+                    if (t.ch7_voltage) jw_field_f32(j, "ch7_v", t.ch7_voltage);
+                    if (t.ch7_current) jw_field_f32(j, "ch7_a", t.ch7_current);
+                    if (t.ch8_voltage) jw_field_f32(j, "ch8_v", t.ch8_voltage);
+                    if (t.ch8_current) jw_field_f32(j, "ch8_a", t.ch8_current);
                     jw_putc(j, '}');
                     jw_close_array(j);
                 }

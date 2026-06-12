@@ -111,6 +111,11 @@ typedef struct mesh_telemetry {
     float    ch1_voltage, ch1_current;
     float    ch2_voltage, ch2_current;
     float    ch3_voltage, ch3_current;
+    float    ch4_voltage, ch4_current;
+    float    ch5_voltage, ch5_current;
+    float    ch6_voltage, ch6_current;
+    float    ch7_voltage, ch7_current;
+    float    ch8_voltage, ch8_current;
 
     bool     have_local_stats;
     uint32_t local_uptime_s;

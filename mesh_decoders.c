@@ -297,12 +297,22 @@ static void parse_power_metrics(const uint8_t *buf, size_t len, mesh_telemetry_t
         if (!pb_read_tag(&p, end, &fld, &wt)) return;
         uint32_t f32;
         switch (fld) {
-        case 1: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch1_voltage = u32_as_float(f32); break;
-        case 2: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch1_current = u32_as_float(f32); break;
-        case 3: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch2_voltage = u32_as_float(f32); break;
-        case 4: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch2_current = u32_as_float(f32); break;
-        case 5: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch3_voltage = u32_as_float(f32); break;
-        case 6: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch3_current = u32_as_float(f32); break;
+        case 1:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch1_voltage = u32_as_float(f32); break;
+        case 2:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch1_current = u32_as_float(f32); break;
+        case 3:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch2_voltage = u32_as_float(f32); break;
+        case 4:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch2_current = u32_as_float(f32); break;
+        case 5:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch3_voltage = u32_as_float(f32); break;
+        case 6:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch3_current = u32_as_float(f32); break;
+        case 7:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch4_voltage = u32_as_float(f32); break;
+        case 8:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch4_current = u32_as_float(f32); break;
+        case 9:  if (!pb_read_fixed32(&p, end, &f32)) return; out->ch5_voltage = u32_as_float(f32); break;
+        case 10: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch5_current = u32_as_float(f32); break;
+        case 11: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch6_voltage = u32_as_float(f32); break;
+        case 12: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch6_current = u32_as_float(f32); break;
+        case 13: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch7_voltage = u32_as_float(f32); break;
+        case 14: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch7_current = u32_as_float(f32); break;
+        case 15: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch8_voltage = u32_as_float(f32); break;
+        case 16: if (!pb_read_fixed32(&p, end, &f32)) return; out->ch8_current = u32_as_float(f32); break;
         default: if (!pb_skip_value(&p, end, wt)) return; break;
         }
     }
