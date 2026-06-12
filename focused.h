@@ -127,4 +127,11 @@ uint64_t focused_worker_samples_consumed(const focused_worker_t *w);
 uint64_t focused_worker_samples_to_decoder(const focused_worker_t *w);
 uint64_t focused_worker_frames_delivered(const focused_worker_t *w);
 
+/* Fall-behind diagnostic counters. Read-only snapshots; safe to call
+ * while the worker thread is running. */
+uint64_t focused_worker_fell_behind_total(const focused_worker_t *w);
+uint64_t focused_worker_fell_behind_edge_start(const focused_worker_t *w);
+uint64_t focused_worker_fell_behind_throughput(const focused_worker_t *w);
+uint64_t focused_worker_fell_behind_skipped_max(const focused_worker_t *w);
+
 #endif

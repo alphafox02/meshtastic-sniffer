@@ -20,6 +20,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,6 +105,27 @@ struct focused_worker {
     atomic_uint_fast64_t samples_to_decoder;
     atomic_uint_fast64_t frames_delivered;
     atomic_uint_fast64_t samples_skipped;     /* lost to fall-behind */
+
+    /* Fall-behind diagnostics. Classifier per shared next-steps doc:
+     * an "edge_start" event is one where the arm-time cursor landed at
+     * (or within one batch of) the ring's oldest sample AND we consumed
+     * less than one batch before the writer caught us -- i.e. the focus
+     * run never really got going. Anything else is a "throughput" event
+     * (worker ran for a while, then the math couldn't keep up). */
+    atomic_uint_fast64_t fell_behind_total;
+    atomic_uint_fast64_t fell_behind_edge_start;
+    atomic_uint_fast64_t fell_behind_throughput;
+    atomic_uint_fast64_t fell_behind_skipped_max;   /* high-water mark */
+
+    /* Per-arm state captured at the moment we accept an arm. Used by
+     * the fall-behind classifier; not visible outside the worker. */
+    uint64_t arm_start_sample;
+    uint64_t arm_oldest;
+    uint64_t arm_newest;
+    uint64_t arm_cursor;
+    uint64_t arm_mono_us;
+    bool     arm_clamped_to_oldest;
+    atomic_uint_fast64_t samples_consumed_since_arm;
 };
 
 /* Hamming-windowed sinc LPF, cutoff at BW/2. Same shape as
@@ -326,17 +348,37 @@ static void *focused_thread(void *arg)
 
             uint64_t o2, n2;
             iq_ring_live_range(w->cfg.ring, &o2, &n2);
+            bool clamped = false;
             if (w->start_sample == 0 || w->start_sample < o2) {
                 w->cursor = o2;
+                clamped = true;
             } else if (w->start_sample > n2) {
                 w->cursor = n2;
             } else {
                 w->cursor = w->start_sample;
             }
-            atomic_store(&w->last_frame_mono_us, mono_us());
+            uint64_t now_us = mono_us();
+            atomic_store(&w->last_frame_mono_us, now_us);
             atomic_store(&w->state, FOCUSED_STATE_DECODING);
-            fprintf(stderr, "focused[%s]: armed at cursor=%llu\n",
-                    w->label_buf, (unsigned long long)w->cursor);
+
+            /* Stash arm-time state for the fall-behind classifier. */
+            w->arm_start_sample = w->start_sample;
+            w->arm_oldest = o2;
+            w->arm_newest = n2;
+            w->arm_cursor = w->cursor;
+            w->arm_mono_us = now_us;
+            w->arm_clamped_to_oldest = clamped;
+            atomic_store(&w->samples_consumed_since_arm, 0);
+
+            uint64_t headroom = (w->cursor > o2) ? (w->cursor - o2) : 0;
+            double   headroom_ms = (w->cfg.sdr_samp_rate > 0)
+                ? (double)headroom * 1000.0 / w->cfg.sdr_samp_rate
+                : 0.0;
+            fprintf(stderr,
+                    "focused[%s]: armed at cursor=%llu  headroom=%llu (%.1fms)%s\n",
+                    w->label_buf, (unsigned long long)w->cursor,
+                    (unsigned long long)headroom, headroom_ms,
+                    clamped ? "  [clamped-to-oldest]" : "");
         }
 
         focused_state_t st = atomic_load(&w->state);
@@ -363,11 +405,46 @@ static void *focused_thread(void *arg)
              * dispatcher arm a fresh attempt next time. */
             uint64_t skipped = oldest - w->cursor;
             atomic_fetch_add(&w->samples_skipped, skipped);
+
+            /* Classifier (per shared next-steps doc):
+             *   edge_start  = arm-time cursor was clamped to oldest AND
+             *                 we consumed less than one batch before the
+             *                 writer caught us (run never got going)
+             *   throughput  = anything else (we ran for a while, then
+             *                 the math slipped behind line rate)
+             * Always uses real per-arm state, not a skip-size heuristic. */
+            uint64_t consumed_since_arm =
+                atomic_load(&w->samples_consumed_since_arm);
+            const char *kind;
+            if (w->arm_clamped_to_oldest &&
+                consumed_since_arm < FOCUSED_BATCH_SAMPLES) {
+                atomic_fetch_add(&w->fell_behind_edge_start, 1);
+                kind = "edge_start";
+            } else {
+                atomic_fetch_add(&w->fell_behind_throughput, 1);
+                kind = "throughput";
+            }
+            atomic_fetch_add(&w->fell_behind_total, 1);
+
+            /* High-water mark for skipped samples. */
+            uint64_t prev_max = atomic_load(&w->fell_behind_skipped_max);
+            while (skipped > prev_max &&
+                   !atomic_compare_exchange_weak(&w->fell_behind_skipped_max,
+                                                 &prev_max, skipped)) {
+                /* CAS retry */
+            }
+
+            uint64_t now_us = mono_us();
+            double   age_ms = (double)(now_us - w->arm_mono_us) * 1e-3;
             fprintf(stderr,
-                    "focused[%s]: fell behind by %llu samples (~%.1fms); "
+                    "focused[%s]: fell behind by %llu samples (~%.1fms) "
+                    "kind=%s consumed_since_arm=%llu age=%.0fms; "
                     "dropping focus run and returning to IDLE\n",
                     w->label_buf, (unsigned long long)skipped,
-                    (double)skipped * 1000.0 / w->cfg.sdr_samp_rate);
+                    (double)skipped * 1000.0 / w->cfg.sdr_samp_rate,
+                    kind,
+                    (unsigned long long)consumed_since_arm,
+                    age_ms);
             w->cursor = newest;
             atomic_store(&w->state, FOCUSED_STATE_IDLE);
             continue;
@@ -380,6 +457,7 @@ static void *focused_thread(void *arg)
             if (got > 0) {
                 focused_process_chunk(w, stage, got, format, chunk_start);
                 atomic_fetch_add(&w->samples_consumed, got);
+                atomic_fetch_add(&w->samples_consumed_since_arm, got);
                 w->cursor += got;
             }
         } else {
@@ -483,6 +561,17 @@ focused_worker_t *focused_worker_create(const focused_cfg_t *cfg)
     atomic_init(&w->samples_to_decoder, 0);
     atomic_init(&w->frames_delivered, 0);
     atomic_init(&w->samples_skipped, 0);
+    atomic_init(&w->fell_behind_total, 0);
+    atomic_init(&w->fell_behind_edge_start, 0);
+    atomic_init(&w->fell_behind_throughput, 0);
+    atomic_init(&w->fell_behind_skipped_max, 0);
+    atomic_init(&w->samples_consumed_since_arm, 0);
+    w->arm_start_sample = 0;
+    w->arm_oldest = 0;
+    w->arm_newest = 0;
+    w->arm_cursor = 0;
+    w->arm_mono_us = 0;
+    w->arm_clamped_to_oldest = false;
     w->sticky      = 0;
     w->hold_down_s = 0.0;
     w->cursor      = 0;
@@ -641,12 +730,18 @@ void focused_worker_stop_and_join(focused_worker_t *w)
     pthread_join(w->tid, NULL);
     w->started = 0;
     fprintf(stderr,
-            "focused[%s]: consumed=%llu decoded=%llu frames=%llu skipped=%llu\n",
+            "focused[%s]: consumed=%llu decoded=%llu frames=%llu skipped=%llu "
+            "fell_behind=%llu (edge_start=%llu throughput=%llu) "
+            "skip_max=%llu samples\n",
             w->label_buf,
             (unsigned long long)atomic_load(&w->samples_consumed),
             (unsigned long long)atomic_load(&w->samples_to_decoder),
             (unsigned long long)atomic_load(&w->frames_delivered),
-            (unsigned long long)atomic_load(&w->samples_skipped));
+            (unsigned long long)atomic_load(&w->samples_skipped),
+            (unsigned long long)atomic_load(&w->fell_behind_total),
+            (unsigned long long)atomic_load(&w->fell_behind_edge_start),
+            (unsigned long long)atomic_load(&w->fell_behind_throughput),
+            (unsigned long long)atomic_load(&w->fell_behind_skipped_max));
 }
 
 void focused_worker_destroy(focused_worker_t *w)
@@ -673,4 +768,24 @@ uint64_t focused_worker_samples_to_decoder(const focused_worker_t *w)
 uint64_t focused_worker_frames_delivered(const focused_worker_t *w)
 {
     return w ? atomic_load(&((focused_worker_t *)w)->frames_delivered) : 0;
+}
+
+uint64_t focused_worker_fell_behind_total(const focused_worker_t *w)
+{
+    return w ? atomic_load(&((focused_worker_t *)w)->fell_behind_total) : 0;
+}
+
+uint64_t focused_worker_fell_behind_edge_start(const focused_worker_t *w)
+{
+    return w ? atomic_load(&((focused_worker_t *)w)->fell_behind_edge_start) : 0;
+}
+
+uint64_t focused_worker_fell_behind_throughput(const focused_worker_t *w)
+{
+    return w ? atomic_load(&((focused_worker_t *)w)->fell_behind_throughput) : 0;
+}
+
+uint64_t focused_worker_fell_behind_skipped_max(const focused_worker_t *w)
+{
+    return w ? atomic_load(&((focused_worker_t *)w)->fell_behind_skipped_max) : 0;
 }

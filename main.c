@@ -1284,9 +1284,16 @@ static void *stats_thread(void *arg)
             /* Sum focused-pool worker frame totals so the dashboard
              * can show how much the pool contributed cumulatively. */
             uint64_t focus_frames_sum = 0;
-            for (int i = 0; i < g_focus_pool_size; ++i)
-                if (g_focus_pool[i])
-                    focus_frames_sum += focused_worker_frames_delivered(g_focus_pool[i]);
+            uint64_t focus_fell_behind_sum = 0;
+            uint64_t focus_fell_behind_edge_sum = 0;
+            uint64_t focus_fell_behind_thru_sum = 0;
+            for (int i = 0; i < g_focus_pool_size; ++i) {
+                if (!g_focus_pool[i]) continue;
+                focus_frames_sum += focused_worker_frames_delivered(g_focus_pool[i]);
+                focus_fell_behind_sum += focused_worker_fell_behind_total(g_focus_pool[i]);
+                focus_fell_behind_edge_sum += focused_worker_fell_behind_edge_start(g_focus_pool[i]);
+                focus_fell_behind_thru_sum += focused_worker_fell_behind_throughput(g_focus_pool[i]);
+            }
             uint64_t ring_samples = g_iq_ring ? iq_ring_total_appended(g_iq_ring) : 0;
             int focus_active = (g_focus_pool_size > 0) ? 1 : 0;
             int off_part = scanner_on
@@ -1303,6 +1310,9 @@ static void *stats_thread(void *arg)
                     "\"focus_promotions\":%llu,\"focus_matched\":%llu,"
                     "\"focus_assigned\":%llu,\"focus_dropped\":%llu,"
                     "\"focus_below_snr\":%llu,\"focus_frames\":%llu,"
+                    "\"focus_fell_behind\":%llu,"
+                    "\"focus_fell_behind_edge\":%llu,"
+                    "\"focus_fell_behind_thru\":%llu,"
                     "\"ring_ms\":%d,\"ring_samples\":%llu}\n",
                     sid, rate_msps, (unsigned long long)f,
                     (unsigned long long)d, (unsigned long long)og,
@@ -1314,6 +1324,9 @@ static void *stats_thread(void *arg)
                     (unsigned long long)atomic_load(&g_focus_pool_promote_dropped),
                     (unsigned long long)atomic_load(&g_focus_pool_promote_below_snr),
                     (unsigned long long)focus_frames_sum,
+                    (unsigned long long)focus_fell_behind_sum,
+                    (unsigned long long)focus_fell_behind_edge_sum,
+                    (unsigned long long)focus_fell_behind_thru_sum,
                     (int)g_iq_ring_ms, (unsigned long long)ring_samples);
             else
                 sn = snprintf(sline, sizeof(sline),
@@ -1325,6 +1338,9 @@ static void *stats_thread(void *arg)
                     "\"focus_promotions\":%llu,\"focus_matched\":%llu,"
                     "\"focus_assigned\":%llu,\"focus_dropped\":%llu,"
                     "\"focus_below_snr\":%llu,\"focus_frames\":%llu,"
+                    "\"focus_fell_behind\":%llu,"
+                    "\"focus_fell_behind_edge\":%llu,"
+                    "\"focus_fell_behind_thru\":%llu,"
                     "\"ring_ms\":%d,\"ring_samples\":%llu}\n",
                     sid, rate_msps, (unsigned long long)f,
                     (unsigned long long)d,
@@ -1336,6 +1352,9 @@ static void *stats_thread(void *arg)
                     (unsigned long long)atomic_load(&g_focus_pool_promote_dropped),
                     (unsigned long long)atomic_load(&g_focus_pool_promote_below_snr),
                     (unsigned long long)focus_frames_sum,
+                    (unsigned long long)focus_fell_behind_sum,
+                    (unsigned long long)focus_fell_behind_edge_sum,
+                    (unsigned long long)focus_fell_behind_thru_sum,
                     (int)g_iq_ring_ms, (unsigned long long)ring_samples);
             if (sn > 0) {
                 if (opt_web_port > 0) web_publish_line(sline, (size_t)sn);
