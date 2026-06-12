@@ -872,8 +872,7 @@ static int demod_downchirp_argmax(lora_decoder_t *d, const float complex *s)
                 crealf(s[2]), cimagf(s[2]), crealf(s[3]), cimagf(s[3]),
                 crealf(up_c[0]), cimagf(up_c[0]), crealf(up_c[1]), cimagf(up_c[1]),
                 crealf(up_c[2]), cimagf(up_c[2]), crealf(up_c[3]), cimagf(up_c[3]));
-            /* Also show second/third peak to see if there's spectral splitting. */
-            float p2 = 0; int b2 = 0, p3 = 0, b3 = 0;
+            /* Also show second peak to see if there's spectral splitting. */
             float pf = 0; int bf = 0;
             for (int k = 0; k < d->N; ++k) {
                 float r = crealf(fft_out_c[k]), im = cimagf(fft_out_c[k]);
