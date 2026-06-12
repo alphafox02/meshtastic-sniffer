@@ -317,6 +317,17 @@ add_executable(test_position_decode
 target_link_libraries(test_position_decode PRIVATE m)
 set_property(TARGET test_position_decode PROPERTY C_STANDARD 99)
 
+# test_mesh_decoders: regression tests for the recent upstream-alignment
+# decoder sweep -- NeighborInfo last_rx_time fixed32, ATAK MemberRole
+# table, StoreAndForward rr labels, Telemetry LocalStats dispatch,
+# PowerMetrics ch8, ATAK GeoChat receipt fields.
+add_executable(test_mesh_decoders
+    ${PROJECT_SOURCE_DIR}/tests/test_mesh_decoders.c
+    ${PROJECT_SOURCE_DIR}/mesh_decoders.c
+    ${PROJECT_SOURCE_DIR}/protobuf.c)
+target_link_libraries(test_mesh_decoders PRIVATE m)
+set_property(TARGET test_mesh_decoders PROPERTY C_STANDARD 99)
+
 # focused_demo: scan-then-focus Phase 2 prototype. One shared file reader
 # streams cs8 IQ into N independent focused-decode workers, each with its
 # own DDC chain (mixer + LPF + decim) and lora_decoder_t. Bypasses the
