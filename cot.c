@@ -261,25 +261,26 @@ void cot_publish_position(const mesh_event_t *ev, const mesh_position_t *pos)
      * XML snprintf -- preset_name and channel_name are operator/key-spec
      * controlled and have shown up with unusual characters in the wild. */
     char remarks_raw[384];
-    int rn = 0;
-    rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
-                   "from=!%08x", ev->header.from);
-    if (ev->preset_name[0])
-        rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
-                       " preset=%s", ev->preset_name);
-    if (ev->sf > 0)
-        rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
-                       " SF%d/CR4-%d/BW%d", ev->sf, ev->cr, ev->bw_hz);
-    if (ev->channel_name[0])
-        rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
-                       " ch=%s", ev->channel_name);
+    size_t rn = 0;
+    #define COT_APPEND(...) do {                                              \
+        if (rn >= sizeof(remarks_raw)) break;                                 \
+        int w_ = snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,         \
+                          __VA_ARGS__);                                       \
+        if (w_ < 0) break;                                                    \
+        rn += ((size_t)w_ >= sizeof(remarks_raw) - rn)                        \
+                ? (sizeof(remarks_raw) - rn - 1) : (size_t)w_;                \
+    } while (0)
+    COT_APPEND("from=!%08x", ev->header.from);
+    if (ev->preset_name[0])  COT_APPEND(" preset=%s", ev->preset_name);
+    if (ev->sf > 0)          COT_APPEND(" SF%d/CR4-%d/BW%d",
+                                        ev->sf, ev->cr, ev->bw_hz);
+    if (ev->channel_name[0]) COT_APPEND(" ch=%s", ev->channel_name);
     if (ev->rssi_db != 0.0f || ev->snr_db != 0.0f)
-        rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
-                       " RSSI=%.1f SNR=%.1f", (double)ev->rssi_db, (double)ev->snr_db);
+        COT_APPEND(" RSSI=%.1f SNR=%.1f",
+                   (double)ev->rssi_db, (double)ev->snr_db);
     if (ev->hop_limit || ev->hop_start)
-        rn += snprintf(remarks_raw + rn, sizeof(remarks_raw) - rn,
-                       " hop=%d/%d", ev->hop_limit, ev->hop_start);
-    (void)rn;
+        COT_APPEND(" hop=%d/%d", ev->hop_limit, ev->hop_start);
+    #undef COT_APPEND
     char remarks[sizeof(remarks_raw) * 6];
     xml_escape(remarks, sizeof(remarks), remarks_raw);
 
