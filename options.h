@@ -100,6 +100,9 @@ extern char         *opt_keys_file;       /* path; one spec per line, # comments
 extern char         *opt_share_url;       /* meshtastic.org/e/ URL to import at startup */
 extern char         *opt_iq_record;       /* path to write raw IQ to (tee from push_samples) */
 extern char         *opt_stats_json;      /* path to dump 5s per-channel stats JSON */
+/* FFTW wisdom persistence. NULL = disabled. Empty string "" = use the
+ * default XDG cache path. Non-empty = use the explicit path. */
+extern char         *opt_fftw_wisdom;
 
 /* Extra user-supplied off-grid slots (e.g. promoted from scan). */
 #define EXTRA_FREQ_MAX 32

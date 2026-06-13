@@ -28,6 +28,7 @@
 #include "psk_dict.h"
 #include "schema.h"
 #include "fftw_lock.h"
+#include "fftw_wisdom.h"
 #include "file_src.h"
 #include "keyset.h"
 #include "lora.h"
@@ -3252,6 +3253,19 @@ static int run_live(void)
 
     if (verbose) keyset_print(g_keys);
 
+    /* If requested, preload FFTW wisdom so plan creation reuses prior
+     * timing data instead of running FFTW_MEASURE from scratch. Has to
+     * happen before channelizer_create / build_channel_set, both of
+     * which call fftwf_plan_*. Save path is resolved here too so we
+     * can stash it for shutdown without re-deriving. */
+    static char *g_fftw_wisdom_path = NULL;
+    if (opt_fftw_wisdom) {
+        g_fftw_wisdom_path = (*opt_fftw_wisdom)
+            ? strdup(opt_fftw_wisdom)
+            : fftw_wisdom_default_path();
+        if (g_fftw_wisdom_path) fftw_wisdom_load(g_fftw_wisdom_path);
+    }
+
     /* Channelizer + per-channel demods */
     g_channelizer = channelizer_create((uint64_t)center_freq, (uint32_t)samp_rate);
     if (!g_channelizer) { fprintf(stderr, "channelizer_create failed\n"); return 1; }
@@ -3735,6 +3749,13 @@ static int run_live(void)
         }
     }
     g_focus_pool_size = 0;
+    /* All FFTW plans have been destroyed at this point; the planner state
+     * still in memory is what we want to persist for the next run. */
+    if (g_fftw_wisdom_path) {
+        fftw_wisdom_save(g_fftw_wisdom_path);
+        free(g_fftw_wisdom_path);
+        g_fftw_wisdom_path = NULL;
+    }
     if (g_iq_ring) {
         uint64_t total = iq_ring_total_appended(g_iq_ring);
         uint64_t oldest, newest;

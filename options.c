@@ -61,6 +61,7 @@ char         *opt_keys_file           = NULL;
 char         *opt_share_url           = NULL;
 char         *opt_iq_record           = NULL;
 char         *opt_stats_json          = NULL;
+char         *opt_fftw_wisdom         = NULL;
 
 extra_freq_t  opt_extra_freqs[EXTRA_FREQ_MAX];
 int           opt_extra_freq_count    = 0;
@@ -231,6 +232,10 @@ void options_print_help(const char *prog)
         "                         HZ:bw=BW:sf=SF:cr=CR (repeatable, max %d)\n"
         "  --iq-record=PATH       tee raw IQ samples to a file for later replay\n"
         "  --stats-json=PATH      write per-channel stats JSON every 5s (rotates)\n"
+        "  --fftw-wisdom[=PATH]   load/save FFTW plan timing data so cold starts skip\n"
+        "                         the FFTW_MEASURE benchmark (off by default). Without\n"
+        "                         PATH uses $XDG_CACHE_HOME/meshtastic-sniffer/fftw.wisdom\n"
+        "                         or $HOME/.cache/meshtastic-sniffer/fftw.wisdom.\n"
         "\n"
         "Outputs (any combination):\n"
         "  --feed=HOST:PORT       JSON UDP feed (repeatable, max %d)\n"
@@ -355,7 +360,7 @@ int options_parse(int argc, char **argv)
         O_USRP, O_VITA49, O_FILE, O_IQ_FORMAT,
         O_CENTER, O_RATE, O_GAIN, O_BIAS, O_PPM, O_CLOCK,
         O_REGION, O_PRESETS, O_KEYS, O_KEYS_FILE, O_SHARE_URL, O_EXTRA_FREQ,
-        O_IQ_RECORD, O_STATS_JSON,
+        O_IQ_RECORD, O_STATS_JSON, O_FFTW_WISDOM,
         O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_STATION, O_GPSD, O_API_TOKEN,
         O_PCAP, O_PCAP_FIFO, O_PSK_WORDLIST, O_ARCHIVE, O_GEOFENCE, O_ANNOUNCE_TO, O_C2_DEALER,
         O_ZMQ_CURVE_SECRET, O_ZMQ_CURVE_KEYGEN, O_STATION_T_ACC_NS,
@@ -400,6 +405,7 @@ int options_parse(int argc, char **argv)
         { "share-url",  required_argument, NULL, O_SHARE_URL },
         { "iq-record",  required_argument, NULL, O_IQ_RECORD },
         { "stats-json", required_argument, NULL, O_STATS_JSON },
+        { "fftw-wisdom", optional_argument, NULL, O_FFTW_WISDOM },
         { "extra-freq", required_argument, NULL, O_EXTRA_FREQ },
         { "feed",       required_argument, NULL, O_FEED },
         { "mqtt",       required_argument, NULL, O_MQTT },
@@ -548,6 +554,10 @@ int options_parse(int argc, char **argv)
         case O_SHARE_URL:  opt_share_url  = strdup(optarg); break;
         case O_IQ_RECORD:  opt_iq_record  = strdup(optarg); break;
         case O_STATS_JSON: opt_stats_json = strdup(optarg); break;
+        case O_FFTW_WISDOM:
+            /* Empty string means "use the default cache path". */
+            opt_fftw_wisdom = strdup(optarg ? optarg : "");
+            break;
         case O_EXTRA_FREQ:
             if (parse_extra_freq(optarg) < 0) {
                 fprintf(stderr, "bad --extra-freq=%s (need HZ:bw=BW:sf=SF:cr=CR)\n", optarg);
