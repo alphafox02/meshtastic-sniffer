@@ -1,6 +1,6 @@
 module github.com/cemaxecuter/meshtastic-fusion
 
-go 1.25.10
+go 1.25.11
 
 require github.com/go-zeromq/zmq4 v0.17.0
 
