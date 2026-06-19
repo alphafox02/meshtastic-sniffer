@@ -319,6 +319,18 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                 if (u.is_licensed)   jw_field_bool(j, "licensed",  true);
                 if (u.have_is_unmessagable)
                     jw_field_bool(j, "unmessagable", u.is_unmessagable);
+                if (u.have_public_key) {
+                    /* 32 raw bytes -> 64 hex chars + NUL. Field is public
+                     * per the proto name; PKI-DM peers need it. */
+                    char hex[2 * sizeof(u.public_key) + 1];
+                    static const char H[] = "0123456789abcdef";
+                    for (size_t k = 0; k < sizeof(u.public_key); ++k) {
+                        hex[2*k    ] = H[(u.public_key[k] >> 4) & 0xF];
+                        hex[2*k + 1] = H[ u.public_key[k]       & 0xF];
+                    }
+                    hex[2 * sizeof(u.public_key)] = '\0';
+                    jw_field_str(j, "public_key", hex);
+                }
                 node_db_remember(ev->header.from, u.long_name, u.short_name,
                                  u.hw_model, u.role);
             }

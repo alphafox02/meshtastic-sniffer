@@ -230,6 +230,49 @@ static void test_power_metrics_ch8(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* User: public_key (field 8, 32 raw bytes) must be parsed into       */
+/* mesh_user_t.public_key with have_public_key set, so the JSON emit  */
+/* layer can surface it in NODEINFO events.                           */
+/* ------------------------------------------------------------------ */
+static const uint8_t USER_PUBKEY_FIXTURE[] = {
+    /* field 1 id      = "!12345678" */
+    0x0A, 0x09, 0x21, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+    /* field 2 long_name = "HK" */
+    0x12, 0x02, 0x48, 0x4B,
+    /* field 3 short_name = "HK" */
+    0x1A, 0x02, 0x48, 0x4B,
+    /* field 5 hw_model = 4 */
+    0x28, 0x04,
+    /* field 7 role     = 1 */
+    0x38, 0x01,
+    /* field 8 public_key = 0x00..0x1F (32 bytes) */
+    0x42, 0x20,
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F,
+};
+
+static void test_user_public_key(void)
+{
+    mesh_user_t u;
+    bool ok = mesh_decode_user(USER_PUBKEY_FIXTURE,
+                               sizeof(USER_PUBKEY_FIXTURE), &u);
+    CHECK(ok, "mesh_decode_user returned false on User-with-pubkey fixture");
+    CHECK_STR(u.id,         "!12345678");
+    CHECK_STR(u.long_name,  "HK");
+    CHECK_STR(u.short_name, "HK");
+    CHECK(u.hw_model == 4u, "hw_model: got %u want 4", u.hw_model);
+    CHECK(u.role     == 1u, "role: got %u want 1",     u.role);
+    CHECK(u.have_public_key, "have_public_key not set");
+    bool ok_bytes = true;
+    for (int k = 0; k < 32; ++k) {
+        if (u.public_key[k] != (uint8_t)k) { ok_bytes = false; break; }
+    }
+    CHECK(ok_bytes, "public_key bytes do not match 0x00..0x1F sequence");
+}
+
+/* ------------------------------------------------------------------ */
 /* Traceroute decoder accepts UNPACKED repeated scalars.              */
 /* proto3 lets a sender encode `repeated uint32 route` as one         */
 /* tag+varint per element; the decoder used to assume wt=2 (packed)   */
@@ -303,6 +346,7 @@ int main(void)
     test_telemetry_health();
     test_telemetry_host();
     test_telemetry_traffic();
+    test_user_public_key();
     test_power_metrics_ch8();
     test_traceroute_unpacked();
     test_atak_geochat_receipt();
