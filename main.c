@@ -718,7 +718,12 @@ static void on_off_grid_discovery(const scanner_discovery_t *disc, void *user)
         (unsigned long long)disc->f_hz, (double)disc->snr_db, (double)disc->bw_hz_estimate);
     if (n < 0) return;
     fwrite(line, 1, (size_t)n, stdout); fflush(stdout);
-    webhook_publish("OFF_GRID_LORA", line, (size_t)n);
+    char sum[160];
+    snprintf(sum, sizeof(sum),
+             "Off-grid LoRa: %.3f MHz, SNR %.1f dB, ~%.0f kHz",
+             disc->f_hz / 1e6, (double)disc->snr_db,
+             (double)disc->bw_hz_estimate / 1000.0);
+    webhook_publish("OFF_GRID_LORA", line, (size_t)n, sum);
     fprintf(stderr, "[scanner] off-grid LoRa-shaped energy at %.3f MHz, SNR %.1f dB\n",
             disc->f_hz / 1e6, (double)disc->snr_db);
 }
@@ -777,7 +782,11 @@ static void replay_check(const mesh_event_t *ev)
             if (n > 0) {
                 fwrite(line, 1, (size_t)n, stdout); fflush(stdout);
                 if (opt_web_port > 0) web_publish_line(line, (size_t)n);
-                webhook_publish("REPLAY_SUSPECTED", line, (size_t)n);
+                char sum[160];
+                snprintf(sum, sizeof(sum),
+                         "Replay suspected: from !%08x, packet %u, %.1fs later",
+                         from, pid, (double)delta_us / 1.0e6);
+                webhook_publish("REPLAY_SUSPECTED", line, (size_t)n, sum);
             }
             e->alerted = true;
         }
@@ -3392,7 +3401,8 @@ static int run_live(void)
     }
 
     /* Opt-in webhook sink. No-op when --webhook-url is unset. */
-    webhook_init(opt_webhook_url, opt_webhook_on, opt_webhook_timeout_ms);
+    webhook_init(opt_webhook_url, opt_webhook_on, opt_webhook_timeout_ms,
+                 webhook_format_parse(opt_webhook_format));
 
     /* Channelizer + per-channel demods */
     g_channelizer = channelizer_create((uint64_t)center_freq, (uint32_t)samp_rate);

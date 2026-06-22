@@ -105,9 +105,11 @@ extern char         *opt_stats_json;      /* path to dump 5s per-channel stats J
 extern char         *opt_fftw_wisdom;
 
 /* Webhook sink. NULL url = disabled. event_csv NULL/empty uses the
- * default allowlist (PSK_DISCOVERED, OFF_GRID_LORA, GEOFENCE_*). */
+ * default allowlist (PSK_DISCOVERED, OFF_GRID_LORA, GEOFENCE_*).
+ * format selects the wire shape: "raw" (default), "slack", "discord". */
 extern char         *opt_webhook_url;
 extern char         *opt_webhook_on;
+extern char         *opt_webhook_format;
 extern int           opt_webhook_timeout_ms;
 
 /* Extra user-supplied off-grid slots (e.g. promoted from scan). */

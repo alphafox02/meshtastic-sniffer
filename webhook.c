@@ -36,10 +36,11 @@ typedef struct {
     size_t len;
 } qitem_t;
 
-static const char     *g_url            = NULL;
-static int             g_timeout_ms     = 1000;
-static char            g_allow[WEBHOOK_MAX_EVENTS][WEBHOOK_NAME_MAX];
-static int             g_allow_n        = 0;
+static const char       *g_url           = NULL;
+static int               g_timeout_ms    = 1000;
+static webhook_format_t  g_format        = WEBHOOK_FORMAT_RAW;
+static char              g_allow[WEBHOOK_MAX_EVENTS][WEBHOOK_NAME_MAX];
+static int               g_allow_n       = 0;
 
 static qitem_t         g_queue[WEBHOOK_QUEUE_CAP];
 static int             g_head           = 0;   /* next pop slot */
@@ -140,7 +141,57 @@ static void *webhook_thread(void *arg)
     return NULL;
 }
 
-int webhook_init(const char *url, const char *event_csv, int timeout_ms)
+webhook_format_t webhook_format_parse(const char *s)
+{
+    if (!s || !*s) return WEBHOOK_FORMAT_RAW;
+    if (strcasecmp(s, "slack")   == 0) return WEBHOOK_FORMAT_SLACK;
+    if (strcasecmp(s, "discord") == 0) return WEBHOOK_FORMAT_DISCORD;
+    return WEBHOOK_FORMAT_RAW;
+}
+
+/* JSON-escape `src` into `dst`. Returns bytes written (not counting
+ * the NUL). Caller sizes dst at >= 6*srclen + 1 in the worst case
+ * (every byte escapes to \uXXXX). At normal alphanumeric input the
+ * inflation is zero. */
+static size_t json_escape(const char *src, size_t srclen,
+                          char *dst, size_t dstcap)
+{
+    size_t w = 0;
+    for (size_t i = 0; i < srclen; ++i) {
+        unsigned char c = (unsigned char)src[i];
+        const char *esc = NULL;
+        char ubuf[8];
+        switch (c) {
+        case '"':  esc = "\\\""; break;
+        case '\\': esc = "\\\\"; break;
+        case '\n': esc = "\\n";  break;
+        case '\r': esc = "\\r";  break;
+        case '\t': esc = "\\t";  break;
+        case '\b': esc = "\\b";  break;
+        case '\f': esc = "\\f";  break;
+        default:
+            if (c < 0x20) {
+                snprintf(ubuf, sizeof(ubuf), "\\u%04x", c);
+                esc = ubuf;
+            }
+            break;
+        }
+        if (esc) {
+            size_t n = strlen(esc);
+            if (w + n + 1 > dstcap) break;
+            memcpy(dst + w, esc, n);
+            w += n;
+        } else {
+            if (w + 2 > dstcap) break;
+            dst[w++] = (char)c;
+        }
+    }
+    if (w < dstcap) dst[w] = 0;
+    return w;
+}
+
+int webhook_init(const char *url, const char *event_csv,
+                 int timeout_ms, webhook_format_t format)
 {
     if (!url || !*url) return 0;  /* not configured; quiet no-op */
     if (g_started) return 0;
@@ -149,6 +200,7 @@ int webhook_init(const char *url, const char *event_csv, int timeout_ms)
     if (timeout_ms > 30000) timeout_ms = 30000;
     g_timeout_ms = timeout_ms;
     g_url        = url;
+    g_format     = format;
 
     if (event_csv && *event_csv) {
         /* Parse the comma-separated allowlist. Anything longer than
@@ -188,8 +240,11 @@ int webhook_init(const char *url, const char *event_csv, int timeout_ms)
         return -1;
     }
     g_started = true;
-    fprintf(stderr, "webhook: enabled, url=%s, allowlist=%d events, timeout=%d ms\n",
-            g_url, g_allow_n, g_timeout_ms);
+    const char *fmt_name =
+        (g_format == WEBHOOK_FORMAT_SLACK)   ? "slack"   :
+        (g_format == WEBHOOK_FORMAT_DISCORD) ? "discord" : "raw";
+    fprintf(stderr, "webhook: enabled, url=%s, format=%s, allowlist=%d events, timeout=%d ms\n",
+            g_url, fmt_name, g_allow_n, g_timeout_ms);
     return 0;
 }
 
@@ -204,29 +259,54 @@ void webhook_stop(void)
     g_started = false;
 }
 
-void webhook_publish(const char *event_name, const char *json, size_t len)
+void webhook_publish(const char *event_name,
+                     const char *json, size_t len,
+                     const char *summary)
 {
-    if (!g_started || !event_name || !json || len == 0) return;
+    if (!g_started || !event_name) return;
     if (!event_allowed(event_name)) return;
 
-    /* Copy the body. The original buffer is stack-allocated at the
-     * call site, so the worker thread cannot read it after we return. */
-    char *copy = malloc(len);
-    if (!copy) {
-        atomic_fetch_add(&g_dropped_total, 1);
-        return;
+    /* Build the body in the wire shape requested by --webhook-format.
+     * RAW posts the sniffer's own JSON line verbatim. SLACK and
+     * DISCORD wrap the summary in their expected envelope so the URL
+     * can be a hosted incoming-webhook directly. Falls back to the
+     * event_name if no summary was supplied for an event. */
+    char *body = NULL;
+    size_t body_len = 0;
+
+    if (g_format == WEBHOOK_FORMAT_RAW) {
+        if (!json || len == 0) return;
+        body = malloc(len);
+        if (!body) { atomic_fetch_add(&g_dropped_total, 1); return; }
+        memcpy(body, json, len);
+        body_len = len;
+    } else {
+        const char *text = (summary && *summary) ? summary : event_name;
+        size_t tlen = strlen(text);
+        /* worst-case 6x inflation per char if everything escapes. */
+        size_t cap = tlen * 6 + 64;
+        char *esc = malloc(cap);
+        if (!esc) { atomic_fetch_add(&g_dropped_total, 1); return; }
+        size_t elen = json_escape(text, tlen, esc, cap);
+        const char *key = (g_format == WEBHOOK_FORMAT_SLACK) ? "text" : "content";
+        size_t out_cap = elen + 32;
+        body = malloc(out_cap);
+        if (!body) { free(esc); atomic_fetch_add(&g_dropped_total, 1); return; }
+        int wn = snprintf(body, out_cap, "{\"%s\":\"%.*s\"}", key, (int)elen, esc);
+        free(esc);
+        if (wn < 0) { free(body); atomic_fetch_add(&g_dropped_total, 1); return; }
+        body_len = (size_t)wn;
     }
-    memcpy(copy, json, len);
 
     pthread_mutex_lock(&g_mu);
     if (g_count >= WEBHOOK_QUEUE_CAP) {
         pthread_mutex_unlock(&g_mu);
-        free(copy);
+        free(body);
         atomic_fetch_add(&g_dropped_total, 1);
         return;
     }
-    g_queue[g_tail].body = copy;
-    g_queue[g_tail].len  = len;
+    g_queue[g_tail].body = body;
+    g_queue[g_tail].len  = body_len;
     g_tail = (g_tail + 1) % WEBHOOK_QUEUE_CAP;
     ++g_count;
     pthread_cond_signal(&g_cv);
