@@ -212,6 +212,7 @@ static double  g_iq_record_peak_mag2 = 0; /* max |sample|^2 observed */
 
 /* Per-channel rolling stats for --stats-json. Bumped from on_lora_frame
  * by channel id, dumped every 5s to stats-json file (rotates in place). */
+#define CHAN_SNR_HISTORY_BUCKETS 60   /* one minute each = 1 hour of history */
 typedef struct {
     uint64_t frames;
     uint64_t decrypted;
@@ -226,6 +227,17 @@ typedef struct {
     int      bw_hz;
     uint64_t freq_hz;
     char     preset_name[24];
+
+    /* Rolling per-minute SNR history. Sliced into CHAN_SNR_HISTORY_BUCKETS
+     * buckets, one per wall-clock minute. snr_history_last_min is the
+     * unix-minute the most recent bucket covers; on a new minute the head
+     * advances and any skipped buckets are cleared. Only frames with
+     * payload_crc_ok feed this so the sparkline tracks real packet
+     * quality, not ambient noise or CRC-fail leakage. */
+    double   snr_history_sum[CHAN_SNR_HISTORY_BUCKETS];
+    uint16_t snr_history_count[CHAN_SNR_HISTORY_BUCKETS];
+    int      snr_history_head;        /* index of the current (newest) bucket */
+    uint64_t snr_history_last_min;    /* unix epoch seconds / 60 */
 } chan_stat_t;
 static chan_stat_t g_chan_stats[CHANNELIZER_MAX_CHANNELS];
 /* Guards the non-atomic fields in chan_stat_t -- snr_db_sum (double) and
@@ -863,6 +875,39 @@ static void dedup_emit_locked(const dedup_entry_t *e)
         pthread_mutex_lock(&g_chan_stats_mu);
         g_chan_stats[channel_id].snr_db_sum   += (double)e->best_meta.snr_db;
         g_chan_stats[channel_id].snr_db_count += 1;
+        /* Per-minute SNR history ring -- only count frames whose CRC passed
+         * (or had no CRC at all, treated as trusted). CRC-fail replicas are
+         * bit-corrupted phantoms whose SNR estimate would mislead. */
+        bool trusted = !e->best_meta.has_crc || e->best_meta.payload_crc_ok;
+        if (trusted) {
+            chan_stat_t *cs = &g_chan_stats[channel_id];
+            uint64_t now_min = (uint64_t)time(NULL) / 60u;
+            if (cs->snr_history_last_min == 0) {
+                /* First sample: align to the current minute. */
+                cs->snr_history_last_min = now_min;
+            } else if (now_min > cs->snr_history_last_min) {
+                /* Advance the head one bucket per elapsed minute, clearing
+                 * skipped buckets so gaps in traffic show as gaps. Cap at
+                 * the ring size: if more than CHAN_SNR_HISTORY_BUCKETS
+                 * minutes elapsed, wipe the whole ring. */
+                uint64_t skipped = now_min - cs->snr_history_last_min;
+                if (skipped >= CHAN_SNR_HISTORY_BUCKETS) {
+                    memset(cs->snr_history_sum, 0, sizeof(cs->snr_history_sum));
+                    memset(cs->snr_history_count, 0, sizeof(cs->snr_history_count));
+                    cs->snr_history_head = 0;
+                } else {
+                    for (uint64_t k = 0; k < skipped; ++k) {
+                        cs->snr_history_head =
+                            (cs->snr_history_head + 1) % CHAN_SNR_HISTORY_BUCKETS;
+                        cs->snr_history_sum  [cs->snr_history_head] = 0.0;
+                        cs->snr_history_count[cs->snr_history_head] = 0;
+                    }
+                }
+                cs->snr_history_last_min = now_min;
+            }
+            cs->snr_history_sum  [cs->snr_history_head] += (double)e->best_meta.snr_db;
+            cs->snr_history_count[cs->snr_history_head] += 1;
+        }
         pthread_mutex_unlock(&g_chan_stats_mu);
     }
     /* PCAP output: write the wire-shape frame (16-byte radio header +
@@ -1367,6 +1412,71 @@ static void *stats_thread(void *arg)
             if (sn > 0) {
                 if (opt_web_port > 0) web_publish_line(sline, (size_t)sn);
                 zmq_pub_publish(sline, (size_t)sn);
+            }
+
+            /* Per-channel SNR sparkline. Separate event so the fixed
+             * sline[] buffer stays bounded; this one varies with how many
+             * channels have recent traffic. Format:
+             *   {"event":"CHAN_SNR","ts":...,"channels":[{"id":N,"snr":[..60..]}, ...]}
+             * Each sparkline value is a small int (rounded dB) or -1 to
+             * mean "no data in this minute." Only channels that have at
+             * least one sample anywhere in the ring are emitted, so an
+             * 800-channel grid with 5 active senders publishes 5 entries. */
+            if (opt_web_port > 0 || opt_zmq_endpoint) {
+                /* Worst-case sizing: 256 bytes overhead + 360 bytes per slot
+                 * (id field + 60 ints averaging 3 chars each + commas + JSON
+                 * wrapping). At CHANNELIZER_MAX_CHANNELS=1024 this peaks
+                 * around 370 KB, but the has-data filter typically keeps
+                 * actual emit at a few KB. Allocation is freed each tick. */
+                size_t cap = 256 +
+                    (size_t)CHANNELIZER_MAX_CHANNELS * 360;
+                char *chan_snr = malloc(cap);
+                if (chan_snr) {
+                    int csn = snprintf(chan_snr, cap,
+                        "{\"event\":\"CHAN_SNR\",\"ts\":%ld,\"channels\":[",
+                        (long)time(NULL));
+                    /* Iterate the WHOLE g_chan_stats range so focused-pool
+                     * slot decodes (channel ids 1019..1023 in the current
+                     * layout) get their SNR history published too. The
+                     * has-data check skips empties so this stays cheap. */
+                    bool first = true;
+                    pthread_mutex_lock(&g_chan_stats_mu);
+                    for (int i = 0; i < CHANNELIZER_MAX_CHANNELS
+                                  && csn > 0 && (size_t)csn < cap; ++i) {
+                        chan_stat_t *cs = &g_chan_stats[i];
+                        int has_data = 0;
+                        for (int b = 0; b < CHAN_SNR_HISTORY_BUCKETS; ++b)
+                            if (cs->snr_history_count[b]) { has_data = 1; break; }
+                        if (!has_data) continue;
+                        csn += snprintf(chan_snr + csn, cap - (size_t)csn,
+                                        "%s{\"id\":%d,\"snr\":[",
+                                        first ? "" : ",", i);
+                        first = false;
+                        /* Walk oldest-first so the dashboard renders left-to-right
+                         * as past-to-present. head is the newest bucket. */
+                        for (int k = 0; k < CHAN_SNR_HISTORY_BUCKETS
+                                     && csn > 0 && (size_t)csn < cap; ++k) {
+                            int idx = (cs->snr_history_head + 1 + k)
+                                      % CHAN_SNR_HISTORY_BUCKETS;
+                            int val = -1;
+                            if (cs->snr_history_count[idx]) {
+                                double avg = cs->snr_history_sum[idx]
+                                             / (double)cs->snr_history_count[idx];
+                                val = (int)(avg + (avg >= 0 ? 0.5 : -0.5));
+                            }
+                            csn += snprintf(chan_snr + csn, cap - (size_t)csn,
+                                            "%s%d", k ? "," : "", val);
+                        }
+                        csn += snprintf(chan_snr + csn, cap - (size_t)csn, "]}");
+                    }
+                    pthread_mutex_unlock(&g_chan_stats_mu);
+                    csn += snprintf(chan_snr + csn, cap - (size_t)csn, "]}\n");
+                    if (csn > 0 && (size_t)csn < cap) {
+                        if (opt_web_port > 0) web_publish_line(chan_snr, (size_t)csn);
+                        zmq_pub_publish(chan_snr, (size_t)csn);
+                    }
+                    free(chan_snr);
+                }
             }
 
             if (opt_stats_json) {

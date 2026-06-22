@@ -112,6 +112,10 @@ static const char DASHBOARD_HTML[] =
 ".log-item .ts{color:#64748b;font-size:11px;margin-right:6px}\n"
 ".log-item b{color:#38bdf8}\n"
 ".port{color:#a78bfa;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;background:#1e1b2e;padding:1px 5px;border-radius:3px;margin:0 4px}\n"
+".snr-arrow{margin-left:3px;font-size:12px;line-height:1}\n"
+".snr-up   {color:#4ade80}\n"
+".snr-down {color:#f87171}\n"
+".snr-flat {color:#64748b}\n"
 /* Config + Activity tabs are plain block content -- override the
  * .tab.active{display:flex} that's right for Live.
  * Topology tab uses a flex column so the canvas can fill the pane. */
@@ -286,7 +290,7 @@ static const char DASHBOARD_HTML[] =
 "        <tbody></tbody>\n"
 "      </table>\n"
 "    </div>\n"
-"    <div class=\"pane\"><h2>Channels <span class=muted>(by hash)</span></h2><table id=\"channels\"><thead><tr><th>Hash</th><th>Name</th><th>Preset</th><th>Frames</th><th>Decrypt</th><th>Slots</th><th>Last</th></tr></thead><tbody></tbody></table></div>\n"
+"    <div class=\"pane\"><h2>Channels <span class=muted>(by hash)</span></h2><table id=\"channels\"><thead><tr><th>Hash</th><th>Name</th><th>Preset</th><th>Frames</th><th>Decrypt</th><th>Slots</th><th>SNR (1h)</th><th>Last</th></tr></thead><tbody></tbody></table></div>\n"
 "    <div class=\"pane\"><h2>Messages</h2><div id=\"msgs\"></div></div>\n"
 "    <div class=\"pane\"><h2>Discoveries &amp; ATAK</h2><div id=\"disc\"></div></div>\n"
 "  </div>\n"
@@ -394,6 +398,10 @@ static const char DASHBOARD_HTML[] =
 "  } catch (err) { btn.textContent = 'error'; btn.disabled = false; }\n"
 "});\n"
 "const chTbody = document.querySelector('#channels tbody');\n"
+/* Per-slot rolling SNR history, keyed by physical slot id. Filled from
+ * CHAN_SNR SSE events; renderChannels() averages buckets across the
+ * slots that map to each channel hash. */
+"const chanSnr = {};\n"
 "const nodesCount = document.getElementById('nodes-count');\n"
 "const nodesSearch = document.getElementById('nodes-search');\n"
 "// LRU cap on the nodes map. Busy environments produce hundreds of\n"
@@ -617,6 +625,53 @@ static const char DASHBOARD_HTML[] =
 "  channelsRafQueued = true;\n"
 "  requestAnimationFrame(()=>{ channelsRafQueued = false; renderChannels(); });\n"
 "}\n"
+/* aggregateSnr -- collapse per-slot rings into one 60-bucket view for
+ * the channel hash (which can span multiple physical slots). Each
+ * bucket is the mean across slots that had data in that minute. */
+"function aggregateSnr(slotSet){\n"
+"  const out = new Array(60).fill(null);\n"
+"  const sum = new Array(60).fill(0);\n"
+"  const cnt = new Array(60).fill(0);\n"
+"  if (!slotSet) return out;\n"
+"  for (const slot of slotSet){\n"
+"    const ring = chanSnr[slot];\n"
+"    if (!ring) continue;\n"
+"    for (let i=0; i<60 && i<ring.length; i++){\n"
+"      if (ring[i] >= 0){ sum[i] += ring[i]; cnt[i] += 1; }\n"
+"    }\n"
+"  }\n"
+"  for (let i=0; i<60; i++) if (cnt[i]) out[i] = sum[i]/cnt[i];\n"
+"  return out;\n"
+"}\n"
+/* snrSummary -- compress the 60-bucket history into one cell:
+ *   current = newest populated minute (rounded dB)
+ *   trend   = least-squares slope over up to 10 most-recent populated
+ *             buckets. slope > +0.5 dB/min = up, < -0.5 = down, else
+ *             flat. Returns null when nothing populated so the cell
+ *             shows '--' instead of confusing zeros. */
+"function snrSummary(buckets){\n"
+"  let current = null, currentIdx = -1;\n"
+"  for (let i = buckets.length - 1; i >= 0; i--){\n"
+"    if (buckets[i] !== null){ current = buckets[i]; currentIdx = i; break; }\n"
+"  }\n"
+"  if (currentIdx < 0) return null;\n"
+"  const xs = [], ys = [];\n"
+"  for (let i = currentIdx; i >= 0 && xs.length < 10; i--){\n"
+"    if (buckets[i] !== null){ xs.push(i); ys.push(buckets[i]); }\n"
+"  }\n"
+"  let trend = 'flat';\n"
+"  if (ys.length >= 3){\n"
+"    const n = ys.length;\n"
+"    const mx = xs.reduce((a,b)=>a+b,0)/n;\n"
+"    const my = ys.reduce((a,b)=>a+b,0)/n;\n"
+"    let num = 0, den = 0;\n"
+"    for (let i = 0; i < n; i++){ const dx = xs[i]-mx; num += dx*(ys[i]-my); den += dx*dx; }\n"
+"    const slope = den ? num/den : 0;\n"
+"    if (slope >  0.5) trend = 'up';\n"
+"    else if (slope < -0.5) trend = 'down';\n"
+"  }\n"
+"  return { current: Math.round(current), trend };\n"
+"}\n"
 "function renderChannels(){\n"
 "  const hashes = Object.keys(channels).sort((a,b)=>channels[b].ts-channels[a].ts);\n"
 "  const frag = document.createDocumentFragment();\n"
@@ -632,8 +687,12 @@ static const char DASHBOARD_HTML[] =
 "    const decCell = c.decrypted>0 ? `${c.decrypted}/${c.total} (${dec}%)` : `<span class=muted>0/${c.total}</span>`;\n"
 "    const slotN = c.slots ? c.slots.size : 0;\n"
 "    const slotCell = slotN>0 ? (c.lastSlot!==undefined ? `${slotN} <span class=muted>(last #${c.lastSlot})</span>` : `${slotN}`) : '<span class=muted>--</span>';\n"
-"    tr.innerHTML=`<td>${hashHex}</td><td>${name}</td><td>${preset}</td><td>${c.total}</td><td>${decCell}</td><td>${slotCell}</td><td>${fmtTime(c.ts)}</td>`;\n"
-"    frag.appendChild(tr);}\n"
+"    const s = snrSummary(aggregateSnr(c.slots));\n"
+"    const arrows = {up:'\\u2197', down:'\\u2198', flat:'\\u2192'};\n"
+"    const snrCell = s ? `${s.current} dB <span class='snr-arrow snr-${s.trend}'>${arrows[s.trend]}</span>` : `<span class=muted>--</span>`;\n"
+"    tr.innerHTML=`<td>${hashHex}</td><td>${name}</td><td>${preset}</td><td>${c.total}</td><td>${decCell}</td><td>${slotCell}</td><td>${snrCell}</td><td>${fmtTime(c.ts)}</td>`;\n"
+"    frag.appendChild(tr);\n"
+"  }\n"
 "  chTbody.replaceChildren(frag);\n"
 "}\n"
 "function exportCsv(){\n"
@@ -1246,6 +1305,17 @@ static const char DASHBOARD_HTML[] =
 "        else accLabel = ` (${accNs} ns)`;\n"
 "      }\n"
 "      setStat('st-clock', p.clock + accLabel);\n"
+"    }\n"
+"    return;\n"
+"  }\n"
+"  if (p.event === 'CHAN_SNR') {\n"
+/* Per-slot SNR sparkline updates. Each entry is {id, snr:[60 ints,
+ * -1 for empty bucket, otherwise rounded dB]}. Store keyed by slot id;
+ * renderChannels() aggregates across the slots that share a channel
+ * hash because the Channels table groups by hash. */
+"    if (Array.isArray(p.channels)) {\n"
+"      for (const c of p.channels) chanSnr[c.id] = c.snr;\n"
+"      refreshChannels();\n"
 "    }\n"
 "    return;\n"
 "  }\n"
