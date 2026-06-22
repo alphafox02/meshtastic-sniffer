@@ -88,8 +88,10 @@ static void post_one(CURL *curl, qitem_t *q)
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, (long)g_timeout_ms);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, drop_body);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
+    /* Do not follow redirects. The webhook URL is the operator's exact
+     * intended destination; if Slack/Discord/etc. ever returned a 3xx
+     * to a third party, we would silently leak the alert payload. */
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
 
     CURLcode rc = curl_easy_perform(curl);
     long status = 0;
@@ -107,7 +109,11 @@ static void *webhook_thread(void *arg)
     (void)arg;
     CURL *curl = curl_easy_init();
     if (!curl) {
+        /* Mark the sink as not-running so webhook_publish() stops
+         * enqueueing; otherwise events silently pile up to the queue
+         * cap and then start counting as drops with no clue why. */
         fprintf(stderr, "webhook: curl_easy_init failed; webhook disabled\n");
+        atomic_store(&g_run, false);
         return NULL;
     }
     pthread_mutex_lock(&g_mu);
@@ -144,9 +150,37 @@ static void *webhook_thread(void *arg)
 webhook_format_t webhook_format_parse(const char *s)
 {
     if (!s || !*s) return WEBHOOK_FORMAT_RAW;
+    if (strcasecmp(s, "raw")     == 0) return WEBHOOK_FORMAT_RAW;
     if (strcasecmp(s, "slack")   == 0) return WEBHOOK_FORMAT_SLACK;
     if (strcasecmp(s, "discord") == 0) return WEBHOOK_FORMAT_DISCORD;
+    /* Unknown value -- complain loudly. Without this an operator
+     * who typo'd 'slcak' would silently post raw JSON to a Slack URL
+     * and wonder why Slack swallowed the messages. */
+    fprintf(stderr, "webhook: unknown --webhook-format '%s'; expected one of raw, slack, discord. "
+                    "Falling back to raw.\n", s);
     return WEBHOOK_FORMAT_RAW;
+}
+
+/* Build a privacy-safe view of `url` for the startup log. Webhook URLs
+ * frequently encode a bearer-equivalent secret in the path (Slack:
+ * /services/T../B../<secret>; Discord: /api/webhooks/<id>/<token>), so
+ * the full URL belongs in the operator's config, not in journald. We
+ * keep the scheme + host visible (so operators can see WHERE we are
+ * about to post) and replace the path component with '<redacted>'. */
+static void redacted_url(const char *url, char *out, size_t out_cap)
+{
+    if (!url || !out || out_cap == 0) return;
+    out[0] = 0;
+    const char *scheme_end = strstr(url, "://");
+    if (!scheme_end) {
+        snprintf(out, out_cap, "<redacted>");
+        return;
+    }
+    const char *host = scheme_end + 3;
+    const char *path = strchr(host, '/');
+    if (!path) path = host + strlen(host);
+    snprintf(out, out_cap, "%.*s/<redacted>",
+             (int)(path - url), url);
 }
 
 /* JSON-escape `src` into `dst`. Returns bytes written (not counting
@@ -203,15 +237,18 @@ int webhook_init(const char *url, const char *event_csv,
     g_format     = format;
 
     if (event_csv && *event_csv) {
-        /* Parse the comma-separated allowlist. Anything longer than
-         * WEBHOOK_NAME_MAX is truncated; anything past
-         * WEBHOOK_MAX_EVENTS is dropped with a stderr warning. */
+        /* Parse the comma-separated allowlist. Whitespace either side
+         * of an entry is trimmed. Anything longer than WEBHOOK_NAME_MAX
+         * is truncated; anything past WEBHOOK_MAX_EVENTS is dropped
+         * with a stderr warning. */
         const char *p = event_csv;
         while (*p && g_allow_n < WEBHOOK_MAX_EVENTS) {
-            while (*p == ',' || *p == ' ') ++p;
+            while (*p == ',' || *p == ' ' || *p == '\t') ++p;
             const char *start = p;
             while (*p && *p != ',') ++p;
-            size_t n = (size_t)(p - start);
+            const char *e = p;
+            while (e > start && (e[-1] == ' ' || e[-1] == '\t')) --e;
+            size_t n = (size_t)(e - start);
             if (n == 0) continue;
             if (n >= WEBHOOK_NAME_MAX) n = WEBHOOK_NAME_MAX - 1;
             memcpy(g_allow[g_allow_n], start, n);
@@ -243,8 +280,10 @@ int webhook_init(const char *url, const char *event_csv,
     const char *fmt_name =
         (g_format == WEBHOOK_FORMAT_SLACK)   ? "slack"   :
         (g_format == WEBHOOK_FORMAT_DISCORD) ? "discord" : "raw";
+    char safe_url[256];
+    redacted_url(g_url, safe_url, sizeof(safe_url));
     fprintf(stderr, "webhook: enabled, url=%s, format=%s, allowlist=%d events, timeout=%d ms\n",
-            g_url, fmt_name, g_allow_n, g_timeout_ms);
+            safe_url, fmt_name, g_allow_n, g_timeout_ms);
     return 0;
 }
 
