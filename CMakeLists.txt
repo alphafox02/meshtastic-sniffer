@@ -353,6 +353,16 @@ target_link_libraries(focused_demo PRIVATE
     m)
 set_property(TARGET focused_demo PROPERTY C_STANDARD 99)
 
+# lora_synth: standalone LoRa preamble synthesizer (cf32) for validating the
+# coherent preamble detector. Pure generator -- only math.h/stdio, links
+# nothing but libm (no FFTW, no lora.c). Emits K upchirps at a given in-band
+# SNR so the detector's sensitivity gain vs the single-symbol floor can be
+# measured directly with an SNR sweep.
+add_executable(lora_synth
+    ${PROJECT_SOURCE_DIR}/tests/lora_synth.c)
+target_link_libraries(lora_synth PRIVATE m)
+set_property(TARGET lora_synth PROPERTY C_STANDARD 99)
+
 # CPack
 set(CPACK_PACKAGE_NAME "meshtastic-sniffer")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Wideband Meshtastic LoRa receiver")
