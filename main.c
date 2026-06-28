@@ -1267,6 +1267,123 @@ static void *watchdog_thread(void *arg)
     return NULL;
 }
 
+/* Base64 encode `n` bytes from `src` into `dst`. Returns the number of
+ * output characters (not counting the NUL). `dst` must hold at least
+ * 4*((n+2)/3) + 1 bytes. Standard RFC 4648 alphabet, with '=' padding. */
+static size_t b64_encode(const uint8_t *src, size_t n, char *dst)
+{
+    static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t w = 0;
+    size_t i = 0;
+    while (i + 3 <= n) {
+        uint32_t v = ((uint32_t)src[i] << 16) | ((uint32_t)src[i+1] << 8) | src[i+2];
+        dst[w++] = A[(v >> 18) & 0x3F];
+        dst[w++] = A[(v >> 12) & 0x3F];
+        dst[w++] = A[(v >>  6) & 0x3F];
+        dst[w++] = A[ v        & 0x3F];
+        i += 3;
+    }
+    if (i < n) {
+        uint32_t v = (uint32_t)src[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)src[i+1] << 8;
+        dst[w++] = A[(v >> 18) & 0x3F];
+        dst[w++] = A[(v >> 12) & 0x3F];
+        dst[w++] = (i + 1 < n) ? A[(v >> 6) & 0x3F] : '=';
+        dst[w++] = '=';
+    }
+    dst[w] = 0;
+    return w;
+}
+
+/* Publish one WATERFALL SSE row from the scanner snapshot. Off by
+ * default; called at 5 Hz from the stats thread when --web-waterfall=on
+ * and --web is set.
+ *
+ * The 4096-bin scanner snapshot is downsampled to 1024 display bins by
+ * max-hold groups of 4 -- max-hold preserves short bursts better than
+ * arithmetic mean for an at-a-glance visual. Each bin's power is then
+ * log-scaled to dB and clamped into a 0..255 byte (encoding "u8_db_v1",
+ * with documented db_min/db_max so a future client can interpret it
+ * even if we retune the colormap). Body is base64-wrapped so the
+ * existing SSE text transport carries it. */
+static void publish_waterfall_row(void)
+{
+    if (!g_scanner || opt_web_port <= 0 || !opt_web_waterfall) return;
+
+    static float    snap[4096];
+    static float    max_hold[1024];
+    static float    sort_buf[1024];
+    static uint8_t  bins[1024];
+    static char     b64[1366 + 1];
+
+    int n = scanner_snapshot(g_scanner, snap, 4096);
+    if (n <= 0) return;
+    /* 4096 -> 1024 max-hold groups of 4. If the scanner was built
+     * with a different FFT size, fall back to grouping by (n / 1024)
+     * bins. */
+    int group = n / 1024;
+    if (group < 1) group = 1;
+    int out_count = n / group;
+    if (out_count > 1024) out_count = 1024;
+
+    /* Two-pass: (1) max-hold downsample to linear power; (2) pick the
+     * 25th-percentile bin as the per-row noise reference and encode
+     * each bin as dB above noise, clipped to [db_min, db_max]. Doing
+     * it row-relative dodges the absolute-calibration question and
+     * keeps the colormap stable as gain changes. */
+    for (int i = 0; i < out_count; ++i) {
+        float peak = 0.0f;
+        int base = i * group;
+        for (int k = 0; k < group && base + k < n; ++k)
+            if (snap[base + k] > peak) peak = snap[base + k];
+        max_hold[i] = peak;
+        sort_buf[i] = peak;
+    }
+    /* Quickselect would be cheaper but qsort is fine at 1024 entries
+     * and runs only at 5 Hz. */
+    for (int i = 1; i < out_count; ++i) {
+        float v = sort_buf[i]; int j = i - 1;
+        while (j >= 0 && sort_buf[j] > v) { sort_buf[j + 1] = sort_buf[j]; --j; }
+        sort_buf[j + 1] = v;
+    }
+    float noise = sort_buf[out_count / 4];
+    if (noise <= 0.0f) noise = 1e-12f;
+
+    const float db_min = -10.0f, db_max = 50.0f;
+    const float db_span = db_max - db_min;
+    for (int i = 0; i < out_count; ++i) {
+        float db = (max_hold[i] > 0.0f) ? (10.0f * log10f(max_hold[i] / noise)) : db_min;
+        if (db < db_min) db = db_min;
+        if (db > db_max) db = db_max;
+        int v = (int)((db - db_min) / db_span * 255.0f + 0.5f);
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        bins[i] = (uint8_t)v;
+    }
+
+    size_t b64len = b64_encode(bins, (size_t)out_count, b64);
+
+    char line[2048];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    double ts_d = (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+    int sn = snprintf(line, sizeof(line),
+        "{\"event\":\"WATERFALL\",\"ts\":%.3f,"
+        "\"f_center_hz\":%llu,\"f_span_hz\":%u,"
+        "\"sample_rate_sps\":%u,\"bin_count\":%d,"
+        "\"encoding\":\"u8_db_rel_v1\",\"db_min\":%d,\"db_max\":%d,"
+        "\"bins\":\"%.*s\"}\n",
+        ts_d,
+        (unsigned long long)center_freq,
+        (unsigned)samp_rate,
+        (unsigned)samp_rate,
+        out_count,
+        (int)db_min, (int)db_max,
+        (int)b64len, b64);
+    if (sn > 0 && (size_t)sn < sizeof(line))
+        web_publish_line(line, (size_t)sn);
+}
+
 /* Heartbeat thread: stderr stats + SSE STATS event every 5 s. */
 static void *stats_thread(void *arg)
 {
@@ -1277,7 +1394,15 @@ static void *stats_thread(void *arg)
     uint64_t prev_samples = 0;
     int      stats_counter = 0;
     while (running) {
-        for (int i = 0; i < 10 && running; ++i) usleep(100000); /* 1s, interruptible */
+        /* 1 s outer tick split into 10 x 100 ms sleeps so SIGINT lands
+         * promptly. Waterfall rows publish every other inner tick
+         * (200 ms = 5 Hz) when the feature is on. The publish is a
+         * no-op when the scanner is absent or --web-waterfall=off,
+         * so the loop shape is unchanged for stock runs. */
+        for (int i = 0; i < 10 && running; ++i) {
+            usleep(100000);
+            if ((i & 1) == 1) publish_waterfall_row();
+        }
         if (!running) break;
 
         /* 5s stderr stats + optional per-channel JSON. */
@@ -3436,16 +3561,27 @@ static int run_live(void)
     if (n > 0)
         fprintf(stderr, "configured %d channel(s) total.\n", n);
 
-    /* Scanner instance for --scan, --scan-and-decode, or --alert-off-grid.
-     * Energy-detector FFT that fires off-grid LoRa-shaped alerts. */
-    if (opt_op_mode != OP_MODE_DECODE || opt_alert_off_grid) {
+    /* Scanner instance for --scan, --scan-and-decode, --alert-off-grid,
+     * or --web-waterfall=on (which needs the scanner's full-passband
+     * FFT to render the Spectrum tab). Energy-detector FFT that fires
+     * off-grid LoRa-shaped alerts; in waterfall-only mode the alert
+     * callback stays unset so the scanner is purely a snapshot source. */
+    bool scanner_for_alerts =
+        opt_op_mode != OP_MODE_DECODE || opt_alert_off_grid;
+    bool scanner_for_waterfall = opt_web_waterfall && opt_web_port > 0;
+    if (scanner_for_alerts || scanner_for_waterfall) {
         g_scanner = scanner_create((uint64_t)center_freq, (uint32_t)samp_rate, 4096);
         if (g_scanner) {
             scanner_set_known_grid(g_scanner, g_grid_freqs, g_grid_bws, g_grid_count);
-            scanner_set_callback(g_scanner, on_off_grid_discovery, NULL);
-            fprintf(stderr, "scanner: enabled with off-grid alerts "
-                            "(4096-bin FFT, excluding %d grid channels)\n",
-                    g_grid_count);
+            if (scanner_for_alerts) {
+                scanner_set_callback(g_scanner, on_off_grid_discovery, NULL);
+                fprintf(stderr, "scanner: enabled with off-grid alerts "
+                                "(4096-bin FFT, excluding %d grid channels)\n",
+                        g_grid_count);
+            } else {
+                fprintf(stderr, "scanner: enabled for waterfall "
+                                "(4096-bin FFT, no off-grid alerts)\n");
+            }
         }
     }
 

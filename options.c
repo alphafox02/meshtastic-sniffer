@@ -122,6 +122,7 @@ char *opt_zmq_curve_keygen        = NULL;
 uint32_t opt_station_t_acc_ns     = 1000000;  /* 1 ms = NTP-class default; mlat solver weights by this */
 char *opt_cot_multicast           = NULL;
 int   opt_web_port                = 0;
+int   opt_web_waterfall           = 0;
 char *opt_station_id              = NULL;
 char *opt_gpsd_endpoint           = NULL;
 char *opt_api_token               = NULL;
@@ -261,6 +262,10 @@ void options_print_help(const char *prog)
         "                         republish ATAK port-72 PLIs as CoT XML to a\n"
         "                         multicast group (default port 6969). LAN-scope.\n"
         "  --web[=PORT]           built-in dashboard (default 8888)\n"
+        "  --web-waterfall=on|off live wideband spectrum + decoded-packet overlay\n"
+        "                         on a Spectrum tab. Off by default; when on,\n"
+        "                         enables the scanner if it is not already running\n"
+        "                         and publishes WATERFALL SSE events.\n"
         "  --station-id=ID        station identifier in feed messages\n"
         "  --gpsd[=HOST:PORT]     read this station's own GPS from gpsd\n"
         "                         (default localhost:2947). Tags every emitted\n"
@@ -377,7 +382,8 @@ int options_parse(int argc, char **argv)
         O_REGION, O_PRESETS, O_KEYS, O_KEYS_FILE, O_SHARE_URL, O_EXTRA_FREQ,
         O_IQ_RECORD, O_STATS_JSON, O_FFTW_WISDOM,
         O_WEBHOOK_URL, O_WEBHOOK_ON, O_WEBHOOK_FORMAT, O_WEBHOOK_TIMEOUT_MS,
-        O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_STATION, O_GPSD, O_API_TOKEN,
+        O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_WEB_WATERFALL,
+        O_STATION, O_GPSD, O_API_TOKEN,
         O_PCAP, O_PCAP_FIFO, O_PSK_WORDLIST, O_ARCHIVE, O_GEOFENCE, O_ANNOUNCE_TO, O_C2_DEALER,
         O_ZMQ_CURVE_SECRET, O_ZMQ_CURVE_KEYGEN, O_STATION_T_ACC_NS,
         O_HACKRF_LNA, O_HACKRF_VGA, O_HACKRF_AMP, O_HACKRF_AMP_OFF, O_USRP_OTW,
@@ -433,6 +439,7 @@ int options_parse(int argc, char **argv)
         { "zmq",        optional_argument, NULL, O_ZMQ },
         { "cot-multicast", required_argument, NULL, O_COT },
         { "web",        optional_argument, NULL, O_WEB },
+        { "web-waterfall", required_argument, NULL, O_WEB_WATERFALL },
         { "station-id", required_argument, NULL, O_STATION },
         { "gpsd",       optional_argument, NULL, O_GPSD },
         { "api-token",  required_argument, NULL, O_API_TOKEN },
@@ -606,6 +613,16 @@ int options_parse(int argc, char **argv)
         case O_ZMQ:        opt_zmq_endpoint = optarg ? strdup(optarg) : strdup("tcp://*:7008"); break;
         case O_COT:        opt_cot_multicast = strdup(optarg); break;
         case O_WEB:        opt_web_port = optarg ? atoi(optarg) : 8888; break;
+        case O_WEB_WATERFALL:
+            if (!optarg || !strcasecmp(optarg, "on") || !strcmp(optarg, "1"))
+                opt_web_waterfall = 1;
+            else if (!strcasecmp(optarg, "off") || !strcmp(optarg, "0"))
+                opt_web_waterfall = 0;
+            else {
+                fprintf(stderr, "--web-waterfall: expected 'on' or 'off', got '%s'\n", optarg);
+                return 2;
+            }
+            break;
         case O_STATION:    opt_station_id = strdup(optarg); break;
         case O_GPSD:       opt_gpsd_endpoint = strdup(optarg ? optarg : "localhost:2947"); break;
         case O_API_TOKEN:  opt_api_token = strdup(optarg); break;

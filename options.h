@@ -166,6 +166,11 @@ extern char *opt_mqtt_topic;
 extern char *opt_zmq_endpoint;
 extern char *opt_cot_multicast;          /* "239.2.3.1:6969" or NULL */
 extern int   opt_web_port;
+/* Live wideband spectrum waterfall on the dashboard. Default off so a
+ * stock --web run pays no CPU or bandwidth for it; when set, the
+ * sensor enables (or reuses) the scanner and publishes WATERFALL SSE
+ * events the Spectrum tab renders into a scrolling canvas. */
+extern int   opt_web_waterfall;
 extern char *opt_station_id;
 extern char *opt_gpsd_endpoint;          /* "host:port"; NULL = disabled */
 extern char *opt_api_token;              /* bearer token for POST /api endpoints; NULL = unauthenticated */

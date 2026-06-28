@@ -20,6 +20,7 @@
 #include <complex.h>
 #include <fftw3.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,12 @@ struct scanner {
     float          power_avg[16384];  /* per-bin EWMA -- max fft_size we tolerate */
     float          power_inst[16384]; /* current frame */
 
+    /* power_avg is updated by the sample-pump thread in process_frame()
+     * and read by the stats / waterfall publisher thread via
+     * scanner_snapshot(). Held only for the copy/update; never around
+     * I/O or peakfind. */
+    pthread_mutex_t snap_mu;
+
     /* Frame counter for rate control. */
     int            frames_until_emit; /* run peakfind every N FFTs */
     int            frame_counter;
@@ -81,6 +88,9 @@ scanner_t *scanner_create(uint64_t f_center, uint32_t samp_rate, int fft_size)
     /* power-of-two preferred but not required for FFTW. */
     scanner_t *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
+    /* Init the snapshot mutex before anything that can fail, so the
+     * shared scanner_destroy() path is safe on every error exit. */
+    pthread_mutex_init(&s->snap_mu, NULL);
     s->f_center  = f_center;
     s->samp_rate = samp_rate;
     s->fft_size  = fft_size;
@@ -106,6 +116,7 @@ void scanner_destroy(scanner_t *s)
     }
     fftwf_free(s->fft_in);
     fftwf_free(s->fft_out);
+    pthread_mutex_destroy(&s->snap_mu);
     free(s);
 }
 
@@ -113,8 +124,13 @@ int scanner_snapshot(const scanner_t *s, float *out, int max)
 {
     if (!s || !out || max < s->fft_size) return 0;
     int N = s->fft_size, half = N / 2;
-    /* fftshift: out[i] = power_avg[(i + half) % N] */
+    /* fftshift: out[i] = power_avg[(i + half) % N].
+     * Lock just long enough to copy out -- the producer thread updates
+     * power_avg in process_frame() under the same mutex. */
+    scanner_t *rw = (scanner_t *)s;
+    pthread_mutex_lock(&rw->snap_mu);
     for (int i = 0; i < N; ++i) out[i] = s->power_avg[(i + half) % N];
+    pthread_mutex_unlock(&rw->snap_mu);
     return N;
 }
 
@@ -263,13 +279,17 @@ static void process_frame(scanner_t *s)
     fftwf_execute(s->plan);
     float complex *out = (float complex *)s->fft_out;
     const float alpha = 0.05f;
+    /* power_inst is producer-only; power_avg is shared with the
+     * waterfall snapshot reader, so the EWMA update goes under the
+     * snap mutex. Held just for the inner-bin loop; FFT execute and
+     * peakfind stay outside. */
+    pthread_mutex_lock(&s->snap_mu);
     for (int k = 0; k < s->fft_size; ++k) {
         float r = crealf(out[k]), im = cimagf(out[k]);
         s->power_inst[k] = r * r + im * im;
-        /* Live EWMA so the spectrum tab reflects every frame, not just
-         * every peakfind cycle. */
         s->power_avg[k] = (1.0f - alpha) * s->power_avg[k] + alpha * s->power_inst[k];
     }
+    pthread_mutex_unlock(&s->snap_mu);
 
     if (++s->frame_counter >= s->frames_until_emit) {
         s->frame_counter = 0;
