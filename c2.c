@@ -9,25 +9,23 @@
  * an HTTP POST and calls these; a future DEALER socket path will
  * call them with a frame body. Both produce the same JSON response.
  *
- * Helpers that depend on raw HTTP semantics (URL-decode, share-URL
- * parse, content-length walk) stay in web.c -- those are coupled to
- * the HTTP request shape. We re-use decode_channel_share() through an
- * extern declaration so the share-URL handler can stay generic.
+ * Helpers that depend on raw HTTP semantics (URL-decode, content-length
+ * walk) stay in web.c -- those are coupled to the HTTP request shape.
+ * The channel-share protobuf decoder itself is transport-agnostic and
+ * lives in share_url.c so CLI startup import and the web/API path use
+ * the same parser.
  */
 
 #include "c2.h"
 #include "cot.h"
 #include "keyset.h"
+#include "share_url.h"
 
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Forwards from web.c -- kept there because they're closer to the HTTP
- * URL form they parse. */
-extern int decode_channel_share(keyset_t *ks, const char *url_or_b64);
 
 /* Forwards from main.c -- the channel-set is global state owned there. */
 extern keyset_t *app_get_keyset(void);

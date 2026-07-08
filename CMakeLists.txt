@@ -140,6 +140,7 @@ set(SOURCES
     ${PROJECT_SOURCE_DIR}/psk_dict.c
     ${PROJECT_SOURCE_DIR}/schema.c
     ${PROJECT_SOURCE_DIR}/scanner.c
+    ${PROJECT_SOURCE_DIR}/share_url.c
     ${PROJECT_SOURCE_DIR}/web.c
     ${PROJECT_SOURCE_DIR}/cot.c
     ${PROJECT_SOURCE_DIR}/node_db.c
@@ -363,6 +364,18 @@ add_executable(test_mesh_packet_decode
     ${PROJECT_SOURCE_DIR}/recover/stubs.c)
 target_link_libraries(test_mesh_packet_decode PRIVATE OpenSSL::Crypto Threads::Threads m)
 set_property(TARGET test_mesh_packet_decode PROPERTY C_STANDARD 99)
+
+# test_share_url: regression test for Meshtastic channel-share URL import.
+# Covers the flat Channel payload shape currently emitted by upstream
+# channel-share URLs, including simpleN one-byte PSKs and multi-channel
+# imports. Kept standalone instead of wiring a full CTest suite.
+add_executable(test_share_url
+    ${PROJECT_SOURCE_DIR}/tests/test_share_url.c
+    ${PROJECT_SOURCE_DIR}/share_url.c
+    ${PROJECT_SOURCE_DIR}/keyset.c
+    ${PROJECT_SOURCE_DIR}/meshtastic.c)
+target_link_libraries(test_share_url PRIVATE Threads::Threads m)
+set_property(TARGET test_share_url PROPERTY C_STANDARD 99)
 
 # focused_demo: scan-then-focus Phase 2 prototype. One shared file reader
 # streams cs8 IQ into N independent focused-decode workers, each with its

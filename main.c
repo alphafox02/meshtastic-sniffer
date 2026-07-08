@@ -38,6 +38,7 @@
 #include "options.h"
 #include "scanner.h"
 #include "sdr.h"
+#include "share_url.h"
 #include "sigmf.h"
 #include "simd_kernels.h"
 #include "web.h"
@@ -3500,10 +3501,9 @@ static int run_live(void)
         }
     }
 
-    /* Share URL via the web decoder (which already understands the protobuf form). */
+    /* Share URL via the shared channel-share decoder used by CLI + web/API. */
     if (opt_share_url) {
-        extern int web_decode_share_url(keyset_t *ks, const char *url);
-        int added = web_decode_share_url(g_keys, opt_share_url);
+        int added = decode_channel_share(g_keys, opt_share_url);
         if (added < 0)
             fprintf(stderr, "share-url: could not parse %s\n", opt_share_url);
         else
