@@ -1333,7 +1333,7 @@ static void publish_waterfall_row(void)
     static float    max_hold[1024];
     static float    sort_buf[1024];
     static uint8_t  bins[1024];
-    static char     b64[1366 + 1];
+    static char     b64[4 * ((1024 + 2) / 3) + 1];
 
     int n = scanner_snapshot(g_scanner, snap, 4096);
     if (n <= 0) return;
