@@ -513,8 +513,8 @@ let nEvents=0,nTx=0;
 
 // Leaflet map.
 const map = L.map('live-map').setView([39.5, -98.0], 4);
-L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-  {maxZoom:19, attribution:'(c) OSM (c) CARTO'}).addTo(map);
+L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+  {maxZoom:19, maxNativeZoom:16, attribution:'Tiles &copy; Esri'}).addTo(map);
 
 // Per-station color palette. Cyan for the first station, amber for the
 // second, etc. -- distinct enough to read at a glance on a multi-station
@@ -1179,8 +1179,8 @@ const ZOOM_NS = { '15m': 15*60*1e9, '1h': 60*60*1e9, '6h': 6*60*60*1e9, '24h': 2
 function evidenceMapInit(){
   if (evidenceMap) return;
   evidenceMap = L.map('ev-map', { zoomControl: true }).setView([39.5, -98.0], 4);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-    { maxZoom: 19, attribution: '(c) OSM (c) CARTO' }).addTo(evidenceMap);
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+    { maxZoom: 19, maxNativeZoom: 16, attribution: 'Tiles &copy; Esri' }).addTo(evidenceMap);
 }
 
 document.querySelectorAll('#ev-zoom button').forEach(b=>{
