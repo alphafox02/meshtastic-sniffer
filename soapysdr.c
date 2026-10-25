@@ -377,6 +377,7 @@ void *soapy_stream_thread(void *arg) {
 
     SoapySDRDevice_deactivateStream(device, stream, 0, 0);
     SoapySDRDevice_closeStream(device, stream);
+    SoapySDRDevice_unmake(device);
 
     running = 0;
     kill(self_pid, SIGINT);

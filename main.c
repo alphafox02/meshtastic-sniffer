@@ -2045,7 +2045,8 @@ static int start_input(pthread_t *tid)
 #endif
 #ifdef HAVE_SOAPYSDR
     case SDR_BACKEND_SOAPYSDR:
-        fn = soapy_stream_thread; name = "soapy";
+        arg = soapy_setup(soapy_num, soapy_args);
+        fn  = soapy_stream_thread; name = "soapy";
         break;
 #endif
 #ifdef HAVE_SDRPLAY
