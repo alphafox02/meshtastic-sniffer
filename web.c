@@ -37,6 +37,7 @@ extern int       app_add_runtime_extra_freq(uint64_t f_hz, int bw_hz, int sf, in
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <stdint.h>
 #include <ctype.h>
 #include <unistd.h>
@@ -476,10 +477,9 @@ static const char DASHBOARD_HTML[] =
 "  if (name==='spectrum') spectrumStart(); else spectrumStop();\n"
 "}\n"
 "// Theme toggle: dark is default, light persists in localStorage. Map\n"
-"// tile layer swaps between Carto dark/light to match. Same pattern as\n"
-"// inmarsat-sniffer / iridium-sniffer.\n"
+"// tiles follow the theme, using Esri by default or CARTO with an API key.\n"
 "let tileLayer=null;\n"
-"function setTheme(name){const html=document.documentElement;if(name==='light')html.classList.add('light');else html.classList.remove('light');try{localStorage.setItem('theme',name);}catch(e){}if(tileLayer)map.removeLayer(tileLayer);const url=(name==='light')?'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png':'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';tileLayer=L.tileLayer(url+'?key=__CARTO_MAP_KEY__',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors &copy; CARTO'}).addTo(map);const btn=document.getElementById('theme-toggle');if(btn)btn.textContent=(name==='light')?'light':'dark';}\n"
+"function setTheme(name){const html=document.documentElement;if(name==='light')html.classList.add('light');else html.classList.remove('light');try{localStorage.setItem('theme',name);}catch(e){}if(tileLayer)map.removeLayer(tileLayer);const key='__CARTO_MAP_KEY__';let url,options;if(key){url=((name==='light')?'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png':'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png')+'?key='+key;options={maxZoom:19,attribution:'&copy; OpenStreetMap contributors &copy; CARTO'};}else{url='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_'+((name==='light')?'Light':'Dark')+'_Gray_Base/MapServer/tile/{z}/{y}/{x}';options={maxZoom:19,maxNativeZoom:16,attribution:'Tiles &copy; Esri'};}tileLayer=L.tileLayer(url,options).addTo(map);const btn=document.getElementById('theme-toggle');if(btn)btn.textContent=(name==='light')?'light':'dark';}\n"
 "function toggleTheme(){setTheme(document.documentElement.classList.contains('light')?'dark':'light');}\n"
 "const map = L.map('map').setView([39.5, -98.0], 4);\n"
 "if (window.ResizeObserver) new ResizeObserver(()=>map.invalidateSize({pan:false})).observe(document.getElementById('map'));\n"
@@ -2224,51 +2224,51 @@ static void *http_client(void *arg)
     struct timeval timeout = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        /* 16 KB request buffer -- enough for hundreds of keys or a long share URL. */
-        static __thread char buf[16384];
-        size_t got = recv_full_request(fd, buf, sizeof(buf));
-        if (!got) { close(fd); goto done; }
+    /* 16 KB request buffer -- enough for hundreds of keys or a long share URL. */
+    static __thread char buf[16384];
+    size_t got = recv_full_request(fd, buf, sizeof(buf));
+    if (!got) { close(fd); goto done; }
 
-        if (strncmp(buf, "GET / ",        6) == 0 ||
-            strncmp(buf, "GET /\r",       6) == 0 ||
-            strncmp(buf, "GET /index",   10) == 0) serve_index(fd);
-        else if (strncmp(buf, "GET /events", 11) == 0) promote_to_sse(fd);
-        else if (strncmp(buf, "POST /api/keys", 14) == 0) {
-            if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
-            c2_response_t r;
-            c2_keys_add(find_body(buf), &r);
-            send_response(fd, r.status, r.body);
+    if (strncmp(buf, "GET / ",        6) == 0 ||
+        strncmp(buf, "GET /\r",       6) == 0 ||
+        strncmp(buf, "GET /index",   10) == 0) serve_index(fd);
+    else if (strncmp(buf, "GET /events", 11) == 0) promote_to_sse(fd);
+    else if (strncmp(buf, "POST /api/keys", 14) == 0) {
+        if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
+        c2_response_t r;
+        c2_keys_add(find_body(buf), &r);
+        send_response(fd, r.status, r.body);
+    }
+    else if (strncmp(buf, "POST /api/share-url", 19) == 0) {
+        if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
+        const char *body = find_body(buf);
+        c2_response_t r;
+        /* HTTP-form bodies arrive URL-encoded; decode before dispatch.
+         * The share-URL parser itself is transport-agnostic in c2.c. */
+        if (!body) { c2_share_url(NULL, &r); }
+        else {
+            char dec[1024];
+            size_t bl = strlen(body);
+            if (bl >= sizeof(dec)) bl = sizeof(dec) - 1;
+            memcpy(dec, body, bl); dec[bl] = 0;
+            url_decode_inplace(dec);
+            c2_share_url(dec, &r);
         }
-        else if (strncmp(buf, "POST /api/share-url", 19) == 0) {
-            if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
-            const char *body = find_body(buf);
-            c2_response_t r;
-            /* HTTP-form bodies arrive URL-encoded; decode before dispatch.
-             * The share-URL parser itself is transport-agnostic in c2.c. */
-            if (!body) { c2_share_url(NULL, &r); }
-            else {
-                char dec[1024];
-                size_t bl = strlen(body);
-                if (bl >= sizeof(dec)) bl = sizeof(dec) - 1;
-                memcpy(dec, body, bl); dec[bl] = 0;
-                url_decode_inplace(dec);
-                c2_share_url(dec, &r);
-            }
-            send_response(fd, r.status, r.body);
-        }
-        else if (strncmp(buf, "POST /api/extra-freq", 20) == 0) {
-            if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
-            c2_response_t r;
-            c2_extra_freq(find_body(buf), &r);
-            send_response(fd, r.status, r.body);
-        }
-        else if (strncmp(buf, "POST /api/cot-multicast", 23) == 0) {
-            if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
-            c2_response_t r;
-            c2_cot_multicast(find_body(buf), &r);
-            send_response(fd, r.status, r.body);
-        }
-        else serve_404(fd);
+        send_response(fd, r.status, r.body);
+    }
+    else if (strncmp(buf, "POST /api/extra-freq", 20) == 0) {
+        if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
+        c2_response_t r;
+        c2_extra_freq(find_body(buf), &r);
+        send_response(fd, r.status, r.body);
+    }
+    else if (strncmp(buf, "POST /api/cot-multicast", 23) == 0) {
+        if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
+        c2_response_t r;
+        c2_cot_multicast(find_body(buf), &r);
+        send_response(fd, r.status, r.body);
+    }
+    else serve_404(fd);
 
 done:
     pthread_mutex_lock(&g_http_lock);
@@ -2408,7 +2408,15 @@ void web_shutdown(void)
         if (g_listen_fd >= 0) shutdown(g_listen_fd, SHUT_RDWR);
         pthread_join(g_thread, NULL);
         pthread_mutex_lock(&g_http_lock);
-        while (g_http_workers) pthread_cond_wait(&g_http_idle, &g_http_lock);
+        /* A peer can keep recv() alive by trickling bytes. Bound the total
+         * drain time, including wakeups from other workers finishing. */
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += 2;
+        while (g_http_workers) {
+            if (pthread_cond_timedwait(&g_http_idle, &g_http_lock, &deadline) != 0)
+                break;
+        }
         pthread_mutex_unlock(&g_http_lock);
     }
     if (g_listen_fd >= 0) { close(g_listen_fd); g_listen_fd = -1; }
