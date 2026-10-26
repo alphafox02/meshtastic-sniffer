@@ -12,9 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <SoapySDR/Device.h>
+#include <SoapySDR/Errors.h>
 #include <SoapySDR/Formats.h>
 #include <SoapySDR/Version.h>
 
@@ -82,16 +84,29 @@ void soapy_list(void) {
     SoapySDRKwargsList_clear(results, length);
 }
 
-SoapySDRDevice *soapy_setup(int id, const char *args) {
-    SoapySDRDevice *device;
+/* Remembered so the stream thread can reopen the device after the link
+ * drops (SoapyRemote network loss, USB unplug). */
+static int         soapy_open_id   = -1;
+static const char *soapy_open_args = NULL;
+
+/* Startup failures exit; reconnect attempts warn and return NULL. */
+#define SOAPY_FAIL(...) do {                          \
+        if (fatal) errx(1, __VA_ARGS__);              \
+        warnx(__VA_ARGS__);                           \
+        if (device) SoapySDRDevice_unmake(device);    \
+        return NULL;                                  \
+    } while (0)
+
+static SoapySDRDevice *soapy_open(int id, const char *args, int fatal) {
+    SoapySDRDevice *device = NULL;
     char **formats;
     size_t num_formats;
 
     if (args) {
         device = SoapySDRDevice_makeStrArgs(args);
         if (device == NULL)
-            errx(1, "Unable to open SoapySDR device with args '%s': %s",
-                 args, SoapySDRDevice_lastError());
+            SOAPY_FAIL("Unable to open SoapySDR device with args '%s': %s",
+                       args, SoapySDRDevice_lastError());
         if (verbose)
             fprintf(stderr, "SoapySDR: opened device with args: %s\n", args);
     } else {
@@ -100,14 +115,14 @@ SoapySDRDevice *soapy_setup(int id, const char *args) {
 
         if (id < 0 || (size_t)id >= length) {
             SoapySDRKwargsList_clear(results, length);
-            errx(1, "Invalid SoapySDR device index: %d (found %zu devices)", id, length);
+            SOAPY_FAIL("Invalid SoapySDR device index: %d (found %zu devices)", id, length);
         }
 
         device = SoapySDRDevice_make(&results[id]);
         SoapySDRKwargsList_clear(results, length);
 
         if (device == NULL)
-            errx(1, "Unable to open SoapySDR device: %s", SoapySDRDevice_lastError());
+            SOAPY_FAIL("Unable to open SoapySDR device: %s", SoapySDRDevice_lastError());
     }
 
     /* Check supported formats: prefer CS8, then CF32, then CS16 */
@@ -148,12 +163,12 @@ SoapySDRDevice *soapy_setup(int id, const char *args) {
     }
 
     if (SoapySDRDevice_setSampleRate(device, SOAPY_SDR_RX, 0, samp_rate) != 0)
-        errx(1, "Unable to set SoapySDR sample rate: %s", SoapySDRDevice_lastError());
+        SOAPY_FAIL("Unable to set SoapySDR sample rate: %s", SoapySDRDevice_lastError());
 
     fprintf(stderr, "SoapySDR: sample rate: %.3f MHz\n", samp_rate / 1e6);
 
     if (SoapySDRDevice_setFrequency(device, SOAPY_SDR_RX, 0, center_freq, NULL) != 0)
-        errx(1, "Unable to set SoapySDR frequency: %s", SoapySDRDevice_lastError());
+        SOAPY_FAIL("Unable to set SoapySDR frequency: %s", SoapySDRDevice_lastError());
 
     /* List available gain elements in verbose mode */
     if (verbose) {
@@ -202,6 +217,14 @@ SoapySDRDevice *soapy_setup(int id, const char *args) {
     }
 
     return device;
+}
+
+#undef SOAPY_FAIL
+
+SoapySDRDevice *soapy_setup(int id, const char *args) {
+    soapy_open_id   = id;
+    soapy_open_args = args;
+    return soapy_open(id, args, 1);
 }
 
 /* Apply bias tee and custom device settings after stream activation */
@@ -258,72 +281,146 @@ static void soapy_cs16_to_float(int16_t *in, float *out, size_t num_samples) {
         out[i] = in[i] * (1.0f / 32768.0f);
 }
 
-void *soapy_stream_thread(void *arg) {
-    SoapySDRDevice *device = (SoapySDRDevice *)arg;
-    SoapySDRStream *stream;
-    size_t channel = 0;
-    int flags;
-    long long time_ns;
-    const char *format;
-    size_t mtu;
+/* Once samples have flowed, a read error or this long with no samples
+ * means the link dropped and the device is reopened. Retries back off
+ * up to SOAPY_RETRY_MAX_S and reset only when samples flow again. A
+ * device that never delivers its first sample fails the same way it
+ * always did. */
+#define SOAPY_STALL_MS     5000
+#define SOAPY_RETRY_MAX_S  30
 
+typedef struct {
+    SoapySDRDevice *device;
+    SoapySDRStream *stream;
+    size_t          mtu;
+    int16_t        *cs16_buf;
+} soapy_session_t;
+
+static void soapy_stop(soapy_session_t *ss) {
+    free(ss->cs16_buf);
+    ss->cs16_buf = NULL;
+    if (ss->stream) {
+        SoapySDRDevice_deactivateStream(ss->device, ss->stream, 0, 0);
+        SoapySDRDevice_closeStream(ss->device, ss->stream);
+        ss->stream = NULL;
+    }
+    if (ss->device) {
+        SoapySDRDevice_unmake(ss->device);
+        ss->device = NULL;
+    }
+}
+
+/* Set up and activate an RX stream on ss->device, preferring CS8, then
+ * CF32, then CS16. On failure exits (fatal) or tears down and returns -1. */
+static int soapy_start(soapy_session_t *ss, int fatal) {
+    size_t channel = 0;
+    const char *format = NULL;
+
+    ss->stream = NULL;
     if (sample_mode == 0) {
         format = SOAPY_SDR_CS8;
-        stream = SoapySDRDevice_setupStream(device, SOAPY_SDR_RX, format,
-                                             &channel, 1, NULL);
-        if (stream == NULL) {
+        ss->stream = SoapySDRDevice_setupStream(ss->device, SOAPY_SDR_RX, format,
+                                                &channel, 1, NULL);
+        if (ss->stream == NULL) {
             if (verbose)
                 warnx("CS8 stream failed, trying CF32");
             sample_mode = 1;
         }
-    } else {
-        stream = NULL;
     }
 
-    if (stream == NULL && sample_mode == 1) {
+    if (ss->stream == NULL && sample_mode == 1) {
         format = SOAPY_SDR_CF32;
-        stream = SoapySDRDevice_setupStream(device, SOAPY_SDR_RX, format,
-                                             &channel, 1, NULL);
-        if (stream == NULL) {
+        ss->stream = SoapySDRDevice_setupStream(ss->device, SOAPY_SDR_RX, format,
+                                                &channel, 1, NULL);
+        if (ss->stream == NULL) {
             if (verbose)
                 warnx("CF32 stream failed, falling back to CS16");
             sample_mode = 2;
         }
     }
 
-    if (stream == NULL) {
+    if (ss->stream == NULL) {
         format = SOAPY_SDR_CS16;
-        stream = SoapySDRDevice_setupStream(device, SOAPY_SDR_RX, format,
-                                             &channel, 1, NULL);
-        if (stream == NULL)
-            errx(1, "Unable to setup SoapySDR stream: %s", SoapySDRDevice_lastError());
+        ss->stream = SoapySDRDevice_setupStream(ss->device, SOAPY_SDR_RX, format,
+                                                &channel, 1, NULL);
+        if (ss->stream == NULL) {
+            if (fatal)
+                errx(1, "Unable to setup SoapySDR stream: %s", SoapySDRDevice_lastError());
+            warnx("Unable to setup SoapySDR stream: %s", SoapySDRDevice_lastError());
+            soapy_stop(ss);
+            return -1;
+        }
     }
 
     if (verbose)
         fprintf(stderr, "SoapySDR: streaming with %s format\n", format);
 
-    mtu = SoapySDRDevice_getStreamMTU(device, stream);
-    if (mtu == 0)
-        mtu = 65536;
+    ss->mtu = SoapySDRDevice_getStreamMTU(ss->device, ss->stream);
+    if (ss->mtu == 0)
+        ss->mtu = 65536;
 
-    if (SoapySDRDevice_activateStream(device, stream, 0, 0, 0) != 0)
-        errx(1, "Unable to activate SoapySDR stream: %s", SoapySDRDevice_lastError());
-
-    /* Apply settings after stream activation (SDRPlay compatibility) */
-    soapy_apply_settings(device);
-
-    int16_t *cs16_buf = NULL;
-    if (sample_mode == 2) {
-        cs16_buf = malloc(mtu * 2 * sizeof(int16_t));
-        if (cs16_buf == NULL)
-            errx(1, "Unable to allocate CS16 buffer");
+    if (SoapySDRDevice_activateStream(ss->device, ss->stream, 0, 0, 0) != 0) {
+        if (fatal)
+            errx(1, "Unable to activate SoapySDR stream: %s", SoapySDRDevice_lastError());
+        warnx("Unable to activate SoapySDR stream: %s", SoapySDRDevice_lastError());
+        soapy_stop(ss);
+        return -1;
     }
 
-    size_t sample_size = (sample_mode == 0) ? 2 * sizeof(int8_t)
-                                            : 2 * sizeof(float);
+    /* Apply settings after stream activation (SDRPlay compatibility) */
+    soapy_apply_settings(ss->device);
+
+    if (sample_mode == 2) {
+        ss->cs16_buf = malloc(ss->mtu * 2 * sizeof(int16_t));
+        if (ss->cs16_buf == NULL)
+            errx(1, "Unable to allocate CS16 buffer");
+    }
+    return 0;
+}
+
+/* Reopen the device with the original --soapy args until it comes back
+ * or the user quits. Leaves ss->device NULL if interrupted. */
+static void soapy_reconnect(soapy_session_t *ss, int *delay_s) {
+    while (running) {
+        for (int i = 0; i < *delay_s * 10 && running; ++i)
+            usleep(100000);
+        if (!running)
+            return;
+
+        ss->device = soapy_open(soapy_open_id, soapy_open_args, 0);
+        int ok = ss->device && soapy_start(ss, 0) == 0;
+
+        *delay_s *= 2;
+        if (*delay_s > SOAPY_RETRY_MAX_S)
+            *delay_s = SOAPY_RETRY_MAX_S;
+        if (ok) {
+            fprintf(stderr, "SoapySDR: reconnected\n");
+            return;
+        }
+        warnx("SoapySDR: reconnect failed, retrying in %d s", *delay_s);
+    }
+}
+
+static uint64_t soapy_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+void *soapy_stream_thread(void *arg) {
+    soapy_session_t ss = { .device = (SoapySDRDevice *)arg };
+    int flags;
+    long long time_ns;
+
+    soapy_start(&ss, 1);
+    uint64_t last_data_ms = soapy_now_ms();
+    int had_data = 0;
+    int retry_s = 1;
 
     while (running) {
-        sample_buf_t *s = malloc(sizeof(*s) + mtu * sample_size);
+        size_t sample_size = (sample_mode == 0) ? 2 * sizeof(int8_t)
+                                                : 2 * sizeof(float);
+        sample_buf_t *s = malloc(sizeof(*s) + ss.mtu * sample_size);
         if (s == NULL) {
             warnx("Unable to allocate sample buffer");
             break;
@@ -333,36 +430,44 @@ void *soapy_stream_thread(void *arg) {
         int ret;
 
         if (sample_mode == 2) {
-            buffs[0] = cs16_buf;
-            ret = SoapySDRDevice_readStream(device, stream, buffs, mtu,
+            buffs[0] = ss.cs16_buf;
+            ret = SoapySDRDevice_readStream(ss.device, ss.stream, buffs, ss.mtu,
                                              &flags, &time_ns, 100000);
             if (ret > 0)
-                soapy_cs16_to_float(cs16_buf, (float *)s->samples, ret);
-        } else if (sample_mode == 1) {
-            buffs[0] = s->samples;
-            ret = SoapySDRDevice_readStream(device, stream, buffs, mtu,
-                                             &flags, &time_ns, 100000);
+                soapy_cs16_to_float(ss.cs16_buf, (float *)s->samples, ret);
         } else {
             buffs[0] = s->samples;
-            ret = SoapySDRDevice_readStream(device, stream, buffs, mtu,
+            ret = SoapySDRDevice_readStream(ss.device, ss.stream, buffs, ss.mtu,
                                              &flags, &time_ns, 100000);
         }
 
-        if (ret < 0) {
-            if (ret == SOAPY_SDR_TIMEOUT) {
-                free(s);
-                continue;
-            }
+        if (ret <= 0) {
+            free(s);
             if (ret == SOAPY_SDR_OVERFLOW) {
                 if (verbose)
                     warnx("SoapySDR overflow");
-                free(s);
                 continue;
             }
-            warnx("SoapySDR read error: %d", ret);
-            free(s);
-            break;
+            if (ret == 0 || ret == SOAPY_SDR_TIMEOUT) {
+                if (!had_data || soapy_now_ms() - last_data_ms < SOAPY_STALL_MS)
+                    continue;
+                warnx("SoapySDR: no samples for %d s, reconnecting",
+                      SOAPY_STALL_MS / 1000);
+            } else if (!had_data) {
+                warnx("SoapySDR read error: %s", SoapySDR_errToStr(ret));
+                break;
+            } else {
+                warnx("SoapySDR read error: %s, reconnecting",
+                      SoapySDR_errToStr(ret));
+            }
+            soapy_stop(&ss);
+            soapy_reconnect(&ss, &retry_s);
+            last_data_ms = soapy_now_ms();
+            continue;
         }
+        last_data_ms = soapy_now_ms();
+        had_data = 1;
+        retry_s = 1;
 
         s->format = (sample_mode == 0) ? SAMPLE_FMT_INT8 : SAMPLE_FMT_FLOAT;
         s->num = ret;
@@ -373,10 +478,7 @@ void *soapy_stream_thread(void *arg) {
             free(s);
     }
 
-    free(cs16_buf);
-
-    SoapySDRDevice_deactivateStream(device, stream, 0, 0);
-    SoapySDRDevice_closeStream(device, stream);
+    soapy_stop(&ss);
 
     running = 0;
     kill(self_pid, SIGINT);
