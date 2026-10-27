@@ -130,6 +130,12 @@ CMake prints which backends it found. Run `./meshtastic-sniffer --list` to confi
 
 The dashboard's **Config** tab adds keys and channel-share URLs at runtime, no restart needed.
 
+The dashboard uses Esri gray canvas tiles by default; no API key is required.
+To use CARTO tiles instead, set an optional API key with `--map-api-key=KEY` or
+the `MAP_API_KEY` environment variable. The command-line value takes precedence,
+including an empty value (`--map-api-key=`) to clear the environment-provided key
+and use Esri tiles.
+
 ---
 
 ## Hardware capacity

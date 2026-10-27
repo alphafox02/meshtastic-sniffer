@@ -36,6 +36,10 @@ extern int       app_add_runtime_extra_freq(uint64_t f_hz, int bw_hz, int sf, in
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
+#include <stdint.h>
+#include <ctype.h>
 #include <unistd.h>
 
 #define MAX_SSE_CLIENTS    8
@@ -46,6 +50,10 @@ static int  g_sse_fds[MAX_SSE_CLIENTS];
 static int  g_sse_count = 0;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_thread;
+#define MAX_HTTP_WORKERS 16
+static pthread_mutex_t g_http_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_http_idle = PTHREAD_COND_INITIALIZER;
+static int g_http_workers = 0;
 static volatile int g_thread_running = 0;
 
 /* Ring buffer of recently-published JSON lines. New SSE clients (browser
@@ -65,6 +73,7 @@ static int g_history_count = 0;  /* total entries currently stored, capped */
 static const char DASHBOARD_HTML[] =
 "<!doctype html>\n"
 "<html><head><meta charset=\"utf-8\">\n"
+"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n"
 "<title>meshtastic-sniffer</title>\n"
 "<link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\">\n"
 "<script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>\n"
@@ -275,6 +284,65 @@ static const char DASHBOARD_HTML[] =
 "html.light .metric .v{color:#0284c7}\n"
 "html.light #drawer-spark{background:#f1f5f9}\n"
 "html.light #drawer-msgs .item{border-bottom-color:#e2e8f0}\n"
+"/* Responsive dashboard: keep each table scroll local to its panel. */\n"
+"html{height:100%;overflow:hidden}\n"
+"body{height:100vh;height:100dvh;min-width:0;overflow:hidden}\n"
+".tab{min-height:0;min-width:0}\n"
+".grid{min-height:0;min-width:0;grid-template-columns:minmax(0,2fr) minmax(0,1fr);grid-template-rows:repeat(4,minmax(0,1fr))}\n"
+".pane{min-width:0;min-height:0;overscroll-behavior:contain}\n"
+".tbl-tools input{min-width:0}\n"
+".log-item,#config .hint,#drawer-body{overflow-wrap:anywhere}\n"
+"button,input,textarea{touch-action:manipulation}\n"
+"button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid #38bdf8;outline-offset:2px}\n"
+"#topo-canvas,#spec-wrap{min-height:0}\n"
+"@media(max-width:900px){\n"
+" #bar{height:auto;min-height:44px;flex-wrap:wrap;gap:8px 14px;padding:8px 12px}\n"
+" #bar .stat{white-space:nowrap}\n"
+" #tabs{overflow-x:auto;overscroll-behavior-x:contain}\n"
+" #tabs button{flex:0 0 auto;min-height:44px;padding:10px 14px}\n"
+" #live{overflow-y:auto;overscroll-behavior-y:contain}\n"
+" .grid{display:flex;flex-direction:column;height:auto;min-height:100%;gap:8px;background:transparent;padding:8px}\n"
+" .grid>.pane{flex:none;max-height:360px;border:1px solid #334155;border-radius:6px;padding:10px}\n"
+" .grid>.map-pane{height:42vh;height:42dvh;min-height:220px;max-height:420px}\n"
+" .grid>.messages-pane{order:1}\n"
+" .grid>.map-pane{order:0}\n"
+" .grid>.nodes-pane{order:2}\n"
+" .grid>.channels-pane{order:3}\n"
+" .grid>.discoveries-pane{order:4}\n"
+" h2{min-height:36px;flex-wrap:wrap}\n"
+" h2 button,button.promote{min-height:44px;min-width:44px}\n"
+" th,td{padding:10px 8px;white-space:nowrap}\n"
+" .tbl-tools input{min-height:44px;font-size:16px}\n"
+" #config{padding:14px;padding-bottom:max(18px,env(safe-area-inset-bottom))}\n"
+" #config textarea,#config input[type=text]{font-size:16px;min-height:44px}\n"
+" #config button{min-height:44px}\n"
+" #config label{display:flex;align-items:flex-start;gap:10px;line-height:1.5}\n"
+" #config input[type=checkbox]{width:22px;height:22px;flex-shrink:0}\n"
+" #activity-grid{grid-template-columns:repeat(auto-fit,minmax(min(260px,100%),1fr))}\n"
+" #spec-strip{flex-wrap:wrap;gap:8px}\n"
+" #spec-strip button{min-height:44px}\n"
+" #topo-legend{right:10px;font-size:10px;line-height:1.5}\n"
+" #drawer{top:0;bottom:0;width:420px;max-width:100%;height:100dvh;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}\n"
+" #drawer-head .close{min-width:44px;min-height:44px;font-size:28px}\n"
+" html.light .grid>.pane{border-color:#cbd5e1}\n"
+"}\n"
+"@media(max-width:480px){\n"
+" #bar{gap:6px 10px;padding-top:max(8px,env(safe-area-inset-top))}\n"
+" #bar .title{flex:1 1 calc(100% - 70px);font-size:14px;order:0}\n"
+" #theme-toggle{order:1;min-height:44px;min-width:44px}\n"
+" #bar .stat{order:2;font-size:11px}\n"
+" #bar .val{margin-left:3px}\n"
+" #bar #status{order:3;width:100%;margin-left:0}\n"
+" #tabs button{padding:10px 12px;font-size:11px;letter-spacing:.5px}\n"
+" .grid{padding:6px;gap:6px}\n"
+" .grid>.map-pane{height:34dvh;min-height:200px}\n"
+" .pane{font-size:13px}\n"
+" .chan-card .row2{gap:10px;flex-wrap:wrap}\n"
+" #activity{padding:10px}\n"
+" #drawer{width:100%}\n"
+" #topo-empty{width:85%}\n"
+"}\n"
+"@media(prefers-reduced-motion:reduce){#drawer,.chan-card{transition:none}}\n"
 "</style></head><body>\n"
 "<div id=\"bar\">\n"
 "  <span class=\"title\">meshtastic-sniffer</span>\n"
@@ -300,8 +368,8 @@ static const char DASHBOARD_HTML[] =
 "</div>\n"
 "<div id=\"live\" class=\"tab active\">\n"
 "  <div class=\"grid\">\n"
-"    <div class=\"pane\" style=\"grid-row:span 4;padding:0;\"><div id=\"map\"></div></div>\n"
-"    <div class=\"pane\"><h2>Nodes <span class=muted id=\"nodes-count\"></span><button onclick=\"exportCsv()\" style=\"background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:3px;padding:2px 8px;cursor:pointer;font-size:10px;\">CSV</button></h2>\n"
+"    <div class=\"pane map-pane\" style=\"grid-row:span 4;padding:0;\"><div id=\"map\"></div></div>\n"
+"    <div class=\"pane nodes-pane\"><h2>Nodes <span class=muted id=\"nodes-count\"></span><button onclick=\"exportCsv()\" style=\"background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:3px;padding:2px 8px;cursor:pointer;font-size:10px;\">CSV</button></h2>\n"
 "      <div class=\"tbl-tools\"><input id=\"nodes-search\" type=\"text\" placeholder=\"Search id, name...\" autocomplete=\"off\"></div>\n"
 "      <table id=\"nodes\">\n"
 "        <thead><tr>\n"
@@ -314,9 +382,9 @@ static const char DASHBOARD_HTML[] =
 "        <tbody></tbody>\n"
 "      </table>\n"
 "    </div>\n"
-"    <div class=\"pane\"><h2>Channels <span class=muted>(by hash)</span></h2><table id=\"channels\"><thead><tr><th>Hash</th><th>Name</th><th>Preset</th><th>Frames</th><th>Decrypt</th><th>Slots</th><th>SNR (1h)</th><th>Last</th></tr></thead><tbody></tbody></table></div>\n"
-"    <div class=\"pane\"><h2>Messages</h2><div id=\"msgs\"></div></div>\n"
-"    <div class=\"pane\"><h2>Discoveries &amp; ATAK</h2><div id=\"disc\"></div></div>\n"
+"    <div class=\"pane channels-pane\"><h2>Channels <span class=muted>(by hash)</span></h2><table id=\"channels\"><thead><tr><th>Hash</th><th>Name</th><th>Preset</th><th>Frames</th><th>Decrypt</th><th>Slots</th><th>SNR (1h)</th><th>Last</th></tr></thead><tbody></tbody></table></div>\n"
+"    <div class=\"pane messages-pane\"><h2>Messages</h2><div id=\"msgs\"></div></div>\n"
+"    <div class=\"pane discoveries-pane\"><h2>Discoveries &amp; ATAK</h2><div id=\"disc\"></div></div>\n"
 "  </div>\n"
 "</div>\n"
 "<div id=\"activity\" class=\"tab\">\n"
@@ -409,12 +477,12 @@ static const char DASHBOARD_HTML[] =
 "  if (name==='spectrum') spectrumStart(); else spectrumStop();\n"
 "}\n"
 "// Theme toggle: dark is default, light persists in localStorage. Map\n"
-"// tile layer swaps between Carto dark/light to match. Same pattern as\n"
-"// inmarsat-sniffer / iridium-sniffer.\n"
+"// tiles follow the theme, using Esri by default or CARTO with an API key.\n"
 "let tileLayer=null;\n"
-"function setTheme(name){const html=document.documentElement;if(name==='light')html.classList.add('light');else html.classList.remove('light');try{localStorage.setItem('theme',name);}catch(e){}if(tileLayer)map.removeLayer(tileLayer);const url=(name==='light')?'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png':'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';tileLayer=L.tileLayer(url,{maxZoom:19,attribution:'(c) OSM (c) CARTO'}).addTo(map);const btn=document.getElementById('theme-toggle');if(btn)btn.textContent=(name==='light')?'light':'dark';}\n"
+"function setTheme(name){const html=document.documentElement;if(name==='light')html.classList.add('light');else html.classList.remove('light');try{localStorage.setItem('theme',name);}catch(e){}if(tileLayer)map.removeLayer(tileLayer);const key='__CARTO_MAP_KEY__';let url,options;if(key){url=((name==='light')?'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png':'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png')+'?key='+key;options={maxZoom:19,attribution:'&copy; OpenStreetMap contributors &copy; CARTO'};}else{url='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_'+((name==='light')?'Light':'Dark')+'_Gray_Base/MapServer/tile/{z}/{y}/{x}';options={maxZoom:19,maxNativeZoom:16,attribution:'Tiles &copy; Esri'};}tileLayer=L.tileLayer(url,options).addTo(map);const btn=document.getElementById('theme-toggle');if(btn)btn.textContent=(name==='light')?'light':'dark';}\n"
 "function toggleTheme(){setTheme(document.documentElement.classList.contains('light')?'dark':'light');}\n"
 "const map = L.map('map').setView([39.5, -98.0], 4);\n"
+"if (window.ResizeObserver) new ResizeObserver(()=>map.invalidateSize({pan:false})).observe(document.getElementById('map'));\n"
 "// Apply persisted theme (also adds the matching tile layer to the map).\n"
 "setTheme((function(){try{return localStorage.getItem('theme')||'dark';}catch(e){return 'dark';}})());\n"
 "const markers = {}, trails = {}, nodes = {}, edges = {}, channels = {};\n"
@@ -1930,14 +1998,37 @@ static void send_all(int fd, const char *buf, size_t n) {
 }
 
 static void serve_index(int fd) {
+    /* URL-encode the runtime key: safe in both a JS string and tile URL. */
+    const char *key = opt_map_api_key ? opt_map_api_key : getenv("MAP_API_KEY");
+    if (!key) key = "";
+    size_t klen = strlen(key);
+    if (klen > 4096) { close(fd); return; }
+    char encoded[4096 * 3 + 1];
+    size_t used = 0;
+    for (size_t i = 0; i < klen; ++i) {
+        unsigned char c = (unsigned char)key[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-') encoded[used++] = c;
+        else { snprintf(encoded + used, 4, "%%%02X", c); used += 3; }
+    }
+    encoded[used] = 0;
+    const char *token = "__CARTO_MAP_KEY__";
+    const char *slot = strstr(DASHBOARD_HTML, token);
+    if (!slot) { close(fd); return; }
+    size_t prefix = (size_t)(slot - DASHBOARD_HTML);
+    const char *suffix = slot + strlen(token);
+    size_t length = prefix + used + strlen(suffix);
     char hdr[256];
     int n = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
+        "Cache-Control: no-store\r\n"
         "Content-Length: %zu\r\n"
-        "Connection: close\r\n\r\n", sizeof(DASHBOARD_HTML) - 1);
+        "Connection: close\r\n\r\n", length);
     send_all(fd, hdr, (size_t)n);
-    send_all(fd, DASHBOARD_HTML, sizeof(DASHBOARD_HTML) - 1);
+    send_all(fd, DASHBOARD_HTML, prefix);
+    send_all(fd, encoded, used);
+    send_all(fd, suffix, strlen(suffix));
     close(fd);
 }
 
@@ -2111,10 +2202,11 @@ static size_t recv_full_request(int fd, char *buf, size_t cap)
             size_t need = (size_t)strtoul(cl + 1, NULL, 10);
             const char *body = strstr(buf, "\r\n\r\n");
             size_t header_len = body ? (size_t)((body + 4) - buf) : got;
+            if (!body || need > cap - 1 - header_len) return 0;
             size_t have = got > header_len ? got - header_len : 0;
             while (have < need && got < cap - 1) {
                 ssize_t n = recv(fd, buf + got, cap - 1 - got, 0);
-                if (n <= 0) break;
+                if (n <= 0) return 0;
                 got += (size_t)n;
                 have += (size_t)n;
                 buf[got] = 0;
@@ -2122,6 +2214,68 @@ static size_t recv_full_request(int fd, char *buf, size_t cap)
         }
     }
     return got;
+}
+
+/* A browser may preconnect without sending a request. Never let that
+ * socket monopolize the accept loop. Bound workers and socket waits. */
+static void *http_client(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    struct timeval timeout = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    /* 16 KB request buffer -- enough for hundreds of keys or a long share URL. */
+    static __thread char buf[16384];
+    size_t got = recv_full_request(fd, buf, sizeof(buf));
+    if (!got) { close(fd); goto done; }
+
+    if (strncmp(buf, "GET / ",        6) == 0 ||
+        strncmp(buf, "GET /\r",       6) == 0 ||
+        strncmp(buf, "GET /index",   10) == 0) serve_index(fd);
+    else if (strncmp(buf, "GET /events", 11) == 0) promote_to_sse(fd);
+    else if (strncmp(buf, "POST /api/keys", 14) == 0) {
+        if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
+        c2_response_t r;
+        c2_keys_add(find_body(buf), &r);
+        send_response(fd, r.status, r.body);
+    }
+    else if (strncmp(buf, "POST /api/share-url", 19) == 0) {
+        if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
+        const char *body = find_body(buf);
+        c2_response_t r;
+        /* HTTP-form bodies arrive URL-encoded; decode before dispatch.
+         * The share-URL parser itself is transport-agnostic in c2.c. */
+        if (!body) { c2_share_url(NULL, &r); }
+        else {
+            char dec[1024];
+            size_t bl = strlen(body);
+            if (bl >= sizeof(dec)) bl = sizeof(dec) - 1;
+            memcpy(dec, body, bl); dec[bl] = 0;
+            url_decode_inplace(dec);
+            c2_share_url(dec, &r);
+        }
+        send_response(fd, r.status, r.body);
+    }
+    else if (strncmp(buf, "POST /api/extra-freq", 20) == 0) {
+        if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
+        c2_response_t r;
+        c2_extra_freq(find_body(buf), &r);
+        send_response(fd, r.status, r.body);
+    }
+    else if (strncmp(buf, "POST /api/cot-multicast", 23) == 0) {
+        if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
+        c2_response_t r;
+        c2_cot_multicast(find_body(buf), &r);
+        send_response(fd, r.status, r.body);
+    }
+    else serve_404(fd);
+
+done:
+    pthread_mutex_lock(&g_http_lock);
+    --g_http_workers;
+    pthread_cond_broadcast(&g_http_idle);
+    pthread_mutex_unlock(&g_http_lock);
+    return NULL;
 }
 
 static void *web_thread(void *arg)
@@ -2141,51 +2295,22 @@ static void *web_thread(void *arg)
             break;
         }
 
-        /* 16 KB request buffer -- enough for hundreds of keys or a long share URL. */
-        static __thread char buf[16384];
-        size_t got = recv_full_request(fd, buf, sizeof(buf));
-        if (!got) { close(fd); continue; }
-
-        if (strncmp(buf, "GET / ",        6) == 0 ||
-            strncmp(buf, "GET /\r",       6) == 0 ||
-            strncmp(buf, "GET /index",   10) == 0) serve_index(fd);
-        else if (strncmp(buf, "GET /events", 11) == 0) promote_to_sse(fd);
-        else if (strncmp(buf, "POST /api/keys", 14) == 0) {
-            if (!api_auth_ok(buf, fd)) { close(fd); continue; }
-            c2_response_t r;
-            c2_keys_add(find_body(buf), &r);
-            send_response(fd, r.status, r.body);
+        pthread_mutex_lock(&g_http_lock);
+        if (g_http_workers >= MAX_HTTP_WORKERS) {
+            pthread_mutex_unlock(&g_http_lock);
+            close(fd);
+            continue;
         }
-        else if (strncmp(buf, "POST /api/share-url", 19) == 0) {
-            if (!api_auth_ok(buf, fd)) { close(fd); continue; }
-            const char *body = find_body(buf);
-            c2_response_t r;
-            /* HTTP-form bodies arrive URL-encoded; decode before dispatch.
-             * The share-URL parser itself is transport-agnostic in c2.c. */
-            if (!body) { c2_share_url(NULL, &r); }
-            else {
-                char dec[1024];
-                size_t bl = strlen(body);
-                if (bl >= sizeof(dec)) bl = sizeof(dec) - 1;
-                memcpy(dec, body, bl); dec[bl] = 0;
-                url_decode_inplace(dec);
-                c2_share_url(dec, &r);
-            }
-            send_response(fd, r.status, r.body);
-        }
-        else if (strncmp(buf, "POST /api/extra-freq", 20) == 0) {
-            if (!api_auth_ok(buf, fd)) { close(fd); continue; }
-            c2_response_t r;
-            c2_extra_freq(find_body(buf), &r);
-            send_response(fd, r.status, r.body);
-        }
-        else if (strncmp(buf, "POST /api/cot-multicast", 23) == 0) {
-            if (!api_auth_ok(buf, fd)) { close(fd); continue; }
-            c2_response_t r;
-            c2_cot_multicast(find_body(buf), &r);
-            send_response(fd, r.status, r.body);
-        }
-        else serve_404(fd);
+        ++g_http_workers;
+        pthread_mutex_unlock(&g_http_lock);
+        pthread_t client;
+        if (pthread_create(&client, NULL, http_client, (void *)(intptr_t)fd) != 0) {
+            close(fd);
+            pthread_mutex_lock(&g_http_lock);
+            --g_http_workers;
+            pthread_cond_broadcast(&g_http_idle);
+            pthread_mutex_unlock(&g_http_lock);
+        } else pthread_detach(client);
     }
     return NULL;
 }
@@ -2282,6 +2407,17 @@ void web_shutdown(void)
         g_thread_running = 0;
         if (g_listen_fd >= 0) shutdown(g_listen_fd, SHUT_RDWR);
         pthread_join(g_thread, NULL);
+        pthread_mutex_lock(&g_http_lock);
+        /* A peer can keep recv() alive by trickling bytes. Bound the total
+         * drain time, including wakeups from other workers finishing. */
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += 2;
+        while (g_http_workers) {
+            if (pthread_cond_timedwait(&g_http_idle, &g_http_lock, &deadline) != 0)
+                break;
+        }
+        pthread_mutex_unlock(&g_http_lock);
     }
     if (g_listen_fd >= 0) { close(g_listen_fd); g_listen_fd = -1; }
     pthread_mutex_lock(&g_lock);
