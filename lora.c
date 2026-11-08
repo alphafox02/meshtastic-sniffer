@@ -82,9 +82,17 @@ typedef struct {
     atomic_uint_fast64_t payload_crc_fail    [LORA_STATS_SF_COUNT];
     atomic_uint_fast64_t payload_no_crc      [LORA_STATS_SF_COUNT];
     atomic_uint_fast64_t published_frames    [LORA_STATS_SF_COUNT];
+    /* Coherent multi-symbol preamble detector (Stage 1 instrument,
+     * MESHTASTIC_COHERENT_PREAMBLE). Parallel to preamble_locks but from the
+     * K-symbol power integrator, ~4-7 dB more sensitive. Pure stat; does
+     * not drive the decode state machine. */
+    atomic_uint_fast64_t coherent_preamble_locks[LORA_STATS_SF_COUNT];
     atomic_uint_fast64_t snr_hist_preamble [LORA_STATS_SNR_BUCKETS];
     atomic_uint_fast64_t snr_hist_header   [LORA_STATS_SNR_BUCKETS];
     atomic_uint_fast64_t snr_hist_crc_pass [LORA_STATS_SNR_BUCKETS];
+    /* Integrated peak/coherent-noise ratio (power, so 10log10) at the moment
+     * of a coherent preamble lock. */
+    atomic_uint_fast64_t snr_hist_coherent [LORA_STATS_SNR_BUCKETS];
     /* Payload-length histogram for CRC pass vs fail, in 30-byte buckets
      * [0-29, 30-59, 60-89, 90-119, 120-149, 150-179, 180-209, 210+]. The
      * "is the payload corruption length-dependent" question becomes
@@ -171,11 +179,17 @@ void lora_demod_stats_dump(FILE *fp)
     /* Sum to detect "nothing ran at all" so we don't spam an empty table.
      * Anything observed (even just preamble candidates above the floor)
      * is worth printing. */
-    uint64_t total_candidates = 0;
-    for (int i = 0; i < LORA_STATS_SF_COUNT; ++i)
+    /* Sum single-symbol candidates AND coherent locks: with the coherent
+     * detector enabled the single-symbol path can be all-zero while the
+     * coherent path still found weak preambles, so guard on both. */
+    uint64_t total_candidates = 0, total_coh = 0;
+    for (int i = 0; i < LORA_STATS_SF_COUNT; ++i) {
         total_candidates += atomic_load_explicit(
             &g_demod_stats.preamble_candidates[i], memory_order_relaxed);
-    if (total_candidates == 0) {
+        total_coh += atomic_load_explicit(
+            &g_demod_stats.coherent_preamble_locks[i], memory_order_relaxed);
+    }
+    if (total_candidates == 0 && total_coh == 0) {
         fprintf(fp, "[demod-stats] no preamble candidates observed.\n");
         return;
     }
@@ -202,11 +216,13 @@ void lora_demod_stats_dump(FILE *fp)
     ROW("payload_crc_fail",     payload_crc_fail);
     ROW("payload_no_crc",       payload_no_crc);
     ROW("published_frames",     published_frames);
+    ROW("coh_preamble_locks",    coherent_preamble_locks);
 #undef ROW
     fprintf(fp, "[demod-stats] SNR histograms (2dB buckets):\n");
     stats_dump_hist(fp, "preamble",   g_demod_stats.snr_hist_preamble);
     stats_dump_hist(fp, "header_pass",g_demod_stats.snr_hist_header);
     stats_dump_hist(fp, "crc_pass",   g_demod_stats.snr_hist_crc_pass);
+    stats_dump_hist(fp, "coh_lock",  g_demod_stats.snr_hist_coherent);
     fprintf(fp, "[demod-stats] CRC pass/fail by payload length (30-byte buckets):\n");
     fprintf(fp, "  %-12s %8s %8s %8s %8s %8s %8s %8s %8s\n", "",
             "0-29", "30-59", "60-89", "90-119", "120-149", "150-179", "180-209", "210+");
@@ -392,6 +408,8 @@ typedef enum {
 #define MAX_SF              12
 #define MAX_FFT             (1 << MAX_SF)
 #define PREAMBLE_MIN        5            /* match >= this many upchirps -> preamble */
+#define COH_K               8            /* coherent preamble window: full Meshtastic preamble = 8 upchirps */
+#define COH_STABLE_MIN      3            /* consecutive +/-1-bin matches to declare a coherent preamble */
 #define MAX_PAYLOAD_BYTES   256
 #define MAX_PAYLOAD_SYMBOLS 1024
 /* Soft-decoding LLR store: one row of sf_app floats per accumulated
@@ -557,6 +575,31 @@ struct lora_decoder {
     uint64_t stream_chunk_anchor;
     uint32_t stream_step_per_sample;
     uint32_t samples_in_chunk;
+
+    /* ---- Coherent multi-symbol preamble detector (Stage 1, env
+     * MESHTASTIC_COHERENT_PREAMBLE). A sliding K-symbol |Y|^2 power
+     * integrator: ~4-7 dB more sensitive than the single-symbol 6 dB floor.
+     * CFO-robust (constant CFO shifts all preamble symbols to one bin, and a
+     * power sum integrates correctly). Pure instrument -- bumps
+     * coherent_preamble_locks, does NOT drive the decode state machine.
+     * Allocated only when coherent_mode_enabled(), so the default path is
+     * byte-identical. */
+    double *coh_mag_sq;       /* COH_K slots x N: last K per-symbol |Y|^2 spectra */
+    double *coh_sum;          /* sliding running sum of |Y|^2, length N */
+    int     coh_ring_next;    /* next ring slot index to overwrite */
+    int     coh_ring_count;   /* slots filled (caps at COH_K) */
+    int     coh_prev_bin;     /* previous integrated argmax bin (-1 = none) */
+    int     coh_stable_count; /* consecutive +/-1-bin matches */
+    int     coh_fired;        /* refractory: one fire per preamble */
+    int     coh_n;            /* N cached at alloc (== d->N) */
+    /* Stage 2 wire-in: when coh fires on a state == IDLE, we seed
+     * preamble_bin/count/etc. and transition to STATE_PREAMBLE_OK, then
+     * wait for 1-2 single-symbol ticks to fill fft_hist/dechirped rings
+     * before the commit block can produce a valid cfo_frac. */
+    int     coh_locked_pending;         /* set on coh fire; cleared on commit */
+    int     coh_committed_bin;          /* coh_bin at fire, for coh-hold floor */
+    double  coh_committed_peak;         /* coh_peak at fire, for coh-hold floor */
+    int     coh_was_committed_recently; /* set at commit; cleared in reset_to_idle */
 };
 
 /* ---- Reference chirps ----
@@ -598,6 +641,54 @@ static void build_chirps(fftwf_complex *up, fftwf_complex *down, int N)
         u[n] = (float)cos(phase) + I * (float)sin(phase);
         d[n] = conjf(u[n]);
     }
+}
+
+/* ---- Coherent preamble detector env knobs (Stage 1) ----
+ * Off by default; mirrors the MESHTASTIC_LORA_TRACE one-shot pattern. The
+ * first call reads the env once and caches the result behind an atomic gate;
+ * allocations and per-tick work happen only when enabled, so the default
+ * decode path is byte-identical. */
+static int coherent_mode_enabled(void)
+{
+    static _Atomic int check = 0;
+    static _Atomic int on    = 0;
+    if (!atomic_load_explicit(&check, memory_order_acquire)) {
+        const char *e = getenv("MESHTASTIC_COHERENT_PREAMBLE");
+        atomic_store_explicit(&on, (e && *e == '1') ? 1 : 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&check, 1, memory_order_release);
+    }
+    return atomic_load_explicit(&on, memory_order_relaxed);
+}
+
+/* Detection threshold on the integrated spectrum: fire when
+ * coh_peak > thr * coh_noise, where coh_noise is the 95th-percentile noise
+ * bin. Default 1.6 (~2 dB above the integrated noise floor); calibrate via
+ * MESHTASTIC_COHERENT_SNR on the noise cap for 0 false locks. The plain
+ * (non-atomic) value is safe: it is written once before the release-store on
+ * `check`, and every reader passes the acquire-load on `check` first. */
+static double coherent_thr(void)
+{
+    static _Atomic int check = 0;
+    static double    thr = 1.6;
+    if (!atomic_load_explicit(&check, memory_order_acquire)) {
+        const char *e = getenv("MESHTASTIC_COHERENT_SNR");
+        if (e && *e) {
+            double v = atof(e);
+            if (v > 0.0) thr = v;
+        }
+        atomic_store_explicit(&check, 1, memory_order_release);
+    }
+    return thr;
+}
+
+/* qsort comparator for the 95th-percentile noise estimate. */
+static int coh_cmp_double(const void *a, const void *b)
+{
+    double da = *(const double *)a, db = *(const double *)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
 }
 
 lora_decoder_t *lora_decoder_create(int sf, int cr, int bw_hz)
@@ -642,6 +733,16 @@ lora_decoder_t *lora_decoder_create_os(int sf, int cr, int bw_hz, int os_factor)
     {
         const char *e = getenv("MESHTASTIC_LORA_SOFT");
         d->soft_decoding = (e && *e == '1');
+    }
+    /* Coherent preamble detector buffers -- only when enabled, so the default
+     * path stays allocation-free. coh_mag_sq holds the last K per-symbol |Y|^2
+     * spectra (COH_K x N doubles) for the slide-exact running sum. */
+    if (coherent_mode_enabled()) {
+        d->coh_mag_sq = calloc((size_t)COH_K * d->N, sizeof(double));
+        d->coh_sum    = calloc((size_t)d->N, sizeof(double));
+        d->coh_n      = d->N;
+        d->coh_prev_bin = -1;
+        if (!d->coh_mag_sq || !d->coh_sum) { lora_decoder_destroy(d); return NULL; }
     }
     return d;
 }
@@ -716,6 +817,8 @@ void lora_decoder_destroy(lora_decoder_t *d)
     if (d->fft2_out) fftwf_free(d->fft2_out);
     free(d->preamble_dechirped);
     free(d->symbuf);
+    free(d->coh_mag_sq);   /* NULL-safe; allocated only when enabled */
+    free(d->coh_sum);
     free(d);
 }
 
@@ -1073,6 +1176,44 @@ static void reset_to_idle(lora_decoder_t *d)
     d->sfo_next_sym_shift = 0;
     d->preamble_dechirped_count = 0;
     d->preamble_dechirped_next  = 0;
+    /* Stage-2 conditional flush of the K-symbol coherent window.
+     *
+     * The K-window and running sum slide in every state, by design: that
+     * way a real preamble that arrives after a few symbols of silence is
+     * already half-built up when the first chirp lands, and the
+     * integration gain shows up in the threshold. The catch is that a
+     * COH-committed frame's header + payload spectrum stays inside the
+     * K-window for the rest of the frame -- and on reset_to_idle() the
+     * next frame's first single-symbol tick enters the new frame with
+     * the OLD frame's spectrum still occupying 6+ of 8 K-slots. The
+     * K-sum then peaks at the old frame's bin (which can be anywhere
+     * in the band) and the coh detector spuriously re-fires on it,
+     * pulling the decoder into a phantom POK -> commit cycle that
+     * produces a payload_crc_fail / header_checksum_fail even when no
+     * real signal is present.
+     *
+     * Mitigation: track `coh_was_committed_recently` -- set at commit
+     * (line ~1818), cleared on the NEXT reset_to_idle after a coh
+     * commit. Only on that one transition do we flush the K-window.
+     * The default path (coh never fired) leaves the sliding window
+     * intact, preserving the integration-gain property. */
+    if (d->coh_was_committed_recently && d->coh_mag_sq && d->coh_sum) {
+        memset(d->coh_mag_sq, 0, sizeof(double) * COH_K * d->coh_n);
+        memset(d->coh_sum,    0, sizeof(double) * d->coh_n);
+        d->coh_ring_next   = 0;
+        d->coh_ring_count  = 0;
+    }
+    /* Coherent detector control state. coh_fired/stable_count/prev_bin
+     * always reset; coh_locked_pending/was_committed_recently/
+     * committed_bin/committed_peak always reset (committed_recently is
+     * self-clearing, used only for the one-shot K-window flush above). */
+    d->coh_fired                  = 0;
+    d->coh_stable_count           = 0;
+    d->coh_prev_bin               = -1;
+    d->coh_locked_pending         = 0;
+    d->coh_was_committed_recently = 0;
+    d->coh_committed_bin          = -1;
+    d->coh_committed_peak         = 0.0;
     /* Rebuild the chirp references to id=0. apply_cfo_correction
      * (called at DC2) mutates d->upchirp and d->downchirp in place
      * to bake the just-measured cfo_int into the reference. Without
@@ -1220,6 +1361,150 @@ static void state_tick(lora_decoder_t *d)
                 d->state, sym, peak, peak / (noise > 0 ? noise : 1));
     }
 
+    /* ---- Coherent multi-symbol preamble detector (Stage 1, instrument) ----
+     * Optional, env MESHTASTIC_COHERENT_PREAMBLE=1. A sliding K-symbol |Y|^2
+     * power integrator that catches weak preambles the single-symbol 6 dB
+     * floor above misses. CFO-robust: in the hunting states (IDLE/PREAMBLE_OK)
+     * cfo_int/cfo_frac are 0, so a constant CFO shifts every preamble symbol
+     * to the same FFT bin and the power sum integrates correctly.
+     *
+     * PURE INSTRUMENT: bumps coherent_preamble_locks + snr_hist_coherent only.
+     * It never mutates d->state and never re-runs demod_one_symbol_full; it
+     * reads the N-point spectrum left in d->fft_out by the authoritative call
+     * above. The window slides in EVERY state so sync/header chirps flush a
+     * real preamble out of the K-window (preventing a stale-window false fire
+     * on the return to IDLE); fires only while hunting (IDLE/PREAMBLE_OK). */
+    if (coherent_mode_enabled() && d->coh_sum) {
+        const int N = d->coh_n;
+        const int slot = d->coh_ring_next;
+        double *slot_p = &d->coh_mag_sq[(size_t)slot * N];
+        const float complex *Y = (const float complex *)d->fft_out;
+
+        /* Slide the running |Y|^2 sum: add the new symbol, subtract the one
+         * it is overwriting in the ring. slot_p[] then holds the new spectrum. */
+        for (int k = 0; k < N; ++k) {
+            float re = crealf(Y[k]), im = cimagf(Y[k]);
+            double m = (double)re * re + (double)im * im;
+            d->coh_sum[k] += m - slot_p[k];
+            slot_p[k] = m;
+        }
+        d->coh_ring_next = (slot + 1) % COH_K;
+        if (d->coh_ring_count < COH_K) d->coh_ring_count++;
+
+        if (d->coh_ring_count >= COH_K) {
+            /* Integrated argmax. */
+            int coh_bin = 0;
+            double coh_peak = d->coh_sum[0];
+            for (int k = 1; k < N; ++k) {
+                if (d->coh_sum[k] > coh_peak) {
+                    coh_peak = d->coh_sum[k]; coh_bin = k;
+                }
+            }
+            /* Noise reference: 95th percentile of the integrated bins,
+             * excluding a guard band around the peak (and its FFT wrap). An
+             * order statistic grows sublinearly with K, so the integration gain
+             * (5*log10(K) ~= 4.5 dB at K=8) actually shows up; a plain mean
+             * would grow K* too and yield ~0 dB. The high percentile trims the
+             * top 5% (bursty non-Gaussian interferers), sidestepping the
+             * noise-inflation pitfall that regressed the soft-decode path. */
+            const int W = 4;
+            double scratch[MAX_FFT];
+            int n_noise = 0;
+            for (int k = 0; k < N; ++k) {
+                int dist = abs(k - coh_bin);
+                if (dist > N - dist) dist = N - dist;   /* wrap distance */
+                if (dist <= W) continue;                /* guard around peak */
+                scratch[n_noise++] = d->coh_sum[k];
+            }
+            double coh_noise = 0.0;
+            if (n_noise > 0) {
+                qsort(scratch, n_noise, sizeof(double), coh_cmp_double);
+                int idx = (int)(0.95 * (n_noise - 1));
+                if (idx < 0) idx = 0;
+                if (idx >= n_noise) idx = n_noise - 1;
+                coh_noise = scratch[idx];
+            }
+            double thr = coherent_thr();
+            bool coh_ok = (coh_noise > 0.0) && (coh_peak > thr * coh_noise);
+
+            if (getenv("MESHTASTIC_COH_DEBUG")) {
+                fprintf(stderr, "[coh] sf=%d state=%d ring=%d bin=%d "
+                        "peak=%.3g noise=%.3g ratio=%.3f thr=%.2f ok=%d "
+                        "stable=%d prev=%d fired=%d\n",
+                        d->sf, d->state, d->coh_ring_count, coh_bin,
+                        coh_peak, coh_noise,
+                        coh_noise > 0 ? coh_peak/coh_noise : 0.0, thr, coh_ok,
+                        d->coh_stable_count, d->coh_prev_bin, d->coh_fired);
+            }
+
+            /* Bin stability (+/-1, with FFT wrap). The integrator sharpens
+             * argmax, so 1-bin tolerance (not 2) over COH_STABLE_MIN matches. */
+            int diff = abs(coh_bin - d->coh_prev_bin);
+            if (diff > N / 2) diff = N - diff;
+            bool stable = (d->coh_prev_bin >= 0) && (diff <= 1);
+            d->coh_stable_count = stable ? d->coh_stable_count + 1 : 1;
+            d->coh_prev_bin = coh_bin;
+
+            /* Fire once per preamble, only while hunting. Stage 2: when the
+             * decoder is in IDLE we also seed the per-symbol state and
+             * transition to STATE_PREAMBLE_OK so the next single-symbol
+             * tick drives the commit. In POK the single-symbol path is
+             * already in control (it got there first on strong frames); do
+             * not clobber its state. */
+            if (coh_ok && d->coh_stable_count >= COH_STABLE_MIN && !d->coh_fired &&
+                d->state == STATE_IDLE) {
+                /* Per-frame TDOA anchor at the moment of coh fire. */
+                d->meta.preamble_lock_sample_idx =
+                    d->stream_chunk_anchor +
+                    (uint64_t)d->samples_in_chunk *
+                    (uint64_t)d->stream_step_per_sample;
+                {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_REALTIME, &ts);
+                    d->meta.preamble_lock_t_ns =
+                        (uint64_t)ts.tv_sec * 1000000000ULL +
+                        (uint64_t)ts.tv_nsec;
+                }
+                STATS_BUMP(coherent_preamble_locks, d->sf);
+                double snr_db = (coh_noise > 0.0)
+                    ? 10.0 * log10(coh_peak / coh_noise) : 0.0;
+                STATS_SNR(snr_hist_coherent, snr_db);
+                d->coh_fired = 1;
+
+                /* Stage-2 wire-in: seed the per-symbol preamble-OK state
+                 * so the single-symbol path takes over on the next tick.
+                 * Save coh_bin/coh_peak for the coh-hold floor in the
+                 * lost-signal branch (handles the first post-coh tick
+                 * whose single-symbol peak is still below 2*noise). */
+                d->coh_locked_pending     = 1;
+                d->coh_committed_bin      = coh_bin;
+                d->coh_committed_peak     = coh_peak;
+                d->preamble_bin           = coh_bin;
+                d->preamble_count         = PREAMBLE_MIN;     /* "locked" */
+                d->preamble_locked_once   = 0;                /* single-symbol will fire */
+                d->preamble_bin_hist[0]   = coh_bin;
+                d->preamble_bin_hist_count = 1;
+                d->preamble_fft_count     = 0;                /* fills in 1-2 deferred ticks */
+                d->preamble_peak_sum      = coh_peak;         /* substitute baseline for straddle */
+                d->preamble_peak_count    = 1;
+                d->cfo_int                = 0;
+                d->cfo_frac               = 0.0f;
+                d->state                  = STATE_PREAMBLE_OK;
+
+                if (d->preamble_cb) {
+                    d->preamble_cb(d->sf, d->cr, d->bw_hz, (float)snr_db,
+                                   d->preamble_user);
+                }
+            }
+            /* Refractory: re-arm when energy drops or the bin drifts away. */
+            if (!coh_ok || d->coh_stable_count == 1) d->coh_fired = 0;
+        } else {
+            /* Window not full yet: keep the control state sane. */
+            d->coh_prev_bin = -1;
+            d->coh_stable_count = 0;
+        }
+    }
+
     /* Preamble-detection SNR floor. Without this, silence between frames
      * has every FFT bin == 0, argmax returns bin 0, the "stable bin"
      * counter ticks to PREAMBLE_MIN, and the state machine fakes a
@@ -1250,12 +1535,24 @@ static void state_tick(lora_decoder_t *d)
     }
     case STATE_PREAMBLE_OK: {
         if (!above_floor) {
-            /* Lost the signal -- back to hunting. */
-            if (framesync_enabled())
+            /* Lost the signal -- back to hunting. UNLESS this is the
+             * first post-coh tick, where the single-symbol peak is still
+             * below 6 dB but the coherent integrator already proved a
+             * preamble exists. Coh-hold keeps us in POK for one more
+             * single-symbol tick so the commit block can run on the
+             * next sync-word bin-jump with real per-symbol history. */
+            bool coh_hold = d->coh_locked_pending
+                && d->coh_committed_peak > 0.0
+                && (double)peak > 0.5 * d->coh_committed_peak / (double)COH_K;
+            if (framesync_enabled()) {
                 fprintf(stderr,
-                    "[fs] frame=%d POK_TICK sym=%d peak=%.3f noise=%.3f decision=below_floor\n",
+                    "[fs] frame=%d POK_TICK sym=%d peak=%.3f noise=%.3f "
+                    "decision=%s\n",
                     d->framesync_frame_idx + 1, (int)sym,
-                    (double)peak, (double)noise);
+                    (double)peak, (double)noise,
+                    coh_hold ? "below_floor_coh_hold" : "below_floor");
+            }
+            if (coh_hold) break;
             reset_to_idle(d);
             d->preamble_fft_count = 0;
             break;
@@ -1311,6 +1608,30 @@ static void state_tick(lora_decoder_t *d)
          * The smallest sync-word offset we still need to detect cleanly
          * is sync_word=1 -> bin = 8 (LoRa convention), so ±2 leaves
          * margin without missing real syncs. */
+        /* Snapshot the FFT bin value for cfo_frac estimation. Filled in
+         * BOTH the match path AND the straddle path so a coh-pending
+         * frame (which enters straddle on its first single-symbol tick)
+         * still has data for cfo_frac at commit. Moved here from inside
+         * the match block; now runs unconditionally on every POK tick. */
+        int N_HIST = (int)(sizeof(d->preamble_fft_hist) / sizeof(d->preamble_fft_hist[0]));
+        if (d->preamble_fft_count < N_HIST)
+            d->preamble_fft_hist[d->preamble_fft_count++] = preamble_bin_val;
+        /* Stash bin value for k_hat = mode computation at lock time. */
+        int B_HIST = (int)(sizeof(d->preamble_bin_hist) / sizeof(d->preamble_bin_hist[0]));
+        if (d->preamble_bin_hist_count < B_HIST)
+            d->preamble_bin_hist[d->preamble_bin_hist_count++] = (int)sym;
+        /* Snapshot the dechirped time-domain samples for RCTSL sto_frac
+         * estimation. demod_one_symbol_full left them in d->fft_in.
+         * Rolling buffer keeps the last K preamble symbols. */
+        if (d->preamble_dechirped) {
+            int K = d->preamble_dechirped_capacity;
+            int slot = d->preamble_dechirped_next;
+            memcpy(&d->preamble_dechirped[(size_t)slot * d->N],
+                   d->fft_in, sizeof(float complex) * (size_t)d->N);
+            d->preamble_dechirped_next = (slot + 1) % K;
+            if (d->preamble_dechirped_count < K)
+                d->preamble_dechirped_count++;
+        }
         if (diff <= 2 && !straddle_trigger) {
             /* Still on preamble. Cap count so we're ready to detect sync. */
             if (d->preamble_count < PREAMBLE_MIN + 4) d->preamble_count++;
@@ -1323,8 +1644,12 @@ static void state_tick(lora_decoder_t *d)
             d->preamble_peak_count += 1;
             /* First tick where we've collected PREAMBLE_MIN matching symbols
              * is a "lock". Record only once per preamble run so the lock
-             * count is a per-preamble event, not a per-symbol event. */
-            if (d->preamble_count >= PREAMBLE_MIN && !d->preamble_locked_once) {
+             * count is a per-preamble event, not a per-symbol event.
+             * Stage 2: skip when coh_locked_pending -- the coh fire already
+             * bumped coherent_preamble_locks, fired the callback, and
+             * stamped the TDOA anchor; re-firing here would double-count. */
+            if (d->preamble_count >= PREAMBLE_MIN && !d->preamble_locked_once
+                && !d->coh_locked_pending) {
                 d->preamble_locked_once = 1;
                 STATS_BUMP(preamble_locks, d->sf);
                 float snr_db = (peak > 0.0f && noise > 0.0f)
@@ -1366,26 +1691,6 @@ static void state_tick(lora_decoder_t *d)
                     d->preamble_cb(d->sf, d->cr, d->bw_hz, snr_db,
                                    d->preamble_user);
                 }
-            }
-            /* Snapshot the FFT bin value for cfo_frac estimation later. */
-            int N_HIST = (int)(sizeof(d->preamble_fft_hist) / sizeof(d->preamble_fft_hist[0]));
-            if (d->preamble_fft_count < N_HIST)
-                d->preamble_fft_hist[d->preamble_fft_count++] = preamble_bin_val;
-            /* Stash bin value for k_hat = mode computation at lock time. */
-            int B_HIST = (int)(sizeof(d->preamble_bin_hist) / sizeof(d->preamble_bin_hist[0]));
-            if (d->preamble_bin_hist_count < B_HIST)
-                d->preamble_bin_hist[d->preamble_bin_hist_count++] = (int)sym;
-            /* Snapshot the dechirped time-domain samples for RCTSL sto_frac
-             * estimation. demod_one_symbol_full left them in d->fft_in.
-             * Rolling buffer keeps the last K preamble symbols. */
-            if (d->preamble_dechirped) {
-                int K = d->preamble_dechirped_capacity;
-                int slot = d->preamble_dechirped_next;
-                memcpy(&d->preamble_dechirped[(size_t)slot * d->N],
-                       d->fft_in, sizeof(float complex) * (size_t)d->N);
-                d->preamble_dechirped_next = (slot + 1) % K;
-                if (d->preamble_dechirped_count < K)
-                    d->preamble_dechirped_count++;
             }
         } else if (d->preamble_count >= PREAMBLE_MIN) {
             /* Bin shifted significantly after we had a confirmed preamble:
@@ -1534,6 +1839,16 @@ static void state_tick(lora_decoder_t *d)
                 fprintf(stderr, "]\n");
             }
             d->preamble_bin_hist_count = 0;
+            /* Stage-2 coh cleanup: the commit ran, either via the
+             * normal single-symbol path or the coh-pending path. Mark
+             * "recently coh-committed" so reset_to_idle can flush the
+             * K-window (otherwise the next frame's coh detector sees
+             * this frame's header/payload spectrum and may spuriously
+             * re-arm). */
+            if (d->coh_locked_pending) {
+                d->coh_locked_pending         = 0;
+                d->coh_was_committed_recently = 1;
+            }
         } else {
             reset_to_idle(d);
         }
