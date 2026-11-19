@@ -22,7 +22,7 @@ A separate Go binary so it can be deployed on a different host than the SDR-atta
   - **Activity**: per-preset cards aggregated across all sensors, with each card showing per-sensor breakdown (frame counts, decrypt%).
   - **Topology**: force-directed graph; each station is a pinned colored node, each transmitting node has dashed pseudo-edges to every station that's heard it (SNR-colored).
   - **Sensors**: registry table with live health (green/yellow/red), frames seen, decrypt%, msps, last event, C2-transport badge with hover-tooltip showing per-session DEALER telemetry (heartbeat count, last-seen age, command success/timeout counts, p50/p95 latency).
-  - **Config**: command fan-out (Add key, Channel-share URL, Add extra freq, CoT multicast) — each form POSTs to every sensor's `/api/*` and reports per-sensor status.
+  - **Config**: command fan-out (Add key, Channel-share URL, Add extra freq, CoT multicast) — each form POSTs to every sensor's `/api/*` and reports per-sensor status. Also a **Google Earth live KML** link (see `/live.kml` below).
 - **C2 fan-out** via HTTP `POST /api/fanout/<endpoint>` — fans to every registered sensor's matching `/api/<endpoint>` in parallel, with optional bearer token from the sensor's registry entry. Prefers DEALER (ZMQ) for any sensor with an active inbound DEALER session; falls back to HTTP otherwise.
 - **DEALER telemetry** at `GET /api/dealer-stats` — per-identity heartbeat count, last-seen age, command counts (sent / replied / timed-out), and a sliding histogram of recent command latencies with p50/p95.
 - **STATS heartbeats over ZMQ** — sniffer-side `[stats]` heartbeats are now published over the same ZMQ PUB feed alongside frame events, so fusion's Sensors tab shows live msps + cumulative frames + decrypt% per sensor without any extra channel.
@@ -93,6 +93,8 @@ All require the bearer token when `--api-token` is set.
 |---|---|---|
 | GET    | `/`                       | Embedded dashboard HTML (always open) |
 | GET    | `/events`                 | SSE firehose: every event from every subscribed sniffer + TX/GEOLOCATED consolidations |
+| GET    | `/live.kml`               | Google Earth NetworkLink (re-polls the feed every `--kml-refresh` s, default 10). With `--api-token` set, the token is embedded in the feed URL, because Google Earth can't send headers |
+| GET    | `/live_feed.kml`          | Live KML with three folders. Sensors: gpsd position, or the registry position as fallback. Nodes: self-reported position + track, plus heard-by lines from stations that heard them in the last 10 min. Multilateration fixes: latest fix + 1-sigma circle + fix trail. Trusted frames only |
 | GET    | `/api/sensors`            | List registered sensors (with live `dealer:bool` for current C2 transport) |
 | POST   | `/api/sensors`            | Add or update a sensor `{name, zmq, api?, api_token?, lat?, lon?, alt_m?}` |
 | DELETE | `/api/sensors/<name>`     | Remove a sensor |

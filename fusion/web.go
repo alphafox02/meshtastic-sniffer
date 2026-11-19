@@ -210,7 +210,7 @@ func authWrap(next http.Handler, token string) http.Handler {
 // the dashboard HTML at / is always served without auth so the operator
 // can land on the page and the JS can pick up the token from a
 // `?token=<T>` query param.
-func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *Registry, store *EventStore, apiToken string) error {
+func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *Registry, store *EventStore, apiToken string, kmlRefreshS int) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -371,6 +371,9 @@ func startWebServer(ctx context.Context, listen string, hub *SSEHub, registry *R
 	wrapped := authWrap(apiMux, apiToken)
 	mux.Handle("/api/", wrapped)
 	mux.Handle("/events", wrapped)
+	// Live Google Earth KML (kml_live.go). Same auth as /events.
+	mux.Handle("/live.kml", authWrap(kmlLinkHandler(kmlRefreshS, apiToken), apiToken))
+	mux.Handle("/live_feed.kml", authWrap(kmlFeedHandler(globalKML, registry), apiToken))
 
 	srv := &http.Server{
 		Addr:              listen,

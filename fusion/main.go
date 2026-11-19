@@ -398,6 +398,8 @@ func main() {
 			"spawn a new cluster (relay/retransmit). Tight values (e.g. 50ms) suit "+
 			"GPSDO-only deployments; default 200ms is safe for NTP-grade stations and "+
 			"still rejects the multi-second mesh relay shape.")
+	kmlRefresh := flag.Int("kml-refresh", 10,
+		"Google Earth refresh interval for /live.kml, in seconds (1..3600)")
 	maxFrames := flag.Int("max-frames", 0,
 		"Stop after N consolidated frames (0 = unlimited)")
 	listen := flag.String("listen", "",
@@ -570,7 +572,13 @@ func main() {
 
 	if *listen != "" {
 		go func() {
-			if err := startWebServer(ctx, *listen, hub, registry, store, *apiToken); err != nil {
+			refresh := *kmlRefresh
+			if refresh < 1 {
+				refresh = 1
+			} else if refresh > 3600 {
+				refresh = 3600
+			}
+			if err := startWebServer(ctx, *listen, hub, registry, store, *apiToken, refresh); err != nil {
 				log.Printf("web: %v", err)
 				cancel()
 			}
@@ -595,6 +603,9 @@ loop:
 			if err := json.Unmarshal(b, &f); err != nil {
 				continue
 			}
+			/* Live Google Earth KML: node positions, names, station
+			 * positions. Does its own trust filtering. */
+			globalKML.NoteFrame(b, time.Now())
 			if f.Event != "" {
 				// STATS / OFF_GRID_LORA / REPLAY_SUSPECTED -- not packet data.
 				// In a future commit we'll surface these too.
@@ -694,6 +705,7 @@ loop:
 									log.Printf("solved_fixes: %v", err)
 								}
 							}
+							globalKML.NoteFix(fix, time.Now())
 							hub.Publish(g)
 						}
 					}

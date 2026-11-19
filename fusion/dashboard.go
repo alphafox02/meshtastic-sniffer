@@ -472,6 +472,17 @@ button.danger:hover{background:var(--err-hover)}
     <button class="primary" onclick="fanout('cot-multicast','cot-input')">Apply</button>
   </div>
   <div id="cot-result" class="fanout-result" style="display:none"></div>
+
+  <h2>Google Earth live KML</h2>
+  <div class="row">
+    <input id="kml-url" type="text" readonly onclick="this.select()">
+    <button class="primary" onclick="location.href=authUrl('/live.kml')">Open in Google Earth</button>
+    <button onclick="copyKmlUrl()">Copy link</button>
+    <span id="kml-status" class="hint"></span>
+  </div>
+  <div class="row">
+    <span class="hint">Sensors, self-reported node positions with tracks and heard-by lines, and multilateration fixes with 1-sigma circles, refreshed by Google Earth every --kml-refresh seconds (default 10). Open the downloaded file, or in Google Earth Pro use Add &gt; Network Link with the URL above. With --api-token the link carries the token, so treat it like the token.</span>
+  </div>
 </div>
 
 <script>
@@ -497,6 +508,17 @@ function authHeaders(extra){
 function authUrl(path){
   if (!FUSION_TOKEN) return path;
   return path + (path.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(FUSION_TOKEN);
+}
+// Google Earth live KML: NetworkLink URL for this host (token included
+// when one is in use -- Google Earth cannot send a bearer header).
+document.addEventListener('DOMContentLoaded', ()=>{
+  const el = document.getElementById('kml-url');
+  if (el) el.value = location.origin + authUrl('/live.kml');
+});
+async function copyKmlUrl(){
+  const el = document.getElementById('kml-url');
+  try { await navigator.clipboard.writeText(el.value); setStatus('kml-status', 'copied', true); }
+  catch(e) { el.select(); setStatus('kml-status', 'press Ctrl+C to copy', true); }
 }
 function showTab(name){
   for(const t of ['live','activity','evidence','topology','sensors','config']){
