@@ -131,6 +131,16 @@ CMake prints which backends it found. Run `./meshtastic-sniffer --list` to confi
 The dashboard's **Config** tab adds keys and channel-share URLs at runtime, no restart needed.
 
 The dashboard uses Esri gray canvas tiles by default; no API key is required.
+A layers button in the map's top-right corner switches between other keyless
+basemaps (OpenStreetMap, Esri Streets, Esri Topographic, OpenTopoMap, Esri
+Satellite) and toggles a place-labels overlay that is useful on satellite
+imagery. The choice is remembered per browser. Only the default gray basemap
+follows the light/dark theme.
+
+**Config → Home location** puts an amber house marker on the map. You can type
+`lat, lon` in decimal degrees, click a spot on the map, or use the browser's
+geolocation (which needs HTTPS or localhost). The location is stored only in
+your browser and the map centers on it at load.
 To use CARTO tiles instead, set an optional API key with `--map-api-key=KEY` or
 the `MAP_API_KEY` environment variable. The command-line value takes precedence,
 including an empty value (`--map-api-key=`) to clear the environment-provided key
