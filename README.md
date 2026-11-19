@@ -141,6 +141,26 @@ follows the light/dark theme.
 `lat, lon` in decimal degrees, click a spot on the map, or use the browser's
 geolocation (which needs HTTPS or localhost). The location is stored only in
 your browser and the map centers on it at load.
+
+### Google Earth live KML
+
+With `--web`, the sniffer also serves a live KML feed for Google Earth. The
+layout follows radiosonde_auto_rx:
+
+- `http://HOST:PORT/live.kml` is a small NetworkLink file. Open it once, or in
+  Google Earth Pro use **Add > Network Link** with this URL. **Config → Google
+  Earth live KML** in the dashboard has the link and a copy button.
+- Google Earth then re-polls `/live_feed.kml` every `--kml-refresh` seconds
+  (default 10, range 1-3600).
+
+The feed shows every node heard with a trusted POSITION or ATAK PLI. Each node
+gets its latest point, a track of up to its last 64 positions, and a
+description with channel, frequency, SNR/RSSI and last-heard time. Nodes not
+heard for an hour turn grey. Names come from the ATAK callsign or NODEINFO,
+falling back to `!nodeid`. With `--gpsd`, the feed adds this station and a
+line-of-sight line from it to each node. Frames that fail CRC or decryption are
+never plotted. Like the `/events` stream, the KML routes don't need the API
+token, so keep the web port on a trusted network.
 To use CARTO tiles instead, set an optional API key with `--map-api-key=KEY` or
 the `MAP_API_KEY` environment variable. The command-line value takes precedence,
 including an empty value (`--map-api-key=`) to clear the environment-provided key

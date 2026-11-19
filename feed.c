@@ -10,6 +10,7 @@
 #include "archive.h"
 #include "feed.h"
 #include "geofence.h"
+#include "kml_live.h"
 #include "gpsd.h"
 #include "mesh_decoders.h"
 #include "meshtastic.h"
@@ -40,6 +41,23 @@ void web_publish_line(const char *json, size_t len);
 #include "net_util.h"
 
 #define MAX_UDP_FEEDS  4
+
+/* Feed the live Google Earth KML cache. Same trust rule as the
+ * fields_trusted JSON flag: only CRC-verified (or, without a CRC,
+ * decrypted) frames, so bit-corrupted phantoms never land on the map. */
+static void kml_note_position(const mesh_event_t *ev, double lat, double lon,
+                              bool have_alt, double alt_m, const char *label)
+{
+    bool trusted = (ev->has_crc && ev->payload_crc_ok) || (!ev->has_crc && ev->decrypted);
+    if (!trusted) return;
+    kml_live_obs_t o = {
+        .id = ev->header.from, .lat = lat, .lon = lon,
+        .have_alt = have_alt, .alt_m = alt_m, .label = label,
+        .channel = ev->channel_name, .snr_db = ev->snr_db, .rssi_db = ev->rssi_db,
+        .freq_hz = ev->freq_hz, .when = time(NULL),
+    };
+    kml_live_note(&o);
+}
 
 typedef struct {
     int                  fd;
@@ -303,6 +321,12 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                 if (p.precision_bits)       jw_field_u32(j, "precision_bits", p.precision_bits);
                 /* CoT republish for any positioned node, named via node_db cache. */
                 cot_publish_position(ev, &p);
+                /* Live Google Earth KML (GET /live.kml). */
+                if (p.have_lat && p.have_lon)
+                    kml_note_position(ev, p.lat_deg, p.lon_deg,
+                                      p.have_alt || p.have_alt_hae,
+                                      p.have_alt ? (double)p.altitude_m : (double)p.altitude_hae_m,
+                                      NULL);
                 /* Geofence transitions: ENTRY / EXIT events when this
                  * node crosses any configured polygon boundary. */
                 if (p.have_lat && p.have_lon)
@@ -531,6 +555,10 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                 }
                 /* CoT multicast republish on PLI / DETAIL. */
                 cot_publish_atak(ev, &a);
+                if (a.kind == MESH_ATAK_PLI && a.have_lat && a.have_lon)
+                    kml_note_position(ev, a.lat_deg, a.lon_deg,
+                                      a.altitude_hae_m != 0, (double)a.altitude_hae_m,
+                                      a.callsign);
             }
             break;
         }

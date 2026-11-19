@@ -144,6 +144,7 @@ set(SOURCES
     ${PROJECT_SOURCE_DIR}/share_url.c
     ${PROJECT_SOURCE_DIR}/cot.c
     ${PROJECT_SOURCE_DIR}/node_db.c
+    ${PROJECT_SOURCE_DIR}/kml_live.c
     ${PROJECT_SOURCE_DIR}/sigmf.c
     ${PROJECT_SOURCE_DIR}/simd_generic.c
 )
@@ -379,6 +380,17 @@ add_executable(test_share_url
     ${PROJECT_SOURCE_DIR}/meshtastic.c)
 target_link_libraries(test_share_url PRIVATE Threads::Threads m)
 set_property(TARGET test_share_url PROPERTY C_STANDARD 99)
+
+# test_kml_live: live Google Earth KML cache + renderer -- NetworkLink
+# shape, (0,0)/out-of-range rejection, track de-dup and ring order,
+# node_db / ATAK label resolution, XML escaping of remote strings,
+# stale styling, station + line-of-sight, and LRU eviction.
+add_executable(test_kml_live
+    ${PROJECT_SOURCE_DIR}/tests/test_kml_live.c
+    ${PROJECT_SOURCE_DIR}/kml_live.c
+    ${PROJECT_SOURCE_DIR}/node_db.c)
+target_link_libraries(test_kml_live PRIVATE Threads::Threads m)
+set_property(TARGET test_kml_live PROPERTY C_STANDARD 99)
 
 # focused_demo: scan-then-focus Phase 2 prototype. One shared file reader
 # streams cs8 IQ into N independent focused-decode workers, each with its

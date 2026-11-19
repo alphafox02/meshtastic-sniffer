@@ -19,7 +19,9 @@
 #include "web.h"
 #include "c2.h"
 #include "cot.h"
+#include "gpsd.h"
 #include "keyset.h"
+#include "kml_live.h"
 #include "options.h"
 #include "share_url.h"
 
@@ -442,6 +444,14 @@ static const char DASHBOARD_HTML[] =
 "    <button onclick=\"clearHome()\">Clear</button>\n"
 "    <span id=\"home-status\" class=\"hint\"></span>\n"
 "    <div class=\"hint\">Decimal degrees as \"lat, lon\" (paste straight from Google Maps / OSM). Shows a house marker on the map; stored in this browser only. \"Use my location\" needs HTTPS or localhost.</div>\n"
+"  </div>\n"
+"  <h3>Google Earth live KML</h3>\n"
+"  <div class=\"row\">\n"
+"    <input id=\"kml-url\" type=\"text\" readonly onclick=\"this.select()\">\n"
+"    <button onclick=\"location.href='/live.kml'\">Open in Google Earth</button>\n"
+"    <button onclick=\"copyKmlUrl()\">Copy link</button>\n"
+"    <span id=\"kml-status\" class=\"hint\"></span>\n"
+"    <div class=\"hint\">Live node positions, tracks and (with --gpsd) this station, refreshed by Google Earth on its own. Open the downloaded file, or in Google Earth Pro use Add &gt; Network Link with the URL above. Refresh interval: --kml-refresh (default 10 s).</div>\n"
 "  </div>\n"
 "  <h3>View options</h3>\n"
 "  <div class=\"row\">\n"
@@ -2020,6 +2030,13 @@ static const char DASHBOARD_HTML[] =
 "  else if (r.enabled === false) setStatus('cot-status', 'disabled', true);\n"
 "  else setStatus('cot-status', r.host+':'+r.port, true);\n"
 "}\n"
+"// Google Earth live KML: show the NetworkLink URL for this host.\n"
+"document.getElementById('kml-url').value = location.origin + '/live.kml';\n"
+"async function copyKmlUrl(){\n"
+"  const el = document.getElementById('kml-url');\n"
+"  try { await navigator.clipboard.writeText(el.value); setStatus('kml-status', 'copied', true); }\n"
+"  catch(e) { el.select(); setStatus('kml-status', 'press Ctrl+C to copy', true); }\n"
+"}\n"
 "// Home location: operator-entered reference point, drawn as an amber\n"
 "// house marker (distinct from node pins and the cyan gpsd RX ring).\n"
 "// Client-side only -- persisted in localStorage, never sent upstream.\n"
@@ -2334,6 +2351,74 @@ static size_t recv_full_request(int fd, char *buf, size_t cap)
 
 /* A browser may preconnect without sending a request. Never let that
  * socket monopolize the accept loop. Bound workers and socket waits. */
+/* Copy the request's Host header into out if it looks like a plain
+ * host[:port] (letters, digits, '.', '-', ':', '[', ']'). Anything else
+ * -- missing, oversized, or carrying markup -- falls back to
+ * 127.0.0.1:<web port>, so a hostile Host can't inject into the KML. */
+static void request_host(const char *buf, char *out, size_t cap)
+{
+    snprintf(out, cap, "127.0.0.1:%d", opt_web_port);
+    const char *end = strstr(buf, "\r\n\r\n");
+    if (!end) return;
+    for (const char *p = buf; p < end; ) {
+        const char *eol = strstr(p, "\r\n");
+        if (!eol || eol > end) break;
+        if ((size_t)(eol - p) > 5 && !strncasecmp(p, "host:", 5)) {
+            const char *v = p + 5;
+            while (v < eol && (*v == ' ' || *v == '\t')) ++v;
+            size_t n = (size_t)(eol - v);
+            if (n == 0 || n >= cap) return;
+            for (size_t i = 0; i < n; ++i) {
+                unsigned char c = (unsigned char)v[i];
+                if (!isalnum(c) && c != '.' && c != '-' && c != ':' && c != '[' && c != ']') return;
+            }
+            memcpy(out, v, n);
+            out[n] = 0;
+            return;
+        }
+        p = eol + 2;
+    }
+}
+
+/* Google Earth live KML (see kml_live.h). /live.kml is the NetworkLink
+ * the user opens once; Google Earth then polls /live_feed.kml. */
+static void serve_kml(int fd, const char *buf, bool network_link)
+{
+    char *doc = NULL;
+    size_t len = 0;
+    if (network_link) {
+        char host[256], url[300];
+        request_host(buf, host, sizeof(host));
+        snprintf(url, sizeof(url), "http://%s/live_feed.kml", host);
+        doc = kml_live_network_link(url, opt_kml_refresh_s, &len);
+    } else {
+        /* Station marker + line-of-sight lines only with a fresh gpsd fix. */
+        double lat, lon, alt, age;
+        kml_live_station_t st;
+        bool have_st = gpsd_get_fix(&lat, &lon, &alt, &age) && age <= 300.0;
+        if (have_st) {
+            st.name = opt_station_id;
+            st.lat = lat; st.lon = lon; st.alt_m = alt;
+        }
+        doc = kml_live_feed(have_st ? &st : NULL, time(NULL), &len);
+    }
+    if (!doc) { send_response(fd, 500, "{\"error\":\"out of memory\"}"); return; }
+    char hdr[384];
+    int n = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/vnd.google-earth.kml+xml; charset=utf-8\r\n"
+        "Cache-Control: no-store\r\n"
+        "%s"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        network_link ? "Content-Disposition: attachment; filename=\"meshtastic-live.kml\"\r\n" : "",
+        len);
+    send_all(fd, hdr, (size_t)n);
+    send_all(fd, doc, len);
+    free(doc);
+    close(fd);
+}
+
 static void *http_client(void *arg)
 {
     int fd = (int)(intptr_t)arg;
@@ -2349,6 +2434,8 @@ static void *http_client(void *arg)
         strncmp(buf, "GET /\r",       6) == 0 ||
         strncmp(buf, "GET /index",   10) == 0) serve_index(fd);
     else if (strncmp(buf, "GET /events", 11) == 0) promote_to_sse(fd);
+    else if (strncmp(buf, "GET /live.kml", 13) == 0) serve_kml(fd, buf, true);
+    else if (strncmp(buf, "GET /live_feed.kml", 18) == 0) serve_kml(fd, buf, false);
     else if (strncmp(buf, "POST /api/keys", 14) == 0) {
         if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
         c2_response_t r;

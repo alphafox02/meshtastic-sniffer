@@ -167,6 +167,7 @@ extern char *opt_zmq_endpoint;
 extern char *opt_cot_multicast;          /* "239.2.3.1:6969" or NULL */
 extern int   opt_web_port;
 extern char *opt_map_api_key;            /* NULL = use MAP_API_KEY environment variable */
+extern int   opt_kml_refresh_s;          /* /live.kml NetworkLink refreshInterval, seconds */
 /* Live wideband spectrum waterfall on the dashboard. Default off so a
  * stock --web run pays no CPU or bandwidth for it; when set, the
  * sensor enables (or reuses) the scanner and publishes WATERFALL SSE
