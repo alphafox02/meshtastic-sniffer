@@ -127,6 +127,10 @@ body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:v
 #live-map-pane{grid-row:span 3;padding:0}
 #live-map{width:100%;height:100%}
 .leaflet-container{background:var(--bg)}
+/* Basemap picker: collapsed toggle keeps Leaflet's light button so the
+ * icon stays visible; the expanded list matches the slate palette. */
+.leaflet-control-layers-expanded{background:var(--bg-panel);color:var(--text)}
+.leaflet-control-layers-separator{border-top-color:var(--border)}
 .live-pane{padding:var(--space-2) 10px;overflow:auto;background:var(--bg)}
 .live-pane h3{font-size:var(--text-sm);color:var(--accent);text-transform:uppercase;letter-spacing:1px;
   margin-bottom:6px;border-bottom:1px solid var(--border);padding-bottom:var(--space-1)}
@@ -511,10 +515,48 @@ function showTab(name){
 function setStat(id,v){const el=document.getElementById(id);if(el)el.textContent=v;}
 let nEvents=0,nTx=0;
 
+// Basemap picker. Same keyless set as the per-sniffer dashboard; dark
+// gray canvas stays the default. Each map gets its own layer instances
+// (a Leaflet layer can only live on one map) but the choice is shared
+// via localStorage, so Live and Evidence open on the same basemap.
+function esriTiles(svc, nativeZ, attr, extra){
+  return L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/'+svc+'/MapServer/tile/{z}/{y}/{x}',
+    Object.assign({maxZoom:19, maxNativeZoom:nativeZ, attribution:attr}, extra||{}));
+}
+function addBasemapPicker(m){
+  const bases = {
+    'Dark gray (Esri)': esriTiles('Canvas/World_Dark_Gray_Base', 16, 'Tiles &copy; Esri'),
+    'Light gray (Esri)': esriTiles('Canvas/World_Light_Gray_Base', 16, 'Tiles &copy; Esri'),
+    'OpenStreetMap': L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+      {maxZoom:19, attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'}),
+    'Streets (Esri)': esriTiles('World_Street_Map', 19, 'Tiles &copy; Esri'),
+    'Topographic (Esri)': esriTiles('World_Topo_Map', 19, 'Tiles &copy; Esri'),
+    'OpenTopoMap': L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
+      {maxZoom:19, maxNativeZoom:17, attribution:'&copy; OpenStreetMap contributors, SRTM | &copy; <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)'}),
+    'Satellite (Esri)': esriTiles('World_Imagery', 19, 'Tiles &copy; Esri, Maxar, Earthstar Geographics'),
+  };
+  // Labels get their own pane above the tiles so they stay on top of any
+  // basemap picked later and never swallow marker clicks.
+  m.createPane('labels');
+  m.getPane('labels').style.zIndex = 350;
+  m.getPane('labels').style.pointerEvents = 'none';
+  const overlays = {
+    'Place labels': esriTiles('Reference/World_Boundaries_and_Places', 19, 'Labels &copy; Esri', {pane:'labels'}),
+  };
+  let b = null, o = [];
+  try { b = localStorage.getItem('fusionBasemap'); o = JSON.parse(localStorage.getItem('fusionMapOverlays') || '[]'); } catch(e) {}
+  (bases[b] || bases['Dark gray (Esri)']).addTo(m);
+  for (const n of (Array.isArray(o) ? o : [])) if (overlays[n]) overlays[n].addTo(m);
+  L.control.layers(bases, overlays, {position:'topright'}).addTo(m);
+  m.on('baselayerchange', e => { try { localStorage.setItem('fusionBasemap', e.name); } catch(_) {} });
+  m.on('overlayadd overlayremove', () => {
+    try { localStorage.setItem('fusionMapOverlays', JSON.stringify(Object.keys(overlays).filter(n => m.hasLayer(overlays[n])))); } catch(_) {}
+  });
+}
+
 // Leaflet map.
 const map = L.map('live-map').setView([39.5, -98.0], 4);
-L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
-  {maxZoom:19, maxNativeZoom:16, attribution:'Tiles &copy; Esri'}).addTo(map);
+addBasemapPicker(map);
 
 // Per-station color palette. Cyan for the first station, amber for the
 // second, etc. -- distinct enough to read at a glance on a multi-station
@@ -1179,8 +1221,7 @@ const ZOOM_NS = { '15m': 15*60*1e9, '1h': 60*60*1e9, '6h': 6*60*60*1e9, '24h': 2
 function evidenceMapInit(){
   if (evidenceMap) return;
   evidenceMap = L.map('ev-map', { zoomControl: true }).setView([39.5, -98.0], 4);
-  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
-    { maxZoom: 19, maxNativeZoom: 16, attribution: 'Tiles &copy; Esri' }).addTo(evidenceMap);
+  addBasemapPicker(evidenceMap);
 }
 
 document.querySelectorAll('#ev-zoom button').forEach(b=>{
