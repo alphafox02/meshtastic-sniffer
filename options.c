@@ -128,6 +128,9 @@ int   opt_web_waterfall           = 0;
 char *opt_station_id              = NULL;
 char *opt_gpsd_endpoint           = NULL;
 char *opt_api_token               = NULL;
+bool  opt_tx_enable               = false;
+char *opt_tx_tool                 = NULL;
+char *opt_tx_node                 = NULL;
 char *opt_pcap_path               = NULL;
 char *opt_pcap_fifo               = NULL;
 char *opt_psk_wordlist            = NULL;
@@ -280,6 +283,16 @@ void options_print_help(const char *prog)
         "  --api-token=SECRET     require 'Authorization: Bearer SECRET' on every\n"
         "                         POST /api/* request. GET endpoints (dashboard,\n"
         "                         /events SSE) stay open. Unset = no auth.\n"
+        "  --tx                   enable the dashboard's Send box (POST /api/tx).\n"
+        "                         With --hackrf, RX pauses while the frame is\n"
+        "                         transmitted and then resumes. With any other\n"
+        "                         backend a second HackRF is driven through\n"
+        "                         hackrf_transfer. Needs python3 + gr-lora_sdr.\n"
+        "                         Strongly recommended together with --api-token.\n"
+        "  --tx-tool=PATH         path to tools/meshtastic_tx.py (default: found\n"
+        "                         next to the binary or in ./tools).\n"
+        "  --tx-node=!AABBCCDD    node number to transmit as (default: random,\n"
+        "                         fixed for the lifetime of the process).\n"
         "  --pcap=PATH            write received LoRa frames to PATH as a libpcap\n"
         "                         file (DLT_USER0=147). Use with tshark / Wireshark.\n"
         "  --pcap-fifo=PATH       like --pcap but creates PATH as a named pipe;\n"
@@ -402,6 +415,7 @@ int options_parse(int argc, char **argv)
         O_SELFTEST_REJECTION_TWOTONE, O_SELFTEST_REJECTION_OFFBIN,
         O_SELFTEST_REJECTION_PROCGAIN,
         O_LIST, O_SCHEMA,
+        O_TX, O_TX_TOOL, O_TX_NODE,
     };
     static const struct option longopts[] = {
         { "hackrf",     optional_argument, NULL, O_HACKRF },
@@ -450,6 +464,9 @@ int options_parse(int argc, char **argv)
         { "station-id", required_argument, NULL, O_STATION },
         { "gpsd",       optional_argument, NULL, O_GPSD },
         { "api-token",  required_argument, NULL, O_API_TOKEN },
+        { "tx",         no_argument,       NULL, O_TX },
+        { "tx-tool",    required_argument, NULL, O_TX_TOOL },
+        { "tx-node",    required_argument, NULL, O_TX_NODE },
         { "pcap",       required_argument, NULL, O_PCAP },
         { "pcap-fifo",  required_argument, NULL, O_PCAP_FIFO },
         { "psk-wordlist", required_argument, NULL, O_PSK_WORDLIST },
@@ -642,6 +659,9 @@ int options_parse(int argc, char **argv)
         case O_STATION:    opt_station_id = strdup(optarg); break;
         case O_GPSD:       opt_gpsd_endpoint = strdup(optarg ? optarg : "localhost:2947"); break;
         case O_API_TOKEN:  opt_api_token = strdup(optarg); break;
+        case O_TX:         opt_tx_enable = true; break;
+        case O_TX_TOOL:    opt_tx_tool = strdup(optarg); break;
+        case O_TX_NODE:    opt_tx_node = strdup(optarg); break;
         case O_PCAP:       opt_pcap_path = strdup(optarg); break;
         case O_PCAP_FIFO:  opt_pcap_fifo = strdup(optarg); break;
         case O_PSK_WORDLIST: opt_psk_wordlist = strdup(optarg); break;

@@ -176,6 +176,9 @@ extern int   opt_web_waterfall;
 extern char *opt_station_id;
 extern char *opt_gpsd_endpoint;          /* "host:port"; NULL = disabled */
 extern char *opt_api_token;              /* bearer token for POST /api endpoints; NULL = unauthenticated */
+extern bool  opt_tx_enable;              /* --tx: dashboard send box + POST /api/tx */
+extern char *opt_tx_tool;                /* path to tools/meshtastic_tx.py; NULL = auto */
+extern char *opt_tx_node;                /* "!aabbccdd" to transmit as; NULL = random */
 extern char *opt_pcap_path;              /* path to pcap file; NULL = disabled */
 extern char *opt_pcap_fifo;              /* path to pcap fifo; NULL = disabled */
 extern char *opt_psk_wordlist;           /* path to wordlist; NULL = disabled */

@@ -61,6 +61,20 @@ When a worker can't keep up with the live sample rate, it disarms itself and cou
 - [meshtastic-recover](recover/) — offline PSK recovery from captured pcaps. OpenMP-parallel; a hashcat custom-mode plugin handles GPU.
 - [meshtastic-fusion](fusion/) — multi-station aggregator (Go). Subscribes to N sniffer ZMQ feeds, runs hyperbolic-TDOA when 3+ time-disciplined stations hear the same packet.
 - [meshtastic-wardrive](wardrive/) — mobile single-node capture (Go). SDR + GPS + SQLite + KML/KMZ/CSV/JSON exports.
+- [tools/meshtastic_tx.py](tools/meshtastic_tx.py) — transmit Meshtastic text (and optional NodeInfo) packets with a HackRF. Builds and encrypts the frame, modulates it with gr-lora_sdr (sync word 0x2B, preset SF/BW/CR, firmware channel-slot hashing) and plays it with `hackrf_transfer`. Use `--dry-run` to write a `.cf32` you can decode with `--file=` first. The HackRF is half-duplex, so stop the sniffer before transmitting, and only transmit on channels you operate.
+
+  ```bash
+  ./tools/meshtastic_tx.py --region US --text "hello mesh" --dry-run
+  ./tools/meshtastic_tx.py --region US --text "hello mesh" --tx-gain 20 \
+      --long-name "Sniffer TX" --short-name STX
+  ```
+
+  **Dashboard send box.** Start the sniffer with `--tx` (plus `--api-token` if the dashboard is reachable by anyone else) and a Send box appears in the Messages pane. Channel, PSK, preset, destination, gain and NodeInfo name are set under Config → Transmit. With `--hackrf`, reception pauses for about a second per packet while the same HackRF transmits, then resumes. With any other backend, a second HackRF is driven through `hackrf_transfer`. The sniffer transmits as one fixed node ID per run (`--tx-node=!aabbccdd` to choose it). Sends are at least 3 s apart.
+
+  ```bash
+  ./build/meshtastic-sniffer --hackrf --region US --keys=default --web=8888 \
+      --tx --api-token="$(openssl rand -hex 16)"
+  ```
 
 ---
 

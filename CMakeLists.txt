@@ -141,6 +141,7 @@ set(SOURCES
     ${PROJECT_SOURCE_DIR}/schema.c
     ${PROJECT_SOURCE_DIR}/scanner.c
     ${PROJECT_SOURCE_DIR}/web.c
+    ${PROJECT_SOURCE_DIR}/tx.c
     ${PROJECT_SOURCE_DIR}/share_url.c
     ${PROJECT_SOURCE_DIR}/cot.c
     ${PROJECT_SOURCE_DIR}/node_db.c

@@ -24,6 +24,7 @@
 #include "kml_live.h"
 #include "options.h"
 #include "share_url.h"
+#include "tx.h"
 
 extern keyset_t *app_get_keyset(void);
 extern int       app_add_runtime_extra_freq(uint64_t f_hz, int bw_hz, int sf, int cr);
@@ -208,6 +209,20 @@ static const char DASHBOARD_HTML[] =
 "#config button:hover{background:#075985;color:#e0f2fe}\n"
 "#config .hint{color:#64748b;font-size:12px;margin-top:4px;display:block}\n"
 "#config .row{margin-bottom:14px}\n"
+"#tx-box{display:flex;gap:6px;margin:2px 0 4px 0}\n"
+"#tx-box input{flex:1;min-width:0;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:3px;padding:6px 8px;font:inherit;font-size:13px}\n"
+"#tx-box input:focus{outline:none;border-color:#38bdf8}\n"
+"#tx-box button{background:#0c4a6e;color:#bae6fd;border:1px solid #0284c7;border-radius:3px;padding:6px 14px;cursor:pointer;font-size:13px}\n"
+"#tx-box button:disabled{opacity:.5;cursor:wait}\n"
+"#tx-status{font-size:11px;color:#64748b;min-height:0}\n"
+".tx-badge{background:#f59e0b;color:#1c1917;border-radius:3px;padding:0 4px;font-size:10px;font-weight:700;margin-right:4px}\n"
+".tx-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px 12px;margin:8px 0}\n"
+".tx-grid label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:#94a3b8}\n"
+".tx-grid label.tx-check{flex-direction:row;align-items:center;gap:6px;padding-top:16px}\n"
+"#config input[type=password],#config select{width:100%;box-sizing:border-box;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:3px;padding:8px 10px;font-family:'SF Mono',Consolas,monospace;font-size:13px}\n"
+"html.light #tx-box input,html.light #config input[type=password],html.light #config select{background:#ffffff;color:#1e293b;border-color:#cbd5e1}\n"
+"html.light #tx-box button{background:#e0f2fe;color:#0c4a6e;border-color:#0284c7}\n"
+"html.light .tx-grid label{color:#475569}\n"
 ".home-icon{background:none;border:none;filter:drop-shadow(0 1px 2px rgba(0,0,0,.6))}\n"
 ".status-ok{color:#4ade80}\n"
 ".status-err{color:#f87171}\n"
@@ -392,7 +407,10 @@ static const char DASHBOARD_HTML[] =
 "      </table>\n"
 "    </div>\n"
 "    <div class=\"pane channels-pane\"><h2>Channels <span class=muted>(by hash)</span></h2><table id=\"channels\"><thead><tr><th>Hash</th><th>Name</th><th>Preset</th><th>Frames</th><th>Decrypt</th><th>Slots</th><th>SNR (1h)</th><th>Last</th></tr></thead><tbody></tbody></table></div>\n"
-"    <div class=\"pane messages-pane\"><h2>Messages</h2><div id=\"msgs\"></div></div>\n"
+"    <div class=\"pane messages-pane\"><h2>Messages</h2>\n"
+"      <div id=\"tx-box\" style=\"display:none\"><input id=\"tx-text\" type=\"text\" maxlength=\"200\" placeholder=\"Send to mesh (HackRF TX)...\" autocomplete=\"off\"><button id=\"tx-send\" onclick=\"txSend()\">Send</button></div>\n"
+"      <div id=\"tx-status\" class=\"hint\"></div>\n"
+"      <div id=\"msgs\"></div></div>\n"
 "    <div class=\"pane discoveries-pane\"><h2>Discoveries &amp; ATAK</h2><div id=\"disc\"></div></div>\n"
 "  </div>\n"
 "</div>\n"
@@ -452,6 +470,28 @@ static const char DASHBOARD_HTML[] =
 "    <button onclick=\"copyKmlUrl()\">Copy link</button>\n"
 "    <span id=\"kml-status\" class=\"hint\"></span>\n"
 "    <div class=\"hint\">Live node positions, tracks and (with --gpsd) this station, refreshed by Google Earth on its own. Open the downloaded file, or in Google Earth Pro use Add &gt; Network Link with the URL above. Refresh interval: --kml-refresh (default 10 s).</div>\n"
+"  </div>\n"
+"  <div id=\"tx-config\" style=\"display:none\">\n"
+"  <h3>Transmit (HackRF)</h3>\n"
+"  <div class=\"row\">\n"
+"    <div class=\"hint\" id=\"tx-info\"></div>\n"
+"    <div class=\"tx-grid\">\n"
+"      <label>Channel name<input id=\"tx-channel\" type=\"text\" maxlength=\"11\" placeholder=\"LongFast (preset default)\"></label>\n"
+"      <label>PSK (base64)<input id=\"tx-psk\" type=\"text\" placeholder=\"AQ== (default key)\"></label>\n"
+"      <label>Preset<select id=\"tx-preset\"><option>LONG_FAST</option><option>LONG_MODERATE</option><option>LONG_SLOW</option><option>LONG_TURBO</option><option>MEDIUM_FAST</option><option>MEDIUM_SLOW</option><option>SHORT_FAST</option><option>SHORT_SLOW</option><option>SHORT_TURBO</option></select></label>\n"
+"      <label>Frequency slot<input id=\"tx-slot\" type=\"text\" placeholder=\"auto (hash of channel name)\"></label>\n"
+"      <label>To<input id=\"tx-to\" type=\"text\" placeholder=\"broadcast or !aabbccdd\"></label>\n"
+"      <label>Hop limit<input id=\"tx-hop\" type=\"text\" placeholder=\"3\"></label>\n"
+"      <label>TX gain dB (0-47)<input id=\"tx-gain\" type=\"text\" placeholder=\"10\"></label>\n"
+"      <label class=\"tx-check\"><input id=\"tx-amp\" type=\"checkbox\"> +14 dB RF amp</label>\n"
+"      <label>Long name (sends NodeInfo)<input id=\"tx-long_name\" type=\"text\" maxlength=\"39\" placeholder=\"optional\"></label>\n"
+"      <label>Short name<input id=\"tx-short_name\" type=\"text\" maxlength=\"4\" placeholder=\"optional\"></label>\n"
+"      <label id=\"tx-token-row\">API token<input id=\"tx-token\" type=\"password\" placeholder=\"--api-token value\" autocomplete=\"off\"></label>\n"
+"    </div>\n"
+"    <button onclick=\"txSaveSettings()\">Save settings</button>\n"
+"    <span id=\"txcfg-status\" class=\"hint\"></span>\n"
+"    <div class=\"hint\">Used by the Send box in the Messages pane. The frame is built and modulated by tools/meshtastic_tx.py (sync word 0x2B, firmware slot hashing). On the sniffer's own HackRF, reception pauses for about a second per packet. Only transmit on channels you operate, within your region's power and duty-cycle limits.</div>\n"
+"  </div>\n"
 "  </div>\n"
 "  <h3>View options</h3>\n"
 "  <div class=\"row\">\n"
@@ -2111,6 +2151,60 @@ static const char DASHBOARD_HTML[] =
 "  drawHome(h, false);\n"
 "  map.setView([h.lat, h.lon], 11);\n"
 "})();\n"
+"// Transmit: Send box in the Messages pane, settings on the Config tab.\n"
+"// Only shown when the sniffer runs with --tx (GET /api/tx says enabled).\n"
+"const TX_FIELDS = ['channel','psk','preset','slot','to','hop','gain','long_name','short_name'];\n"
+"function txEl(f){ return document.getElementById('tx-'+f); }\n"
+"function txSaveSettings(){\n"
+"  const s = {amp: txEl('amp').checked};\n"
+"  for (const f of TX_FIELDS) s[f] = txEl(f).value;\n"
+"  try { localStorage.setItem('txSettings', JSON.stringify(s)); } catch(e) {}\n"
+"  try { sessionStorage.setItem('txToken', txEl('token').value); } catch(e) {}\n"
+"  setStatus('txcfg-status', 'saved', true);\n"
+"}\n"
+"async function txInit(){\n"
+"  let info;\n"
+"  try { const r = await fetch('/api/tx'); if (!r.ok) return; info = await r.json(); } catch(e) { return; }\n"
+"  if (!info.enabled) return;\n"
+"  document.getElementById('tx-box').style.display = 'flex';\n"
+"  document.getElementById('tx-config').style.display = 'block';\n"
+"  if (!info.auth) document.getElementById('tx-token-row').style.display = 'none';\n"
+"  document.getElementById('tx-info').textContent = 'Transmitting as ' + info.from + ', region ' + info.region + ', ' +\n"
+"    (info.mode === 'hackrf-inline' ? 'on the sniffer\\'s HackRF (RX pauses during TX)' : 'on a separate HackRF via hackrf_transfer') +\n"
+"    (info.tool ? '' : '. WARNING: tools/meshtastic_tx.py not found, pass --tx-tool=PATH');\n"
+"  let s = null;\n"
+"  try { s = JSON.parse(localStorage.getItem('txSettings') || 'null'); } catch(e) {}\n"
+"  if (s) { for (const f of TX_FIELDS) if (typeof s[f] === 'string') txEl(f).value = s[f]; txEl('amp').checked = !!s.amp; }\n"
+"  try { txEl('token').value = sessionStorage.getItem('txToken') || ''; } catch(e) {}\n"
+"  txEl('text').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); txSend(); } });\n"
+"}\n"
+"async function txSend(){\n"
+"  const textEl = txEl('text'), btn = txEl('send');\n"
+"  const text = textEl.value.trim();\n"
+"  if (!text || btn.disabled) return;\n"
+"  const body = new URLSearchParams();\n"
+"  body.set('text', text);\n"
+"  for (const f of TX_FIELDS) { const v = txEl(f).value.trim(); if (v) body.set(f, v); }\n"
+"  if (txEl('amp').checked) body.set('amp', '1');\n"
+"  const headers = {'X-Mesh-Tx': '1', 'Content-Type': 'application/x-www-form-urlencoded'};\n"
+"  const tok = txEl('token').value.trim();\n"
+"  if (tok) headers['Authorization'] = 'Bearer ' + tok;\n"
+"  btn.disabled = true;\n"
+"  setStatus('tx-status', 'building + transmitting...', true);\n"
+"  try {\n"
+"    const r = await fetch('/api/tx', {method: 'POST', headers, body: body.toString()});\n"
+"    const j = await r.json().catch(() => ({error: 'HTTP ' + r.status}));\n"
+"    if (!r.ok || j.error) setStatus('tx-status', 'TX failed: ' + (j.error || ('HTTP ' + r.status)), false);\n"
+"    else {\n"
+"      setStatus('tx-status', 'sent ' + j.packets + ' packet(s) on ' + j.freq_mhz.toFixed(3) + ' MHz, ~' + j.airtime_ms + ' ms on air', true);\n"
+"      const ch = txEl('channel').value.trim() || 'LongFast';\n"
+"      pushTo(msgsEl, `<span class=tx-badge>TX</span><b>${escHtml(j.from)}</b> <span class=muted>${escHtml(ch)}</span>: ${escHtml(text)}`);\n"
+"      textEl.value = '';\n"
+"    }\n"
+"  } catch(e) { setStatus('tx-status', 'TX failed: network error', false); }\n"
+"  finally { btn.disabled = false; }\n"
+"}\n"
+"txInit();\n"
 "</script></body></html>\n";
 
 static int set_nonblock(int fd) {
@@ -2183,7 +2277,14 @@ static void send_response(int fd, int code, const char *body)
         "Content-Length: %zu\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n\r\n",
-        code, code == 200 ? "OK" : (code == 400 ? "Bad Request" : "Server Error"),
+        code,
+        code == 200 ? "OK" :
+        code == 400 ? "Bad Request" :
+        code == 401 ? "Unauthorized" :
+        code == 403 ? "Forbidden" :
+        code == 404 ? "Not Found" :
+        code == 409 ? "Conflict" :
+        code == 429 ? "Too Many Requests" : "Server Error",
         blen);
     send_all(fd, hdr, (size_t)n);
     if (body) send_all(fd, body, blen);
@@ -2436,6 +2537,30 @@ static void *http_client(void *arg)
     else if (strncmp(buf, "GET /events", 11) == 0) promote_to_sse(fd);
     else if (strncmp(buf, "GET /live.kml", 13) == 0) serve_kml(fd, buf, true);
     else if (strncmp(buf, "GET /live_feed.kml", 18) == 0) serve_kml(fd, buf, false);
+    else if (strncmp(buf, "GET /api/tx", 11) == 0) {
+        char js[256];
+        tx_status_json(js, sizeof(js));
+        send_response(fd, 200, js);
+    }
+    else if (strncmp(buf, "POST /api/tx", 12) == 0) {
+        if (!opt_tx_enable) {
+            send_response(fd, 403, "{\"error\":\"TX disabled; start the sniffer with --tx\"}");
+            goto done;
+        }
+        if (!api_auth_ok(buf, fd)) goto done;
+        /* CSRF guard: a custom header forces a CORS preflight, which this
+         * server never approves, so a third-party page in the operator's
+         * browser can't make the radio transmit. */
+        const char *hdr_end = strstr(buf, "\r\n\r\n");
+        const char *xh = strcasestr(buf, "\r\nX-Mesh-Tx:");
+        if (!xh || (hdr_end && xh > hdr_end)) {
+            send_response(fd, 403, "{\"error\":\"missing X-Mesh-Tx header\"}");
+            goto done;
+        }
+        c2_response_t r;
+        tx_send(find_body(buf), &r);
+        send_response(fd, r.status, r.body);
+    }
     else if (strncmp(buf, "POST /api/keys", 14) == 0) {
         if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
         c2_response_t r;
