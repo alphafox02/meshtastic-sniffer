@@ -43,6 +43,30 @@ JAVA_HOME=~/Android/jdk ./gradlew assembleDebug
 # -> app/build/outputs/apk/debug/app-debug.apk
 ```
 
+### Signed release APK
+
+The release build is signed with a key kept outside the repo. Create it once:
+
+```bash
+K=~/.config/meshtastic-sniffer/android-release; mkdir -p -m 700 $K
+PW=$(openssl rand -base64 24 | tr -d '/+=')
+keytool -genkeypair -keystore $K/release.jks -storetype PKCS12 -alias meshsniffer \
+  -keyalg RSA -keysize 4096 -validity 10000 -dname "CN=Mesh Sniffer" -storepass "$PW" -keypass "$PW"
+printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=meshsniffer\nkeyPassword=%s\n' \
+  $K/release.jks "$PW" "$PW" > $K/keystore.properties; chmod 600 $K/*
+```
+
+Then build:
+
+```bash
+JAVA_HOME=~/Android/jdk ./gradlew assembleRelease
+# -> app/build/outputs/apk/release/app-release.apk
+```
+
+To use a `keystore.properties` file somewhere else, pass `-PmeshKeystoreProps=PATH` or set `MESH_KEYSTORE_PROPS`. Without the file, `assembleRelease` builds an unsigned APK.
+
+Back up `release.jks` and its password. Updates install over an existing release install only if they're signed with the same key. A release APK can't replace a debug install (different key): uninstall the debug app first, which deletes its settings and its TX key (`files/tx_key`).
+
 The native library compiles the repo's C sources as they are, with
 `SNIFFER_LIBRARY` (no `main()`); libhackrf, curl, MQTT and ZMQ are left
 out (those backends and outputs compile to stubs). On the desktop,

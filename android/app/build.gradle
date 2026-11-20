@@ -25,9 +25,30 @@ android {
         }
     }
 
+    // Release signing: a keystore.properties file kept outside the repo
+    // (storeFile, storePassword, keyAlias, keyPassword). Its path comes from
+    // -PmeshKeystoreProps=..., $MESH_KEYSTORE_PROPS, or the default below.
+    // Without it, assembleRelease builds an unsigned APK.
+    def ksProps = new Properties()
+    def ksFile = file(project.findProperty('meshKeystoreProps') ?: System.getenv('MESH_KEYSTORE_PROPS') ?:
+            "${System.getProperty('user.home')}/.config/meshtastic-sniffer/android-release/keystore.properties")
+    if (ksFile.exists()) ksFile.withInputStream { ksProps.load(it) }
+
+    signingConfigs {
+        release {
+            if (ksProps.storeFile) {
+                storeFile file(ksProps.storeFile)
+                storePassword ksProps.storePassword
+                keyAlias ksProps.keyAlias
+                keyPassword ksProps.keyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
+            if (ksProps.storeFile) signingConfig signingConfigs.release
         }
     }
     externalNativeBuild {
