@@ -285,6 +285,21 @@ static const uint8_t TRACEROUTE_UNPACKED_FIXTURE[] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01,
 };
 
+/* A direct (zero-hop) traceroute reply carries no route entries, only
+ * the SNR the destination heard us at (packed snr_towards = [104] ->
+ * 26 dB). Seen on air from a 2.x node; it used to decode as "nothing". */
+static void test_traceroute_direct(void)
+{
+    static const uint8_t direct[] = { 0x12, 0x01, 0x68 };
+    mesh_traceroute_t t;
+    bool ok = mesh_decode_traceroute(direct, sizeof(direct), &t);
+    CHECK(ok, "direct traceroute (SNR only) not decoded");
+    CHECK(t.route_len == 0 && t.snr_towards_len == 1 && t.snr_towards[0] == 104,
+          "direct traceroute: route_len=%d snr_len=%d snr0=%d",
+          t.route_len, t.snr_towards_len, t.snr_towards[0]);
+    CHECK(!mesh_decode_traceroute(direct, 0, &t), "empty RouteDiscovery decodes as nothing");
+}
+
 static void test_traceroute_unpacked(void)
 {
     mesh_traceroute_t t;
@@ -349,6 +364,7 @@ int main(void)
     test_user_public_key();
     test_power_metrics_ch8();
     test_traceroute_unpacked();
+    test_traceroute_direct();
     test_atak_geochat_receipt();
 
     if (fails) {
