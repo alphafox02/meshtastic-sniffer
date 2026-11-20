@@ -123,6 +123,7 @@ char *opt_zmq_curve_keygen        = NULL;
 uint32_t opt_station_t_acc_ns     = 1000000;  /* 1 ms = NTP-class default; mlat solver weights by this */
 char *opt_cot_multicast           = NULL;
 int   opt_web_port                = 0;
+char *opt_web_bind                = NULL;
 char *opt_map_api_key             = NULL;
 int   opt_kml_refresh_s           = 10;
 int   opt_web_waterfall           = 0;
@@ -201,6 +202,7 @@ void options_print_help(const char *prog)
         "                         CLI values, so a sender that emits context can run with\n"
         "                         bare --vita49=PORT.\n"
         "  --file=PATH            replay IQ file\n"
+        "  --external-source      samples are pushed in by a host app (Android build)\n"
         "  --iq-format=FMT        cs8 (default) | cs16 | cf32. Used for raw file replay\n"
         "                         AND for the VITA-49 payload format. For VITA-49 this is\n"
         "                         only needed when the sender's context omits the payload\n"
@@ -273,6 +275,8 @@ void options_print_help(const char *prog)
         "                         republish ATAK port-72 PLIs as CoT XML to a\n"
         "                         multicast group (default port 6969). LAN-scope.\n"
         "  --web[=PORT]           built-in dashboard (default 8888)\n"
+        "  --web-bind=ADDR        dashboard listen address (default 0.0.0.0, all\n"
+        "                         interfaces; 127.0.0.1 keeps it on this machine)\n"
         "  --map-api-key=KEY      map tile API key (overrides MAP_API_KEY env var)\n"
         "  --kml-refresh=S        Google Earth refresh interval for /live.kml\n"
         "                         (seconds, 1..3600, default 10)\n"
@@ -293,10 +297,11 @@ void options_print_help(const char *prog)
         "                         With --hackrf, RX pauses while the frame is\n"
         "                         transmitted and then resumes. With any other\n"
         "                         backend a second HackRF is driven through\n"
-        "                         hackrf_transfer. Needs python3 + gr-lora_sdr.\n"
+        "                         hackrf_transfer. Packets are built and LoRa-\n"
+        "                         modulated in C (no python needed).\n"
         "                         Strongly recommended together with --api-token.\n"
-        "  --tx-tool=PATH         path to tools/meshtastic_tx.py (default: found\n"
-        "                         next to the binary or in ./tools).\n"
+        "  --tx-tool=PATH         build packets with tools/meshtastic_tx.py +\n"
+        "                         gr-lora_sdr instead of the built-in C engine.\n"
         "  --tx-node=!AABBCCDD    node number to transmit as (default: random,\n"
         "                         fixed for the lifetime of the process).\n"
         "  --tx-ppm=PPM           clock correction for the transmitting HackRF\n"
@@ -412,12 +417,12 @@ int options_parse(int argc, char **argv)
 {
     enum {
         O_HACKRF = 200, O_BLADERF, O_RTLSDR, O_SOAPY, O_SDRPLAY, O_AIRSPY,
-        O_USRP, O_VITA49, O_FILE, O_IQ_FORMAT,
+        O_USRP, O_VITA49, O_FILE, O_EXTERNAL, O_IQ_FORMAT,
         O_CENTER, O_RATE, O_GAIN, O_BIAS, O_PPM, O_CLOCK,
         O_REGION, O_PRESETS, O_KEYS, O_KEYS_FILE, O_SHARE_URL, O_EXTRA_FREQ,
         O_IQ_RECORD, O_STATS_JSON, O_FFTW_WISDOM,
         O_WEBHOOK_URL, O_WEBHOOK_ON, O_WEBHOOK_FORMAT, O_WEBHOOK_TIMEOUT_MS,
-        O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_MAP_API_KEY, O_KML_REFRESH, O_WEB_WATERFALL,
+        O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_WEB_BIND, O_MAP_API_KEY, O_KML_REFRESH, O_WEB_WATERFALL,
         O_STATION, O_GPSD, O_API_TOKEN,
         O_PCAP, O_PCAP_FIFO, O_PSK_WORDLIST, O_ARCHIVE, O_GEOFENCE, O_ANNOUNCE_TO, O_C2_DEALER,
         O_ZMQ_CURVE_SECRET, O_ZMQ_CURVE_KEYGEN, O_STATION_T_ACC_NS,
@@ -449,6 +454,7 @@ int options_parse(int argc, char **argv)
         { "usrp-otw",   required_argument, NULL, O_USRP_OTW },
         { "vita49",     required_argument, NULL, O_VITA49 },
         { "file",       required_argument, NULL, O_FILE },
+        { "external-source", no_argument,  NULL, O_EXTERNAL },
         { "iq-format",  required_argument, NULL, O_IQ_FORMAT },
         { "center",     required_argument, NULL, O_CENTER },
         { "rate",       required_argument, NULL, O_RATE },
@@ -475,6 +481,7 @@ int options_parse(int argc, char **argv)
         { "zmq",        optional_argument, NULL, O_ZMQ },
         { "cot-multicast", required_argument, NULL, O_COT },
         { "web",        optional_argument, NULL, O_WEB },
+        { "web-bind",   required_argument, NULL, O_WEB_BIND },
         { "map-api-key", required_argument, NULL, O_MAP_API_KEY },
         { "kml-refresh", required_argument, NULL, O_KML_REFRESH },
         { "web-waterfall", required_argument, NULL, O_WEB_WATERFALL },
@@ -564,6 +571,7 @@ int options_parse(int argc, char **argv)
                         vita49_endpoint = strdup(optarg);
                         vita49_enabled = 1;
                         break;
+        case O_EXTERNAL: if (set_backend(SDR_BACKEND_EXTERNAL, NULL) < 0) return 2; break;
         case O_FILE:    if (set_backend(SDR_BACKEND_FILE, NULL) < 0) return 2;
                         opt_input_file = strdup(optarg); break;
 
@@ -657,6 +665,7 @@ int options_parse(int argc, char **argv)
         case O_ZMQ:        opt_zmq_endpoint = optarg ? strdup(optarg) : strdup("tcp://*:7008"); break;
         case O_COT:        opt_cot_multicast = strdup(optarg); break;
         case O_WEB:        opt_web_port = optarg ? atoi(optarg) : 8888; break;
+        case O_WEB_BIND:   opt_web_bind = strdup(optarg); break;
         case O_KML_REFRESH: {
             int v = atoi(optarg);
             opt_kml_refresh_s = v < 1 ? 1 : (v > 3600 ? 3600 : v);

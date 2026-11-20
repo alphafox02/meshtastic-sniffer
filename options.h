@@ -28,6 +28,7 @@ typedef enum {
     SDR_BACKEND_USRP,
     SDR_BACKEND_VITA49,
     SDR_BACKEND_FILE,
+    SDR_BACKEND_EXTERNAL,      /* samples pushed by a host app (Android) */
 } sdr_backend_t;
 
 typedef enum {
@@ -166,6 +167,7 @@ extern char *opt_mqtt_topic;
 extern char *opt_zmq_endpoint;
 extern char *opt_cot_multicast;          /* "239.2.3.1:6969" or NULL */
 extern int   opt_web_port;
+extern char *opt_web_bind;               /* --web-bind: listen address; NULL = 0.0.0.0 */
 extern char *opt_map_api_key;            /* NULL = use MAP_API_KEY environment variable */
 extern int   opt_kml_refresh_s;          /* /live.kml NetworkLink refreshInterval, seconds */
 /* Live wideband spectrum waterfall on the dashboard. Default off so a

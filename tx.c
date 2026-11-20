@@ -10,6 +10,7 @@
 #include "meshtastic.h"
 #include "options.h"
 #include "pki.h"
+#include "mesh_tx.h"
 
 #ifdef HAVE_HACKRF
 #include "hackrf.h"
@@ -143,29 +144,24 @@ int tx_init(void)
 
 static const char *tool_path(void)
 {
-    static char path[PATH_MAX];
-    if (opt_tx_tool) return access(opt_tx_tool, R_OK) == 0 ? opt_tx_tool : NULL;
+    /* The python engine is used only when asked for with --tx-tool; the
+     * built-in C engine (mesh_tx.c) is the default. */
+    return (opt_tx_tool && access(opt_tx_tool, R_OK) == 0) ? opt_tx_tool : NULL;
+}
 
-    char exe[PATH_MAX];
-    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (n > 0) {
-        exe[n] = 0;
-        char *slash = strrchr(exe, '/');
-        if (slash) {
-            *slash = 0;
-            const char *rel[] = { "/../tools/meshtastic_tx.py", "/tools/meshtastic_tx.py" };
-            for (size_t i = 0; i < sizeof(rel) / sizeof(rel[0]); ++i) {
-                snprintf(path, sizeof(path), "%s%s", exe, rel[i]);
-                if (access(path, R_OK) == 0) return path;
-            }
-        }
-    }
-    if (access("tools/meshtastic_tx.py", R_OK) == 0) return "tools/meshtastic_tx.py";
-    return NULL;
+/* A HackRF provided by the host app (Android). See tx_set_player. */
+static tx_player_fn g_player;
+static const char  *g_player_name = "external";
+
+void tx_set_player(tx_player_fn fn, const char *name)
+{
+    g_player = fn;
+    if (name) g_player_name = name;
 }
 
 static int inline_hackrf(void)
 {
+    if (g_player) return 1;   /* the host's HackRF is also the receiver */
 #ifdef HAVE_HACKRF
     return opt_sdr_backend == SDR_BACKEND_HACKRF && hackrf_tx_available();
 #else
@@ -194,7 +190,7 @@ static const char *tx_region(void)
 
 void tx_status_json(char *out, size_t cap)
 {
-    const char *tool = opt_tx_enable ? tool_path() : NULL;
+    bool engine_ok = !opt_tx_tool || tool_path();
     const char *rx_region = opt_region ? opt_region : "US";
     const mesh_region_t *rr = mesh_lookup_region(rx_region);
     char pub_b64[45] = "";
@@ -204,12 +200,13 @@ void tx_status_json(char *out, size_t cap)
         pki_b64_encode(pub, pub_b64);
     }
     snprintf(out, cap,
-        "{\"enabled\":%s,\"tool\":%s,\"mode\":\"%s\",\"region\":\"%s\","
+        "{\"enabled\":%s,\"tool\":%s,\"engine\":\"%s\",\"mode\":\"%s\",\"region\":\"%s\","
         "\"rx_region\":\"%s\",\"from\":\"!%08x\",\"ppm\":%g,\"auth\":%s,"
         "\"public_key\":\"%s\"}",
         opt_tx_enable ? "true" : "false",
-        tool ? "true" : "false",
-        inline_hackrf() ? "hackrf-inline" : "hackrf_transfer",
+        engine_ok ? "true" : "false",
+        opt_tx_tool ? "python" : "native",
+        g_player ? g_player_name : (inline_hackrf() ? "hackrf-inline" : "hackrf_transfer"),
         tx_region(),
         rr ? rr->name : rx_region,
         opt_tx_enable ? from_node() : 0,
@@ -490,13 +487,20 @@ static int json_u64(const char *line, const char *key, uint64_t *out)
     return 0;
 }
 
+/* One packet ready to play: int8 I/Q in memory, whichever engine built it. */
 typedef struct {
     char     label[16];
-    char     s8[PATH_MAX];
     uint64_t freq, lo_freq, rate, id, airtime_ms;
+    bool     pki;
+    int8_t  *iq;
+    size_t   n;
 } tx_pkt_t;
 
-#ifdef HAVE_HACKRF
+static void free_pkts(tx_pkt_t *pk, int n)
+{
+    for (int i = 0; i < n; ++i) { free(pk[i].iq); pk[i].iq = NULL; }
+}
+
 static int read_file(const char *path, int8_t **buf, size_t *n)
 {
     FILE *f = fopen(path, "rb");
@@ -512,29 +516,54 @@ static int read_file(const char *path, int8_t **buf, size_t *n)
     *n = (size_t)sz;
     return 0;
 }
-#endif
 
-static int play_packet(const tx_pkt_t *pk, const tx_req_t *rq, char *err, size_t errlen)
+/* Scratch directory, created on first use (python engine, hackrf_transfer). */
+typedef struct { char path[PATH_MAX]; bool made; } workdir_t;
+
+static const char *workdir_get(workdir_t *w)
 {
-#ifdef HAVE_HACKRF
-    if (inline_hackrf()) {
-        int8_t *iq = NULL;
-        size_t n = 0;
-        if (read_file(pk->s8, &iq, &n) != 0) {
-            snprintf(err, errlen, "cannot read generated IQ");
-            return -1;
-        }
-        int rc = hackrf_tx_play(iq, n, pk->lo_freq, (uint32_t)pk->rate,
-                                rq->gain, rq->amp, err, errlen);
-        free(iq);
-        return rc;
+    if (!w->made) {
+        const char *tmp = getenv("TMPDIR");
+        snprintf(w->path, sizeof(w->path), "%s/meshtx_XXXXXX", tmp && *tmp ? tmp : "/tmp");
+        if (!mkdtemp(w->path)) return NULL;
+        w->made = true;
     }
+    return w->path;
+}
+
+static void workdir_drop(workdir_t *w)
+{
+    if (w->made) rm_tree_flat(w->path);
+    w->made = false;
+}
+
+static int play_packet(const tx_pkt_t *pk, const tx_req_t *rq, int idx, workdir_t *wd,
+                       char *err, size_t errlen)
+{
+    if (g_player)
+        return g_player(pk->iq, pk->n, pk->lo_freq, (uint32_t)pk->rate, rq->gain, rq->amp,
+                        err, errlen);
+#ifdef HAVE_HACKRF
+    if (inline_hackrf())
+        return hackrf_tx_play(pk->iq, pk->n, pk->lo_freq, (uint32_t)pk->rate,
+                              rq->gain, rq->amp, err, errlen);
 #endif
+    const char *dir = workdir_get(wd);
+    char path[PATH_MAX + 32];
+    if (!dir) { snprintf(err, errlen, "cannot create a scratch directory"); return -1; }
+    snprintf(path, sizeof(path), "%s/play_%d.s8", dir, idx);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0 || write(fd, pk->iq, pk->n) != (ssize_t)pk->n) {
+        if (fd >= 0) close(fd);
+        snprintf(err, errlen, "cannot write the IQ file");
+        return -1;
+    }
+    close(fd);
     char f[32], s[32], x[16];
     snprintf(f, sizeof(f), "%llu", (unsigned long long)pk->lo_freq);
     snprintf(s, sizeof(s), "%llu", (unsigned long long)pk->rate);
     snprintf(x, sizeof(x), "%d", rq->gain);
-    char *argv[] = { "hackrf_transfer", "-t", (char *)pk->s8, "-f", f, "-s", s,
+    char *argv[] = { "hackrf_transfer", "-t", path, "-f", f, "-s", s,
                      "-x", x, "-a", rq->amp ? "1" : "0", NULL };
     int rc = run_capture(argv, NULL, 0, TX_PLAY_TIMEOUT_MS);
     if (rc != 0) {
@@ -542,6 +571,192 @@ static int play_packet(const tx_pkt_t *pk, const tx_req_t *rq, char *err, size_t
                                         : "hackrf_transfer failed (HackRF busy or missing?)");
         return -1;
     }
+    return 0;
+}
+
+/* ---- packet engines ---- */
+
+typedef struct {
+    bool     use_pki, announce;
+    uint8_t  dest_key[PKI_KEY_LEN];
+} tx_plan_t;
+
+/* Built in C (mesh_tx.c): the default, and the only engine on Android. */
+static int generate_native(const tx_req_t *rq, const tx_plan_t *pl, tx_pkt_t *pk, int *npk,
+                           char *err, size_t errlen)
+{
+    mesh_tx_req_t r;
+    memset(&r, 0, sizeof(r));
+    r.region = tx_region();
+    r.preset = rq->preset;
+    r.channel = rq->channel[0] ? rq->channel : NULL;
+    r.psk = rq->psk;
+    r.slot = rq->slot;
+    r.from = from_node();
+    r.to = strcmp(rq->to, "broadcast") ? (uint32_t)strtoul(rq->to + 2, NULL, 16) : 0xFFFFFFFFu;
+    r.hop_limit = rq->hop;
+    r.want_ack = rq->ack;
+    r.kind = rq->kind;
+    r.text = rq->kind == TX_KIND_TEXT ? rq->text : NULL;
+    r.reply_id = rq->reply_id;
+    r.long_name = rq->long_name[0] ? rq->long_name : NULL;
+    r.short_name = rq->long_name[0] && rq->short_name[0] ? rq->short_name : NULL;
+    r.announce_dest = pl->announce;
+    if (pki_enabled()) { r.has_identity = true; pki_private_key(r.our_priv); }
+    if (pl->use_pki) { r.has_dest_key = true; memcpy(r.dest_pub, pl->dest_key, PKI_KEY_LEN); }
+    r.ppm = tx_ppm();
+    r.rate = TX_RATE_HZ;
+
+    mesh_tx_packet_t mp[2];
+    int n = mesh_tx_build(&r, mp, 2, err, errlen);
+    memset(r.our_priv, 0, sizeof(r.our_priv));
+    if (n < 0) return -1;
+    for (int i = 0; i < n; ++i) {
+        tx_pkt_t *p = &pk[i];
+        memset(p, 0, sizeof(*p));
+        snprintf(p->label, sizeof(p->label), "%s", mp[i].label);
+        p->freq = mp[i].freq_hz; p->lo_freq = mp[i].lo_hz; p->rate = mp[i].rate;
+        p->id = mp[i].id; p->airtime_ms = mp[i].airtime_ms; p->pki = mp[i].pki;
+        p->iq = mp[i].iq; p->n = mp[i].iq_bytes;   /* ownership moves to pk */
+        mp[i].iq = NULL;
+    }
+    *npk = n;
+    return 0;
+}
+
+/* tools/meshtastic_tx.py + gr-lora_sdr, with --tx-tool=PATH. */
+static int generate_python(const tx_req_t *rq, const tx_plan_t *pl, workdir_t *wd,
+                           tx_pkt_t *pk, int *npk, char *err, size_t errlen)
+{
+    const char *tool = tool_path();
+    if (!tool) { snprintf(err, errlen, "--tx-tool: %s not found", opt_tx_tool); return -1; }
+    const char *workdir = workdir_get(wd);
+    if (!workdir) { snprintf(err, errlen, "mkdtemp failed"); return -1; }
+
+    /* Our private key reaches the tool through a 0600 file in the 0700
+     * scratch dir, never on the command line. */
+    char keyfile[PATH_MAX + 8] = "";
+    if (pki_enabled()) {
+        uint8_t priv[PKI_KEY_LEN];
+        char b64[45];
+        pki_private_key(priv);
+        pki_b64_encode(priv, b64);
+        memset(priv, 0, sizeof(priv));
+        snprintf(keyfile, sizeof(keyfile), "%s/key", workdir);
+        int kfd = open(keyfile, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        int ok = kfd >= 0 && dprintf(kfd, "%s\n", b64) >= 0;
+        if (kfd >= 0) close(kfd);
+        memset(b64, 0, sizeof(b64));
+        if (!ok) { snprintf(err, errlen, "cannot write the key file"); return -1; }
+    }
+
+    /* Every user string goes in as --flag=value: no shell, and a value
+     * starting with '-' can't be taken for an option. */
+    char a_keep[PATH_MAX + 8], a_rate[32], a_region[48], a_preset[40], a_psk[80],
+         a_to[32], a_from[32], a_hop[24], a_gain[24], a_text[280], a_chan[32],
+         a_slot[24], a_long[64], a_short[24], a_ppm[40], a_kind[24], a_reply[32],
+         a_keyfile[PATH_MAX + 32], a_dest[80];
+    snprintf(a_keep,   sizeof(a_keep),   "--keep=%s", workdir);
+    snprintf(a_rate,   sizeof(a_rate),   "--rate=%d", TX_RATE_HZ);
+    snprintf(a_region, sizeof(a_region), "--region=%s", tx_region());
+    snprintf(a_preset, sizeof(a_preset), "--preset=%s", rq->preset);
+    snprintf(a_psk,    sizeof(a_psk),    "--psk=%s", rq->psk);
+    snprintf(a_to,     sizeof(a_to),     "--to=%s", rq->to);
+    snprintf(a_from,   sizeof(a_from),   "--from-node=0x%08x", from_node());
+    snprintf(a_hop,    sizeof(a_hop),    "--hop-limit=%d", rq->hop);
+    snprintf(a_gain,   sizeof(a_gain),   "--tx-gain=%d", rq->gain);
+    snprintf(a_kind,   sizeof(a_kind),   "--kind=%s", TX_KINDS[rq->kind]);
+
+    char *argv[32];
+    int ac = 0;
+    argv[ac++] = "python3";
+    argv[ac++] = (char *)tool;
+    argv[ac++] = "--emit-json";
+    argv[ac++] = "--dry-run";
+    argv[ac++] = a_keep;
+    argv[ac++] = a_rate;
+    argv[ac++] = a_region;
+    argv[ac++] = a_preset;
+    argv[ac++] = a_psk;
+    argv[ac++] = a_to;
+    argv[ac++] = a_from;
+    argv[ac++] = a_hop;
+    argv[ac++] = a_gain;
+    argv[ac++] = a_kind;
+    if (rq->kind == TX_KIND_TEXT) {
+        snprintf(a_text, sizeof(a_text), "--text=%s", rq->text);
+        argv[ac++] = a_text;
+    }
+    if (rq->reply_id) {
+        snprintf(a_reply, sizeof(a_reply), "--reply-id=0x%08x", rq->reply_id);
+        argv[ac++] = a_reply;
+    }
+    if (rq->ack) argv[ac++] = "--want-ack";
+    if (keyfile[0]) {
+        snprintf(a_keyfile, sizeof(a_keyfile), "--pki-key-file=%s", keyfile);
+        argv[ac++] = a_keyfile;
+    }
+    if (pl->use_pki) {
+        char b64[45];
+        pki_b64_encode(pl->dest_key, b64);
+        snprintf(a_dest, sizeof(a_dest), "--dest-pubkey=%s", b64);
+        argv[ac++] = a_dest;
+        if (pl->announce) argv[ac++] = "--announce-dest";
+    }
+    if (rq->channel[0]) {
+        snprintf(a_chan, sizeof(a_chan), "--channel=%s", rq->channel);
+        argv[ac++] = a_chan;
+    }
+    if (rq->slot >= 0) {
+        snprintf(a_slot, sizeof(a_slot), "--slot=%d", rq->slot);
+        argv[ac++] = a_slot;
+    }
+    double ppm = tx_ppm();
+    if (ppm != 0.0) {
+        snprintf(a_ppm, sizeof(a_ppm), "--ppm=%.6g", ppm);
+        argv[ac++] = a_ppm;
+    }
+    if (rq->long_name[0]) {
+        snprintf(a_long, sizeof(a_long), "--long-name=%s", rq->long_name);
+        argv[ac++] = a_long;
+        if (rq->short_name[0]) {
+            snprintf(a_short, sizeof(a_short), "--short-name=%s", rq->short_name);
+            argv[ac++] = a_short;
+        }
+    }
+    argv[ac] = NULL;
+
+    char gen_out[8192];
+    int rc = run_capture(argv, gen_out, sizeof(gen_out), TX_GEN_TIMEOUT_MS);
+    if (rc != 0) {
+        snprintf(err, errlen, "%s", rc == 127 ? "python3 not found"
+                                              : "packet generation failed (see the sniffer's stderr)");
+        return -1;
+    }
+    int n = 0;
+    for (char *save = NULL, *line = strtok_r(gen_out, "\n", &save);
+         line && n < TX_MAX_PACKETS; line = strtok_r(NULL, "\n", &save)) {
+        if (strncmp(line, "{\"tx\": ", 7) != 0) continue;
+        tx_pkt_t *p = &pk[n];
+        char s8[PATH_MAX];
+        memset(p, 0, sizeof(*p));
+        if (json_str(line, "tx", p->label, sizeof(p->label)) ||
+            json_str(line, "s8", s8, sizeof(s8)) ||
+            json_u64(line, "freq", &p->freq) ||
+            json_u64(line, "lo_freq", &p->lo_freq) ||
+            json_u64(line, "rate", &p->rate) ||
+            json_u64(line, "id", &p->id))
+            continue;
+        json_u64(line, "airtime_ms", &p->airtime_ms);
+        p->pki = strstr(line, "\"pki\": true") != NULL;
+        /* Only play files from our own scratch directory. */
+        if (strncmp(s8, workdir, strlen(workdir)) != 0 || strstr(s8, ".."))
+            continue;
+        if (read_file(s8, &p->iq, &p->n) != 0) continue;
+        ++n;
+    }
+    if (n == 0) { snprintf(err, errlen, "generator produced no packets"); return -1; }
+    *npk = n;
     return 0;
 }
 
@@ -563,9 +778,8 @@ void tx_send(const char *body, c2_response_t *out)
         respond(out, 400, "{\"error\":\"%s\"}", perr);
         return;
     }
-    const char *tool = tool_path();
-    if (!tool) {
-        respond(out, 500, "{\"error\":\"tools/meshtastic_tx.py not found; pass --tx-tool=PATH\"}");
+    if (opt_tx_tool && !tool_path()) {
+        respond(out, 500, "{\"error\":\"--tx-tool: meshtastic_tx.py not found\"}");
         return;
     }
     if (pthread_mutex_trylock(&g_tx_lock) != 0) {
@@ -578,166 +792,38 @@ void tx_send(const char *body, c2_response_t *out)
         return;
     }
 
-    char workdir[] = "/tmp/meshtx_XXXXXX";
-    if (!mkdtemp(workdir)) {
-        pthread_mutex_unlock(&g_tx_lock);
-        respond(out, 500, "{\"error\":\"mkdtemp failed\"}");
-        return;
-    }
-
     /* Public-key DM: like the firmware, PKI for unicast packets except
      * TRACEROUTE / NODEINFO / ROUTING / POSITION, when we know the
-     * destination's key. Our private key reaches the tool through a 0600
-     * file in the 0700 scratch dir, never on the command line. */
+     * destination's key. */
+    tx_plan_t pl;
+    memset(&pl, 0, sizeof(pl));
     uint32_t to_num = 0;
     bool unicast = strcmp(rq.to, "broadcast") != 0;
     if (unicast) to_num = (uint32_t)strtoul(rq.to + 2, NULL, 16);
     if (rq.has_pubkey) pki_note_peer(to_num, rq.pubkey);
     bool pki_port = rq.kind == TX_KIND_TEXT || !strcmp(TX_KINDS[rq.kind], "telemetry");
-    uint8_t dest_key[PKI_KEY_LEN];
-    bool use_pki = unicast && pki_port && pki_enabled() && pki_peer_key(to_num, dest_key);
-    bool announce = use_pki && !announced(to_num);
-    char keyfile[PATH_MAX] = "";
-    if (pki_enabled()) {
-        uint8_t priv[PKI_KEY_LEN];
-        char b64[45];
-        pki_private_key(priv);
-        pki_b64_encode(priv, b64);
-        memset(priv, 0, sizeof(priv));
-        snprintf(keyfile, sizeof(keyfile), "%s/key", workdir);
-        int kfd = open(keyfile, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-        if (kfd < 0 || dprintf(kfd, "%s\n", b64) < 0) {
-            if (kfd >= 0) close(kfd);
-            memset(b64, 0, sizeof(b64));
-            rm_tree_flat(workdir);
-            pthread_mutex_unlock(&g_tx_lock);
-            respond(out, 500, "{\"error\":\"cannot write the key file\"}");
-            return;
-        }
-        close(kfd);
-        memset(b64, 0, sizeof(b64));
-    }
+    pl.use_pki = unicast && pki_port && pki_enabled() && pki_peer_key(to_num, pl.dest_key);
+    pl.announce = pl.use_pki && !announced(to_num);
 
-    /* Every user string goes in as --flag=value: no shell, and a value
-     * starting with '-' can't be taken for an option. */
-    char a_keep[PATH_MAX + 8], a_rate[32], a_region[48], a_preset[40], a_psk[80],
-         a_to[32], a_from[32], a_hop[24], a_gain[24], a_text[280], a_chan[32],
-         a_slot[24], a_long[64], a_short[24], a_ppm[40], a_kind[24], a_reply[32],
-         a_keyfile[PATH_MAX + 24], a_dest[80];
-    snprintf(a_keep,   sizeof(a_keep),   "--keep=%s", workdir);
-    snprintf(a_rate,   sizeof(a_rate),   "--rate=%d", TX_RATE_HZ);
-    snprintf(a_region, sizeof(a_region), "--region=%s", tx_region());
-    snprintf(a_preset, sizeof(a_preset), "--preset=%s", rq.preset);
-    snprintf(a_psk,    sizeof(a_psk),    "--psk=%s", rq.psk);
-    snprintf(a_to,     sizeof(a_to),     "--to=%s", rq.to);
-    snprintf(a_from,   sizeof(a_from),   "--from-node=0x%08x", from_node());
-    snprintf(a_hop,    sizeof(a_hop),    "--hop-limit=%d", rq.hop);
-    snprintf(a_gain,   sizeof(a_gain),   "--tx-gain=%d", rq.gain);
-    snprintf(a_kind,   sizeof(a_kind),   "--kind=%s", TX_KINDS[rq.kind]);
-
-    char *argv[32];
-    int ac = 0;
-    argv[ac++] = "python3";
-    argv[ac++] = (char *)tool;
-    argv[ac++] = "--emit-json";
-    argv[ac++] = "--dry-run";
-    argv[ac++] = a_keep;
-    argv[ac++] = a_rate;
-    argv[ac++] = a_region;
-    argv[ac++] = a_preset;
-    argv[ac++] = a_psk;
-    argv[ac++] = a_to;
-    argv[ac++] = a_from;
-    argv[ac++] = a_hop;
-    argv[ac++] = a_gain;
-    argv[ac++] = a_kind;
-    if (rq.kind == TX_KIND_TEXT) {
-        snprintf(a_text, sizeof(a_text), "--text=%s", rq.text);
-        argv[ac++] = a_text;
-    }
-    if (rq.reply_id) {
-        snprintf(a_reply, sizeof(a_reply), "--reply-id=0x%08x", rq.reply_id);
-        argv[ac++] = a_reply;
-    }
-    if (rq.ack) argv[ac++] = "--want-ack";
-    if (keyfile[0]) {
-        snprintf(a_keyfile, sizeof(a_keyfile), "--pki-key-file=%s", keyfile);
-        argv[ac++] = a_keyfile;
-    }
-    if (use_pki) {
-        char b64[45];
-        pki_b64_encode(dest_key, b64);
-        snprintf(a_dest, sizeof(a_dest), "--dest-pubkey=%s", b64);
-        argv[ac++] = a_dest;
-        if (announce) argv[ac++] = "--announce-dest";
-    }
-    if (rq.channel[0]) {
-        snprintf(a_chan, sizeof(a_chan), "--channel=%s", rq.channel);
-        argv[ac++] = a_chan;
-    }
-    if (rq.slot >= 0) {
-        snprintf(a_slot, sizeof(a_slot), "--slot=%d", rq.slot);
-        argv[ac++] = a_slot;
-    }
-    double ppm = tx_ppm();
-    if (ppm != 0.0) {
-        snprintf(a_ppm, sizeof(a_ppm), "--ppm=%.6g", ppm);
-        argv[ac++] = a_ppm;
-    }
-    if (rq.long_name[0]) {
-        snprintf(a_long, sizeof(a_long), "--long-name=%s", rq.long_name);
-        argv[ac++] = a_long;
-        if (rq.short_name[0]) {
-            snprintf(a_short, sizeof(a_short), "--short-name=%s", rq.short_name);
-            argv[ac++] = a_short;
-        }
-    }
-    argv[ac] = NULL;
-
-    char gen_out[8192];
-    int rc = run_capture(argv, gen_out, sizeof(gen_out), TX_GEN_TIMEOUT_MS);
-    if (rc != 0) {
-        rm_tree_flat(workdir);
-        pthread_mutex_unlock(&g_tx_lock);
-        respond(out, 500, "{\"error\":\"%s\"}",
-                rc == 127 ? "python3 not found"
-                          : "packet generation failed (see the sniffer's stderr)");
-        return;
-    }
-
+    workdir_t wd = { .made = false };
     tx_pkt_t pk[TX_MAX_PACKETS];
     int npk = 0;
-    for (char *save = NULL, *line = strtok_r(gen_out, "\n", &save);
-         line && npk < TX_MAX_PACKETS; line = strtok_r(NULL, "\n", &save)) {
-        if (strncmp(line, "{\"tx\": ", 7) != 0) continue;
-        tx_pkt_t *p = &pk[npk];
-        memset(p, 0, sizeof(*p));
-        if (json_str(line, "tx", p->label, sizeof(p->label)) ||
-            json_str(line, "s8", p->s8, sizeof(p->s8)) ||
-            json_u64(line, "freq", &p->freq) ||
-            json_u64(line, "lo_freq", &p->lo_freq) ||
-            json_u64(line, "rate", &p->rate) ||
-            json_u64(line, "id", &p->id))
-            continue;
-        json_u64(line, "airtime_ms", &p->airtime_ms);
-        /* Only play files from our own scratch directory. */
-        if (strncmp(p->s8, workdir, strlen(workdir)) != 0 || strstr(p->s8, ".."))
-            continue;
-        ++npk;
-    }
-    if (npk == 0) {
-        rm_tree_flat(workdir);
+    char err[200] = "";
+    int grc = opt_tx_tool ? generate_python(&rq, &pl, &wd, pk, &npk, err, sizeof(err))
+                          : generate_native(&rq, &pl, pk, &npk, err, sizeof(err));
+    if (grc != 0) {
+        workdir_drop(&wd);
         pthread_mutex_unlock(&g_tx_lock);
-        respond(out, 500, "{\"error\":\"generator produced no packets\"}");
+        /* err is built from literals and numbers: no quotes to escape */
+        respond(out, opt_tx_tool ? 500 : 400, "{\"error\":\"%s\"}", err[0] ? err : "packet generation failed");
         return;
     }
 
-    char err[160] = "";
     int sent = 0;
     uint64_t main_id = 0, airtime = 0;
     for (int i = 0; i < npk; ++i) {
         if (i > 0) sleep(1);  /* NodeInfo first, then the text / request */
-        if (play_packet(&pk[i], &rq, err, sizeof(err)) != 0) break;
+        if (play_packet(&pk[i], &rq, i, &wd, err, sizeof(err)) != 0) break;
         ++sent;
         airtime += pk[i].airtime_ms;
         if (!strcmp(pk[i].label, TX_KINDS[rq.kind])) main_id = pk[i].id;
@@ -746,9 +832,11 @@ void tx_send(const char *body, c2_response_t *out)
     /* Our NodeInfo (with our public key) reached the node: by itself
      * (kind=nodeinfo) or ahead of a PKI DM. */
     if (sent == npk && unicast && pki_enabled() &&
-        (announce || !strcmp(TX_KINDS[rq.kind], "nodeinfo")))
+        (pl.announce || !strcmp(TX_KINDS[rq.kind], "nodeinfo")))
         mark_announced(to_num);
-    rm_tree_flat(workdir);
+    uint64_t freq = pk[0].freq;
+    free_pkts(pk, npk);
+    workdir_drop(&wd);
     pthread_mutex_unlock(&g_tx_lock);
 
     if (sent < npk) {
@@ -757,10 +845,10 @@ void tx_send(const char *body, c2_response_t *out)
         return;
     }
     fprintf(stderr, "[tx] sent %d packet(s) as !%08x on %.6f MHz (%s, id 0x%08llx)\n",
-            sent, from_node(), pk[0].freq / 1e6, TX_KINDS[rq.kind],
+            sent, from_node(), freq / 1e6, TX_KINDS[rq.kind],
             (unsigned long long)main_id);
     const char *warning = "";
-    if (rq.kind == TX_KIND_TEXT && unicast && !use_pki)
+    if (rq.kind == TX_KIND_TEXT && unicast && !pl.use_pki)
         warning = pki_enabled()
             ? ",\"warning\":\"no public key known for this node, so the DM went out with the channel key; "
               "firmware 2.5+ drops those. Wait for its NodeInfo or paste its public key.\""
@@ -772,7 +860,7 @@ void tx_send(const char *body, c2_response_t *out)
         "{\"ok\":true,\"from\":\"!%08x\",\"to\":\"%s\",\"kind\":\"%s\","
         "\"freq_mhz\":%.6f,\"packets\":%d,\"id\":\"%08llx\",\"airtime_ms\":%llu,"
         "\"pki\":%s%s}",
-        from_node(), to_buf, TX_KINDS[rq.kind], pk[0].freq / 1e6, sent,
+        from_node(), to_buf, TX_KINDS[rq.kind], freq / 1e6, sent,
         (unsigned long long)main_id, (unsigned long long)airtime,
-        use_pki ? "true" : "false", warning);
+        pl.use_pki ? "true" : "false", warning);
 }

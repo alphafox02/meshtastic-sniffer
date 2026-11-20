@@ -15,6 +15,9 @@ double        opt_tx_ppm;
 bool          opt_tx_ppm_set;
 char         *opt_tx_region;
 char         *opt_tx_key;
+int           verbose;                       /* lora.c */
+#include <pthread.h>
+pthread_mutex_t fftw_planner_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #include "tx.c"
 #include "pki.h"
@@ -44,11 +47,26 @@ int hackrf_tx_play(const int8_t *iq, size_t n, uint64_t f, uint32_t rate, int ga
 {
     (void)err; (void)errlen;
     ++play_calls; play_n = n; play_f = f; play_rate = rate; play_gain = gain; play_amp = amp;
-    return (iq[0] == 1 && iq[1] == 2) ? 0 : -1;  /* matches the dummy IQ pattern */
+    /* the python wrapper's dummy pattern, or real IQ (starts with the 20 ms zero lead) */
+    return ((iq[0] == 1 && iq[1] == 2) || (n > 80000 && iq[0] == 0 && iq[1] == 0)) ? 0 : -1;
 }
 #endif
 
 static int fails;
+
+/* stands in for the Android app's HackRF */
+static int player_calls, player_gain, player_amp, player_fail;
+static uint64_t player_lo;
+static uint32_t player_rate;
+static size_t player_n;
+static int fake_player(const int8_t *iq, size_t n, uint64_t lo, uint32_t rate, int gain, int amp,
+                       char *err, size_t errlen)
+{
+    (void)iq;
+    if (player_fail) { snprintf(err, errlen, "usb gone"); return -1; }
+    ++player_calls; player_n = n; player_lo = lo; player_rate = rate; player_gain = gain; player_amp = amp;
+    return 0;
+}
 #define CHECK(c, ...) do { if (c) printf("ok   "); else { printf("FAIL "); ++fails; } \
                            printf(__VA_ARGS__); printf("\n"); } while (0)
 
@@ -93,6 +111,7 @@ static int leftover_workdirs(void)
 int main(int argc, char **argv)
 {
     if (argc < 2) return 2;
+    unsetenv("TMPDIR");   /* scratch dirs under /tmp, where the checks look */
     const char *tool_log = getenv("FAKE_LOG"), *ht_log = getenv("HT_LOG");
     unlink(tool_log); unlink(ht_log);
     int workdirs_before = leftover_workdirs();
@@ -281,6 +300,46 @@ int main(int argc, char **argv)
     c2_dispatch("tx_send", "text=x", &rc2);
     CHECK(rc2.status == 403, "c2 tx_send without --tx -> 403 (%s)", rc2.body);
     opt_tx_enable = true;
+
+    /* --- built-in C engine (default without --tx-tool) --- */
+    const char *wrapper = opt_tx_tool;
+    opt_tx_tool = NULL;
+    unlink(tool_log); unlink(ht_log);
+    tx_status_json(st, sizeof(st));
+    CHECK(strstr(st, "\"engine\":\"native\"") && strstr(st, "\"tool\":true"), "native engine by default (%s)", st);
+    r = send("text=native+hello&preset=MEDIUM_FAST");
+    CHECK(r.status == 200 && strstr(r.body, "\"packets\":1") && strstr(r.body, "913.125000") &&
+          count_lines(tool_log) == 0, "native send: no python, 913.125 MHz (%s)", r.body);
+#ifdef HAVE_HACKRF
+    CHECK(play_f == 912625000 && play_n > 200000 && play_gain == 10,
+          "native IQ played inline: LO %llu, %zu bytes", (unsigned long long)play_f, play_n);
+#else
+    CHECK(file_has(ht_log, "-f 912625000 -s 2000000"), "native IQ played via hackrf_transfer");
+#endif
+    r = send("kind=bogus2&text=x");
+    CHECK(r.status == 400, "native: bad kind still 400 (%s)", r.body);
+    r = send("text=0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
+             "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
+             "0123456789012345678901234567890123456789012345");
+    CHECK(r.status == 400 && strstr(r.body, "shorten"), "native: oversize frame -> 400 (%s)", r.body);
+    CHECK(leftover_workdirs() == workdirs_before, "native: no scratch dirs left");
+
+    /* --- a player from the host app (Android) --- */
+    tx_set_player(fake_player, "android-hackrf");
+    tx_status_json(st, sizeof(st));
+    CHECK(strstr(st, "\"mode\":\"android-hackrf\""), "status names the player (%s)", st);
+    ppm_correction = 13;
+    r = send("text=via+player&preset=MEDIUM_FAST&gain=25&amp=1");
+    CHECK(r.status == 200 && player_calls == 1 && player_gain == 25 && player_amp == 1 &&
+          player_lo == 912613136 && player_rate == 2000000 && player_n > 200000,
+          "player got the IQ, LO corrected by --ppm 13 (lo=%llu, %s)", (unsigned long long)player_lo, r.body);
+    player_fail = 1;
+    r = send("text=x");
+    CHECK(r.status == 500 && strstr(r.body, "usb gone"), "player error reported (%s)", r.body);
+    player_fail = 0;
+    tx_set_player(NULL, NULL);
+    ppm_correction = 0;
+    opt_tx_tool = (char *)wrapper;
 
     /* --- failures --- */
     setenv("FAKE_MODE", "fail", 1);

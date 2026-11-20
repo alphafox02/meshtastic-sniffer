@@ -76,24 +76,23 @@ When a worker can't keep up with the live sample rate, it disarms itself and cou
 
 ## Transmit mode (HackRF)
 
-With `--tx` the sniffer becomes a Meshtastic node you drive from the web dashboard: it sends channel messages and replies, direct messages (end-to-end encrypted with the firmware 2.5+ public-key scheme), and the node requests of the Meshtastic apps (position, node info, telemetry, traceroute), and it matches and decodes the answers. Frames are built and modulated by [tools/meshtastic_tx.py](tools/meshtastic_tx.py) (gr-lora_sdr) and played on a HackRF.
+With `--tx` the sniffer becomes a Meshtastic node you drive from the web dashboard: it sends channel messages and replies, direct messages (end-to-end encrypted with the firmware 2.5+ public-key scheme), and the node requests of the Meshtastic apps (position, node info, telemetry, traceroute), and it matches and decodes the answers. Frames are built and LoRa-modulated in C (`mesh_tx.c`, `lora_tx.c`: a port of gr-lora_sdr's transmit chain, symbol-for-symbol identical) and played on a HackRF. It also runs on an Android phone with the HackRF on USB OTG: see [android/](android/README.md).
 
 Only transmit on channels you operate, within your region's power and duty-cycle limits (EU_868 869.4–869.65 MHz: 10% duty cycle, up to 500 mW ERP).
 
 ### Requirements
 
 - A HackRF One. Either the sniffer's own receiver (`--hackrf`: reception pauses for about a second per packet while it transmits), or a second HackRF next to any other receiver, driven through `hackrf_transfer`.
-- `python3` with gnuradio + [gr-lora_sdr](https://github.com/tapparelj/gr-lora_sdr), `numpy` and `python3-cryptography` (X25519 / AES-CCM for public-key DMs), and the `hackrf` tools. DragonOS ships all of them.
-- If gr-lora_sdr was built into `~/.local`, the library path must be set for the sniffer (it runs the tool): `export LD_LIBRARY_PATH=$HOME/.local/lib/x86_64-linux-gnu` (or add that directory to `/etc/ld.so.conf.d/` and run `ldconfig`).
+- Nothing else: packet building, encryption (AES-CTR, X25519 + AES-CCM) and LoRa modulation are built in. With a separate TX HackRF, the `hackrf` tools (`hackrf_transfer`).
+- Optional: `--tx-tool=tools/meshtastic_tx.py` uses the python tool instead (needs `python3` with gnuradio + [gr-lora_sdr](https://github.com/tapparelj/gr-lora_sdr), `numpy`, `python3-cryptography`; if gr-lora_sdr is in `~/.local`, also `export LD_LIBRARY_PATH=$HOME/.local/lib/x86_64-linux-gnu`).
 
-Check the chain before going on air: `make check_tx` runs the transmit tests without a radio, including the firmware's own public-key test vectors and, when gr-lora_sdr is importable, a modulate→demodulate round trip of every preset.
+Check the chain before going on air: `make check_tx` runs the transmit tests without a radio: the firmware's own public-key test vectors, the C engine against the python tool (identical frames and IQ) and against gr-lora_sdr's blocks (identical symbols, when importable), a modulate→demodulate round trip of every preset, and the Android data path (the sniffer as a library fed with pushed samples).
 
 ### Launch
 
 The full command, as tested on EU_868 MediumFast against a Meshtastic 2.x node (values for that HackRF; adjust region, preset, gains and ppm to yours):
 
 ```bash
-export LD_LIBRARY_PATH=$HOME/.local/lib/x86_64-linux-gnu     # only if gr-lora_sdr is in ~/.local
 mkdir -p ~/.config/meshtastic-sniffer && chmod 700 ~/.config/meshtastic-sniffer
 openssl rand -hex 16 > ~/.config/meshtastic-sniffer/api_token  # once; paste it in Config -> Transmit
 
@@ -121,13 +120,13 @@ Then open `http://localhost:8889`, go to **Config → Transmit**, paste the API 
 | `--ppm=13` | Clock correction, RX and (on the same HackRF) TX | This HackRF runs +13 ppm fast; measure yours |
 | `--keys=default` | Channel keys for decoding (`default` = `AQ==`) | Add your channels: `--keys='MyChan=base64:...'` or `--keys-file` |
 | `--scan-and-decode --show-untrusted` | Decode the grid and show CRC-failed frames too | Optional; `--trusted-only` gives a clean feed |
-| `--web=8889` | Dashboard and `/api/*` | |
+| `--web=8889` | Dashboard and `/api/*` | `--web-bind=127.0.0.1` keeps it on this machine |
 | `--tx` | Enables transmit (Send box, node actions, `POST /api/tx`, C2 `tx_send`) | Off by default |
 | `--tx-node='!18bbc790'` | Node number we transmit as | Default: random per run. Keep it fixed so nodes recognise you |
 | `--tx-key=PATH` | Our X25519 private key (base64), created with mode 0600 if missing | **Needed for DMs.** Keep the same file with the same `--tx-node`: firmware refuses a known node whose key changed. Default: a new key per run |
 | `--tx-region=NAME` | Transmit band, if different from `--region` | e.g. receive `US`, transmit `EU_868` on a second HackRF. Sub-GHz only |
 | `--tx-ppm=PPM` | Clock correction of the transmitting HackRF | Default: `--ppm` when the same HackRF receives, else 0 |
-| `--tx-tool=PATH` | Path to `meshtastic_tx.py` | Default: found next to the binary or in `./tools` |
+| `--tx-tool=PATH` | Build packets with `tools/meshtastic_tx.py` + gr-lora_sdr instead of the built-in C engine | Optional; for comparison |
 | `--api-token=SECRET` | Requires `Authorization: Bearer SECRET` on every `POST /api/*` | **Strongly recommended with `--tx`**: anyone who can reach the dashboard could otherwise transmit |
 
 At startup the sniffer prints its TX identity: `[tx] transmitting as !18bbc790, PKI public key p5Eb...UTA= (...tx_key)`. The dashboard's Config → Transmit shows the same.
@@ -163,7 +162,9 @@ Tested on air (HackRF One, EU_868 MediumFast, Meshtastic 2.x node at about 27 dB
 | Exchange node info | The node answers with its NodeInfo, including its public key (firmware throttles repeats to one every few minutes) |
 | Request telemetry | Answered, PKI-encrypted to us and decrypted by the sniffer |
 | Traceroute | Answered; a direct link shows the SNR at which the node heard us |
-| Request position | `NO_RESPONSE` when the node doesn't share its position on that channel (position precision 0) |
+| Request position | `NO_RESPONSE` (or nothing) when the node doesn't share its position on that channel (position precision 0) |
+
+A node with the **TRACKER** role (or power saving on) sleeps its radio between its own broadcasts, so it only answers right after sending: the first request may get through and the next ones not. Set it to CLIENT, or turn power saving off, while testing. The same tests ran from the Android app (Galaxy S9+, Android 10): traceroute, public-key DM (ACKed), telemetry answered PKI-encrypted and decrypted on the phone.
 
 If DMs stop being ACKed after a restart, the node probably holds an older key for our node number (a new `--tx-key` with an old `--tx-node`): keep both fixed, or pick a new `--tx-node`. If it doesn't have our key yet, use **Exchange node info**.
 

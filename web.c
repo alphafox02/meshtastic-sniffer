@@ -2854,6 +2854,10 @@ void web_init(int port)
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
+    if (opt_web_bind && inet_pton(AF_INET, opt_web_bind, &addr.sin_addr) != 1) {
+        fprintf(stderr, "web: --web-bind=%s is not an IPv4 address\n", opt_web_bind);
+        close(g_listen_fd); g_listen_fd = -1; return;
+    }
     addr.sin_port = htons((uint16_t)port);
     if (bind(g_listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("web: bind"); close(g_listen_fd); g_listen_fd = -1; return;
