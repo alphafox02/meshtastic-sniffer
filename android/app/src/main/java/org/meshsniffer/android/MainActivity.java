@@ -3,12 +3,16 @@
  */
 package org.meshsniffer.android;
 
+import android.Manifest;
 import android.app.Activity;
+import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.graphics.Typeface;
 import android.os.Bundle;
 import android.os.Handler;
@@ -16,6 +20,9 @@ import android.os.Looper;
 import android.text.InputType;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.GeolocationPermissions;
+import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -29,10 +36,13 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import org.json.JSONObject;
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -51,6 +61,9 @@ public class MainActivity extends Activity {
     private FrameLayout root;
     private boolean webInjected;
     private final Handler ui = new Handler(Looper.getMainLooper());
+    private static final int REQ_LOCATION = 1;
+    private String geoOrigin;
+    private GeolocationPermissions.Callback geoCallback;
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) {
@@ -127,8 +140,33 @@ public class MainActivity extends Activity {
         WebSettings ws = web.getSettings();
         ws.setJavaScriptEnabled(true);
         ws.setDomStorageEnabled(true);
+        ws.setGeolocationEnabled(true);
         web.setWebViewClient(new WebViewClient() {
             @Override public void onPageFinished(WebView v, String url) { injectToken(); }
+            /* Links that leave the dashboard (Google Maps, OSM...) go to the
+             * app that handles them; the WebView only shows the sniffer. */
+            @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                String url = r.getUrl().toString();
+                if (url.startsWith(baseUrl())) return false;
+                openExternal(url);
+                return true;
+            }
+        });
+        web.setWebChromeClient(new WebChromeClient() {
+            /* "Use my location" (home marker): Android permission first,
+             * then let only our own page have the position. */
+            @Override public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback cb) {
+                if (!origin.startsWith(baseUrl())) { cb.invoke(origin, false, false); return; }
+                if (hasLocationPermission()) { cb.invoke(origin, true, false); return; }
+                geoOrigin = origin;
+                geoCallback = cb;
+                requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION,
+                        Manifest.permission.ACCESS_COARSE_LOCATION}, REQ_LOCATION);
+            }
+        });
+        /* "Open in Google Earth" downloads /live.kml: hand it to Google Earth. */
+        web.setDownloadListener((url, ua, disposition, mime, length) -> {
+            if (url.startsWith(baseUrl())) openKml(url);
         });
 
         logView = new TextView(this);
@@ -274,6 +312,59 @@ public class MainActivity extends Activity {
                     + "if(changed)location.reload();}catch(e){}})()";
             web.evaluateJavascript(js, null);
         } catch (Exception ignored) { }
+    }
+
+    private boolean hasLocationPermission() {
+        return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            || checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    @Override public void onRequestPermissionsResult(int req, String[] perms, int[] results) {
+        if (req != REQ_LOCATION || geoCallback == null) return;
+        geoCallback.invoke(geoOrigin, hasLocationPermission(), false);
+        geoCallback = null;
+        geoOrigin = null;
+    }
+
+    private void openExternal(String url) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(this, "No app can open " + url, Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /* Fetch the KML from the sniffer and open it with Google Earth (or any
+     * KML app). /live.kml is a NetworkLink to 127.0.0.1, so the app keeps
+     * polling the sniffer on this phone while it runs. */
+    private void openKml(String url) {
+        new Thread(() -> {
+            File dir = new File(getCacheDir(), "kml");
+            File f = new File(dir, "meshtastic-live.kml");
+            String err = null;
+            try {
+                dir.mkdirs();
+                HttpURLConnection h = (HttpURLConnection) new URL(url).openConnection();
+                h.setConnectTimeout(1000);
+                h.setReadTimeout(5000);
+                try (InputStream in = h.getInputStream(); FileOutputStream out = new FileOutputStream(f)) {
+                    byte[] buf = new byte[8192];
+                    for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
+                } finally { h.disconnect(); }
+            } catch (Exception e) { err = e.toString(); }
+            final String error = err;
+            ui.post(() -> {
+                if (error != null) { Toast.makeText(this, "KML: " + error, Toast.LENGTH_LONG).show(); return; }
+                Uri uri = androidx.core.content.FileProvider.getUriForFile(this, "org.meshsniffer.android.files", f);
+                Intent i = new Intent(Intent.ACTION_VIEW)
+                        .setDataAndType(uri, "application/vnd.google-earth.kml+xml")
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                try { startActivity(Intent.createChooser(i, "Open live KML with")); }
+                catch (ActivityNotFoundException e) {
+                    Toast.makeText(this, "Install Google Earth to open the live KML", Toast.LENGTH_LONG).show();
+                }
+            });
+        }).start();
     }
 
     private void showLog() {
