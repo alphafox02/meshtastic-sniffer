@@ -20,6 +20,7 @@
 #include "cot.h"
 #include "keyset.h"
 #include "share_url.h"
+#include "tx.h"
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -130,5 +131,6 @@ void c2_dispatch(const char *cmd, const char *body, c2_response_t *out)
     else if (!strcmp(cmd, "share_url"))     c2_share_url(body, out);
     else if (!strcmp(cmd, "extra_freq"))    c2_extra_freq(body, out);
     else if (!strcmp(cmd, "cot_multicast")) c2_cot_multicast(body, out);
+    else if (!strcmp(cmd, "tx_send"))       tx_send(body, out);   /* same form body as POST /api/tx */
     else respond(out, 404, "{\"error\":\"unknown cmd\"}");
 }

@@ -89,7 +89,7 @@ Single-binary wideband Meshtastic LoRa receiver. One SDR -> one wide IQ stream -
 | archive.{c,h} | daily-rotated gzipped JSONL archive (`meshtastic-YYYYMMDD.jsonl.gz`) for SIEM ingest |
 | geofence.{c,h} | INI-style polygon parser; ray-cast point-in-polygon; emits ENTRY/EXIT events |
 | announce.{c,h} | `--announce-to=URL` periodic POST of this sensor's registry entry to fusion |
-| c2.{c,h} | transport-independent C2 dispatch (`keys_add`, `share_url`, `extra_freq`, `cot_multicast`); shared between HTTP and DEALER paths |
+| c2.{c,h} | transport-independent C2 dispatch (`keys_add`, `share_url`, `extra_freq`, `cot_multicast`, `tx_send`); shared between HTTP and DEALER paths |
 | c2_dealer.{c,h} | outbound ZMQ DEALER socket (`--c2-dealer=tcp://fusion:7009`) for NAT-friendly C2; heartbeats + reply matching |
 | schema.{c,h} | static JSON Schema 2020-12 definition emitted by `--schema` |
 | scanner.{c,h} | wideband FFT, off-grid energy detector with occupied-BW estimate, spectrum snapshot |

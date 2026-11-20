@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -133,17 +134,27 @@ static int inline_hackrf(void)
 #endif
 }
 
+/* Clock correction for the transmitting HackRF. --tx-ppm wins; otherwise
+ * the sniffer's --ppm applies only when that same HackRF is the receiver
+ * (with another RX backend, --ppm describes that SDR, not the TX HackRF). */
+static double tx_ppm(void)
+{
+    double p = opt_tx_ppm_set ? opt_tx_ppm : (inline_hackrf() ? ppm_correction : 0.0);
+    return isfinite(p) ? p : 0.0;   /* strtod accepts "nan"/"inf" */
+}
+
 void tx_status_json(char *out, size_t cap)
 {
     const char *tool = opt_tx_enable ? tool_path() : NULL;
     snprintf(out, cap,
         "{\"enabled\":%s,\"tool\":%s,\"mode\":\"%s\",\"region\":\"%s\","
-        "\"from\":\"!%08x\",\"auth\":%s}",
+        "\"from\":\"!%08x\",\"ppm\":%g,\"auth\":%s}",
         opt_tx_enable ? "true" : "false",
         tool ? "true" : "false",
         inline_hackrf() ? "hackrf-inline" : "hackrf_transfer",
         opt_region ? opt_region : "US",
         opt_tx_enable ? from_node() : 0,
+        tx_ppm(),
         opt_api_token ? "true" : "false");
 }
 
@@ -483,7 +494,7 @@ void tx_send(const char *body, c2_response_t *out)
      * starting with '-' can't be taken for an option. */
     char a_keep[PATH_MAX + 8], a_rate[32], a_region[48], a_preset[40], a_psk[80],
          a_to[32], a_from[32], a_hop[24], a_gain[24], a_text[280], a_chan[32],
-         a_slot[24], a_long[64], a_short[24];
+         a_slot[24], a_long[64], a_short[24], a_ppm[40];
     snprintf(a_keep,   sizeof(a_keep),   "--keep=%s", workdir);
     snprintf(a_rate,   sizeof(a_rate),   "--rate=%d", TX_RATE_HZ);
     snprintf(a_region, sizeof(a_region), "--region=%s", opt_region ? opt_region : "US");
@@ -518,6 +529,11 @@ void tx_send(const char *body, c2_response_t *out)
     if (rq.slot >= 0) {
         snprintf(a_slot, sizeof(a_slot), "--slot=%d", rq.slot);
         argv[ac++] = a_slot;
+    }
+    double ppm = tx_ppm();
+    if (ppm != 0.0) {
+        snprintf(a_ppm, sizeof(a_ppm), "--ppm=%.6g", ppm);
+        argv[ac++] = a_ppm;
     }
     if (rq.long_name[0]) {
         snprintf(a_long, sizeof(a_long), "--long-name=%s", rq.long_name);

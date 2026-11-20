@@ -131,6 +131,8 @@ char *opt_api_token               = NULL;
 bool  opt_tx_enable               = false;
 char *opt_tx_tool                 = NULL;
 char *opt_tx_node                 = NULL;
+double opt_tx_ppm                 = 0.0;
+bool  opt_tx_ppm_set              = false;
 char *opt_pcap_path               = NULL;
 char *opt_pcap_fifo               = NULL;
 char *opt_psk_wordlist            = NULL;
@@ -293,6 +295,9 @@ void options_print_help(const char *prog)
         "                         next to the binary or in ./tools).\n"
         "  --tx-node=!AABBCCDD    node number to transmit as (default: random,\n"
         "                         fixed for the lifetime of the process).\n"
+        "  --tx-ppm=PPM           clock correction for the transmitting HackRF\n"
+        "                         (default: --ppm when --hackrf is also the\n"
+        "                         receiver, else 0).\n"
         "  --pcap=PATH            write received LoRa frames to PATH as a libpcap\n"
         "                         file (DLT_USER0=147). Use with tshark / Wireshark.\n"
         "  --pcap-fifo=PATH       like --pcap but creates PATH as a named pipe;\n"
@@ -415,7 +420,7 @@ int options_parse(int argc, char **argv)
         O_SELFTEST_REJECTION_TWOTONE, O_SELFTEST_REJECTION_OFFBIN,
         O_SELFTEST_REJECTION_PROCGAIN,
         O_LIST, O_SCHEMA,
-        O_TX, O_TX_TOOL, O_TX_NODE,
+        O_TX, O_TX_TOOL, O_TX_NODE, O_TX_PPM,
     };
     static const struct option longopts[] = {
         { "hackrf",     optional_argument, NULL, O_HACKRF },
@@ -467,6 +472,7 @@ int options_parse(int argc, char **argv)
         { "tx",         no_argument,       NULL, O_TX },
         { "tx-tool",    required_argument, NULL, O_TX_TOOL },
         { "tx-node",    required_argument, NULL, O_TX_NODE },
+        { "tx-ppm",     required_argument, NULL, O_TX_PPM },
         { "pcap",       required_argument, NULL, O_PCAP },
         { "pcap-fifo",  required_argument, NULL, O_PCAP_FIFO },
         { "psk-wordlist", required_argument, NULL, O_PSK_WORDLIST },
@@ -662,6 +668,7 @@ int options_parse(int argc, char **argv)
         case O_TX:         opt_tx_enable = true; break;
         case O_TX_TOOL:    opt_tx_tool = strdup(optarg); break;
         case O_TX_NODE:    opt_tx_node = strdup(optarg); break;
+        case O_TX_PPM:     opt_tx_ppm = strtod(optarg, NULL); opt_tx_ppm_set = true; break;
         case O_PCAP:       opt_pcap_path = strdup(optarg); break;
         case O_PCAP_FIFO:  opt_pcap_fifo = strdup(optarg); break;
         case O_PSK_WORDLIST: opt_psk_wordlist = strdup(optarg); break;
