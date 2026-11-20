@@ -22,6 +22,7 @@
 
 extern double samp_rate;
 extern double center_freq;
+extern double ppm_correction;
 extern int bias_tee;
 extern volatile sig_atomic_t running;
 
@@ -76,7 +77,7 @@ void *hackrf_backend_setup(const char *serial)
     if (r != HACKRF_SUCCESS)
         errx(1, "HackRF set_sample_rate: %s", hackrf_error_name(r));
 
-    r = hackrf_set_freq(dev, (uint64_t)center_freq);
+    r = hackrf_set_freq(dev, hackrf_ppm_tune_hz(center_freq, ppm_correction));
     if (r != HACKRF_SUCCESS)
         errx(1, "HackRF set_freq: %s", hackrf_error_name(r));
 
@@ -105,6 +106,9 @@ void *hackrf_backend_setup(const char *serial)
     fprintf(stderr, "HackRF: serial=%s sr=%.0f freq=%.0f lna=%d vga=%d amp=%d\n",
             serial ? serial : "(auto)", samp_rate, center_freq,
             hackrf_lna_gain, hackrf_vga_gain, hackrf_amp_enable);
+    if (ppm_correction != 0.0)
+        fprintf(stderr, "HackRF: PPM correction %.3f -> tuned to %llu Hz\n", ppm_correction,
+                (unsigned long long)hackrf_ppm_tune_hz(center_freq, ppm_correction));
 
     g_dev = dev;
     return dev;
@@ -244,7 +248,7 @@ restore:
     hackrf_set_txvga_gain(dev, 0);
     hackrf_set_amp_enable(dev, hackrf_amp_enable);
     hackrf_set_sample_rate(dev, samp_rate);
-    hackrf_set_freq(dev, (uint64_t)center_freq);
+    hackrf_set_freq(dev, hackrf_ppm_tune_hz(center_freq, ppm_correction));
     hackrf_set_lna_gain(dev, hackrf_lna_gain);
     hackrf_set_vga_gain(dev, hackrf_vga_gain);
     r = hackrf_start_rx(dev, hackrf_rx_cb, NULL);

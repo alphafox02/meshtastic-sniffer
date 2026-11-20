@@ -37,6 +37,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 import argparse
 import base64
 import json
+import math
 import os
 import random
 import shutil
@@ -116,6 +117,13 @@ def lookup_preset(name: str):
 # ---------------------------------------------------------------------------
 # Channel / frequency helpers (match firmware RadioInterface.cpp)
 # ---------------------------------------------------------------------------
+
+def ppm_tune_hz(f_hz: float, ppm: float) -> int:
+    """Frequency to program so the HackRF lands on f_hz despite a clock error
+    of ppm (positive = oscillator fast). Same formula and rounding as the
+    sniffer's RX tuning (hackrf_ppm_tune_hz in hackrf.h)."""
+    return int(math.floor(f_hz * (1.0 - ppm * 1e-6) + 0.5))
+
 
 def djb2(s: str) -> int:
     h = 5381
@@ -364,7 +372,8 @@ def main():
     g.add_argument("--if-offset", type=float, default=500e3,
                    help="put the signal this far from the LO to dodge the DC spur")
     g.add_argument("--ppm", type=float, default=0.0,
-                   help="HackRF clock correction (positive if the HackRF reads high)")
+                   help="HackRF clock correction in ppm (positive = oscillator runs fast; "
+                        "same convention and formula as the sniffer's --ppm)")
     g.add_argument("--tx-gain", type=int, default=20, help="TX VGA gain 0-47 dB")
     g.add_argument("--amp", action="store_true", help="enable the +14 dB RF amp")
     g.add_argument("--repeat", type=int, default=1, help="send N separate packets")
@@ -412,7 +421,7 @@ def main():
                  else random.randint(0x10000000, 0xFFFFFFFE))
     to_node = parse_node(args.to)
 
-    lo_freq = int(round((freq - args.if_offset) * (1 - args.ppm * 1e-6)))
+    lo_freq = ppm_tune_hz(freq - args.if_offset, args.ppm)
     hackrf = shutil.which("hackrf_transfer")
     if not args.dry_run and not hackrf:
         raise SystemExit("hackrf_transfer not found in PATH (install hackrf tools)")

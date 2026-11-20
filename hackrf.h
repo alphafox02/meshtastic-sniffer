@@ -28,4 +28,16 @@ int hackrf_tx_play(const int8_t *iq, size_t nbytes, uint64_t freq_hz,
 /* 1 while the sniffer has an open HackRF it is streaming from. */
 int hackrf_tx_available(void);
 
+#include <math.h>
+
+/* Frequency to program into the HackRF so it lands on f_hz despite a
+ * clock error of ppm (positive = oscillator runs fast). RX tuning and
+ * tools/meshtastic_tx.py (TX LO) use this same formula and rounding, so
+ * one --ppm moves both directions identically; tests/tx/params_check
+ * holds them together. */
+static inline uint64_t hackrf_ppm_tune_hz(double f_hz, double ppm)
+{
+    return (uint64_t)floor(f_hz * (1.0 - ppm * 1e-6) + 0.5);
+}
+
 #endif

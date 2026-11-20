@@ -32,6 +32,13 @@ if build gcc -std=gnu11 -O1 -I"$R" -o "$B/decode_harness" "$T/decode_harness.c" 
     run python3 "$T/frame_test.py" "$R" "$B/decode_harness"
 fi
 
+echo "### 1b. TX/RX parity: tool's presets, regions, slots, hashes, ppm == receiver's"
+if build gcc -std=gnu11 -Wall -Wextra -O1 -I"$R" -o "$B/params_check" "$T/params_check.c" \
+    "$R/keyset.c" "$R/meshtastic.c" "$R/mesh_packet.c" "$R/protobuf.c" "$R/recover/stubs.c" \
+    -lcrypto -lpthread -lm; then
+    run python3 "$T/params_check.py" "$R/tools/meshtastic_tx.py" "$B/params_check"
+fi
+
 echo "### 2. POST /api/tx + C2 tx_send handler (tx.c), fallback + inline HackRF modes"
 cat > "$B/fakebin/hackrf_transfer" <<'SH'
 #!/bin/bash
@@ -58,6 +65,16 @@ if command -v node >/dev/null; then
   run node "$T/js_tx_test.js" "$B/script0.js"
 else
   echo "(node not installed: skipped JS checks)"
+fi
+
+echo "### 4. real modulation round trip: gr-lora_sdr TX -> sniffer RX, every preset"
+BIN="${SNIFFER_BIN:-$R/build/meshtastic-sniffer}"
+if ! python3 -c "from gnuradio import lora_sdr; import numpy, cryptography" 2>/dev/null; then
+    echo "(gr-lora_sdr/numpy/cryptography not importable: skipped)"
+elif [ ! -x "$BIN" ]; then
+    echo "(no sniffer binary at $BIN; build first or set SNIFFER_BIN: skipped)"
+else
+    run bash "$T/round_trip.sh" "$R" "$BIN"
 fi
 
 [ $status -eq 0 ] && echo "### all TX tests passed" || echo "### TX tests FAILED"

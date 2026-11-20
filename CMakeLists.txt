@@ -406,17 +406,21 @@ target_link_libraries(focused_demo PRIVATE
     m)
 set_property(TARGET focused_demo PROPERTY C_STANDARD 99)
 
-# Offline transmit-path tests (tests/tx): no radio or gnuradio needed.
+# Transmit-path tests (tests/tx): no radio needed. The TX/RX round trip
+# through gr-lora_sdr runs when it is importable and is skipped otherwise.
 # Run with `make check_tx`, or `ctest -R tx_offline`.
 find_program(BASH_EXECUTABLE bash)
 if(BASH_EXECUTABLE)
     add_custom_target(check_tx
-        COMMAND ${BASH_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/tx/run_tests.sh ${PROJECT_SOURCE_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env SNIFFER_BIN=$<TARGET_FILE:meshtastic-sniffer>
+                ${BASH_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/tx/run_tests.sh ${PROJECT_SOURCE_DIR}
+        DEPENDS meshtastic-sniffer
         USES_TERMINAL
         COMMENT "Running offline TX tests (tests/tx)")
     enable_testing()
     add_test(NAME tx_offline
-        COMMAND ${BASH_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/tx/run_tests.sh ${PROJECT_SOURCE_DIR})
+        COMMAND ${CMAKE_COMMAND} -E env SNIFFER_BIN=$<TARGET_FILE:meshtastic-sniffer>
+                ${BASH_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/tx/run_tests.sh ${PROJECT_SOURCE_DIR})
 endif()
 
 # CPack
