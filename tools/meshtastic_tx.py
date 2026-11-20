@@ -3,9 +3,14 @@
 meshtastic_tx.py -- transmit a Meshtastic packet with a HackRF.
 
 Pipeline:
-  1. Build a meshtastic.Data protobuf (TEXT_MESSAGE_APP by default, optionally
-     preceded by a NODEINFO_APP packet so receivers show a name).
-  2. Encrypt it with AES-CTR using the channel PSK (Meshtastic nonce layout).
+  1. Build a meshtastic.Data protobuf: a text message (optionally a reply to
+     an earlier packet), or one of the app's node requests (position,
+     node info, telemetry, traceroute) with want_response set, optionally
+     preceded by a NODEINFO_APP packet so receivers show a name.
+  2. Encrypt it with AES-CTR using the channel PSK (Meshtastic nonce layout),
+     or, for a direct message to a node whose public key is known
+     (--dest-pubkey), with the firmware 2.5+ public-key scheme: X25519 +
+     SHA-256 + AES-256-CCM, channel hash 0 (--pki-key-file holds our key).
   3. Prepend the 16-byte over-the-air header (to/from/id/flags/hash/...).
   4. Modulate it with gr-lora_sdr (sync word 0x2B, explicit header, CRC on,
      16-symbol preamble, LDRO auto) at a HackRF-legal sample rate.
@@ -21,6 +26,18 @@ Examples:
 
   # Transmit on the default LongFast channel (US, slot 19 = 906.875 MHz)
   ./tools/meshtastic_tx.py --region US --text "hello mesh" --tx-gain 20
+
+  # Ask a node for its position / user info / telemetry / route
+  ./tools/meshtastic_tx.py --region US --kind position --to '!aabbccdd'
+  ./tools/meshtastic_tx.py --region US --kind traceroute --to '!aabbccdd'
+
+  # Public-key DM (firmware 2.5+ drops DMs sent with the channel key).
+  # The node needs our public key first: --announce-dest sends our NodeInfo.
+  ./tools/meshtastic_tx.py --region US --text "hi" --to '!aabbccdd' \\
+      --pki-key-file tx_key --dest-pubkey 'BASE64KEY=' --announce-dest
+
+  # Reply to a channel message whose packet id was 0x1a2b3c4d
+  ./tools/meshtastic_tx.py --region US --text "ack" --reply-id 0x1a2b3c4d
 
   # Private channel, also announce a name
   ./tools/meshtastic_tx.py --region EU_433 --channel MyChan \\
@@ -64,7 +81,21 @@ MESH_SYNC_WORD = 0x2B          # Meshtastic private sync word (SX126x 0x24B4)
 BROADCAST = 0xFFFFFFFF
 
 PORT_TEXT = 1
+PORT_POSITION = 3
 PORT_NODEINFO = 4
+PORT_TELEMETRY = 67
+PORT_TRACEROUTE = 70
+
+# --kind -> port. Everything except "text" is a request: unicast only, with
+# want_response set, answered by the target's firmware module of that port
+# (the same requests the Meshtastic apps send from a node's detail page).
+KINDS = {
+    "text": PORT_TEXT,
+    "position": PORT_POSITION,      # "Request position"
+    "nodeinfo": PORT_NODEINFO,      # "Exchange user info"
+    "telemetry": PORT_TELEMETRY,    # "Request telemetry" (device metrics)
+    "traceroute": PORT_TRACEROUTE,  # "Traceroute"
+}
 
 # name -> (display/channel name, SF, CR(5..8), BW sub-GHz, preamble)
 PRESETS = {
@@ -201,17 +232,100 @@ def pb_field_bytes(num: int, b: bytes) -> bytes:
     return pb_varint((num << 3) | 2) + pb_varint(len(b)) + b
 
 
-def data_envelope(port: int, payload: bytes) -> bytes:
-    """meshtastic.Data { portnum = 1; payload = 2; }"""
-    return pb_field_varint(1, port) + pb_field_bytes(2, payload)
+def pb_field_fixed32(num: int, v: int) -> bytes:
+    return pb_varint((num << 3) | 5) + struct.pack("<I", v & 0xFFFFFFFF)
 
 
-def user_protobuf(node_num: int, long_name: str, short_name: str) -> bytes:
-    """meshtastic.User { id=1; long_name=2; short_name=3; hw_model=5 }"""
-    return (pb_field_bytes(1, f"!{node_num:08x}".encode())
-            + pb_field_bytes(2, long_name.encode("utf-8"))
-            + pb_field_bytes(3, short_name.encode("utf-8"))
-            + pb_field_varint(5, 255))          # HardwareModel.PRIVATE_HW
+def data_envelope(port: int, payload: bytes, want_response: bool = False,
+                  request_id: int = 0, reply_id: int = 0) -> bytes:
+    """meshtastic.Data { portnum=1; payload=2; want_response=3;
+    request_id=6 (fixed32); reply_id=7 (fixed32) }"""
+    out = pb_field_varint(1, port) + pb_field_bytes(2, payload)
+    if want_response:
+        out += pb_field_varint(3, 1)
+    if request_id:
+        out += pb_field_fixed32(6, request_id)
+    if reply_id:
+        out += pb_field_fixed32(7, reply_id)
+    return out
+
+
+def request_payload(kind: str, user: bytes) -> bytes:
+    """Body of a node request, as the Meshtastic apps send it."""
+    if kind == "nodeinfo":
+        return user                 # our User; the target answers with its own
+    if kind == "telemetry":
+        return pb_field_bytes(2, b"")  # Telemetry { device_metrics = {} }
+    return b""                      # empty Position / RouteDiscovery
+
+
+def user_protobuf(node_num: int, long_name: str, short_name: str,
+                  public_key: bytes = b"") -> bytes:
+    """meshtastic.User { id=1; long_name=2; short_name=3; hw_model=5;
+    public_key=8 }"""
+    out = (pb_field_bytes(1, f"!{node_num:08x}".encode())
+           + pb_field_bytes(2, long_name.encode("utf-8"))
+           + pb_field_bytes(3, short_name.encode("utf-8"))
+           + pb_field_varint(5, 255))           # HardwareModel.PRIVATE_HW
+    if public_key:
+        out += pb_field_bytes(8, public_key)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Public-key (PKI) direct messages, firmware 2.5+ (src/mesh/CryptoEngine.cpp)
+# ---------------------------------------------------------------------------
+
+PKI_OVERHEAD = 12                       # CCM tag (8) + extra nonce (4)
+# Ports the firmware never PKI-encrypts (Router::perhapsEncode).
+PKI_EXCLUDED_PORTS = {PORT_TRACEROUTE, PORT_NODEINFO, 5, PORT_POSITION}
+
+
+def decode_key(s: str) -> bytes:
+    """32-byte key from base64 (standard or URL-safe) or 64 hex digits."""
+    s = s.strip()
+    if len(s) == 64 and all(c in "0123456789abcdefABCDEF" for c in s):
+        k = bytes.fromhex(s)
+    else:
+        s = s.replace("-", "+").replace("_", "/")
+        k = base64.b64decode(s + "=" * (-len(s) % 4))
+    if len(k) != 32:
+        raise SystemExit("key must be 32 bytes (base64 as shown in the app, or 64 hex digits)")
+    return k
+
+
+def pki_public_key(private_key: bytes) -> bytes:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    return X25519PrivateKey.from_private_bytes(private_key).public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
+def pki_shared_key(private_key: bytes, peer_public: bytes) -> bytes:
+    """SHA-256(X25519(ours, theirs)), as CryptoEngine::setDHPublicKey + hash."""
+    import hashlib
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (X25519PrivateKey,
+                                                                  X25519PublicKey)
+    secret = X25519PrivateKey.from_private_bytes(private_key).exchange(
+        X25519PublicKey.from_public_bytes(peer_public))
+    if secret == bytes(32):
+        raise SystemExit("destination public key is invalid (weak point)")
+    return hashlib.sha256(secret).digest()
+
+
+def pki_nonce(packet_id: int, from_node: int, extra_nonce: int) -> bytes:
+    """CryptoEngine::initNonce, first 13 bytes (CCM with L=2)."""
+    return (struct.pack("<I", packet_id) + struct.pack("<I", extra_nonce)
+            + struct.pack("<I", from_node) + b"\x00")
+
+
+def pki_encrypt(inner: bytes, shared: bytes, from_node: int, packet_id: int,
+                extra_nonce: int) -> bytes:
+    """ciphertext | tag(8) | LE32(extra_nonce), as encryptCurve25519."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESCCM
+    ct_tag = AESCCM(shared, tag_length=8).encrypt(
+        pki_nonce(packet_id, from_node, extra_nonce), inner, None)
+    return ct_tag + struct.pack("<I", extra_nonce)
 
 
 # ---------------------------------------------------------------------------
@@ -224,8 +338,12 @@ HEADER_LEN = 16
 
 def build_frame(inner: bytes, key: bytes, channel_name: str, from_node: int,
                 to_node: int, packet_id: int, hop_limit: int,
-                want_ack: bool) -> bytes:
-    if key:
+                want_ack: bool, pki_shared: bytes = b"",
+                extra_nonce: int = 0) -> bytes:
+    if pki_shared:
+        body = pki_encrypt(inner, pki_shared, from_node, packet_id,
+                           extra_nonce or random.randint(1, 0xFFFFFFFF))
+    elif key:
         nonce = (struct.pack("<Q", packet_id) + struct.pack("<I", from_node)
                  + b"\x00\x00\x00\x00")
         enc = Cipher(algorithms.AES(key), modes.CTR(nonce)).encryptor()
@@ -235,7 +353,8 @@ def build_frame(inner: bytes, key: bytes, channel_name: str, from_node: int,
 
     # flags: hop_limit[2:0] | want_ack[3] | via_mqtt[4] | hop_start[7:5]
     flags = (hop_limit & 7) | (0x08 if want_ack else 0) | ((hop_limit & 7) << 5)
-    chan_hash = xor_hash(channel_name.encode("utf-8")) ^ xor_hash(key)
+    # PKI packets carry channel hash 0 (Router::perhapsEncode).
+    chan_hash = 0 if pki_shared else xor_hash(channel_name.encode("utf-8")) ^ xor_hash(key)
 
     hdr = (struct.pack("<III", to_node, from_node, packet_id)
            + bytes([flags, chan_hash, 0x00, from_node & 0xFF]))  # next_hop, relay_node
@@ -344,7 +463,11 @@ def main():
         description="Transmit a Meshtastic packet with a HackRF.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     g = ap.add_argument_group("message")
-    g.add_argument("--text", required=True, help="text message to send")
+    g.add_argument("--kind", default="text", choices=list(KINDS),
+                   help="text message, or a request to the --to node (want_response)")
+    g.add_argument("--text", help="text message to send (--kind text)")
+    g.add_argument("--reply-id", default=None,
+                   help="packet id (0x...) this text replies to (Data.reply_id)")
     g.add_argument("--to", default="broadcast",
                    help="destination node (!aabbccdd, 0x..., or broadcast)")
     g.add_argument("--from-node", default=None,
@@ -353,6 +476,15 @@ def main():
     g.add_argument("--want-ack", action="store_true")
     g.add_argument("--long-name", help="also send a NodeInfo with this long name first")
     g.add_argument("--short-name", help="NodeInfo short name (<=4 chars)")
+    g.add_argument("--pki-key-file",
+                   help="file with our X25519 private key (base64): our NodeInfo then "
+                        "carries the public key, and --dest-pubkey DMs can be sent")
+    g.add_argument("--dest-pubkey",
+                   help="destination's public key (base64 or hex): encrypt the DM with "
+                        "the firmware 2.5+ public-key scheme instead of the channel key")
+    g.add_argument("--announce-dest", action="store_true",
+                   help="first send our NodeInfo (with our public key) to the --to node, "
+                        "which it needs before it can decrypt a public-key DM")
 
     g = ap.add_argument_group("channel / radio")
     g.add_argument("--region", default="US", help=", ".join(REGIONS))
@@ -421,6 +553,36 @@ def main():
                  else random.randint(0x10000000, 0xFFFFFFFE))
     to_node = parse_node(args.to)
 
+    if args.kind == "text":
+        if not args.text:
+            raise SystemExit("--text is required for --kind text")
+    else:
+        if to_node == BROADCAST:
+            raise SystemExit(f"--kind {args.kind} is a request to one node: pass --to !aabbccdd")
+        if args.text:
+            raise SystemExit("--text only applies to --kind text")
+    reply_id = int(args.reply_id, 0) & 0xFFFFFFFF if args.reply_id else 0
+    if reply_id and args.kind != "text":
+        raise SystemExit("--reply-id only applies to --kind text")
+
+    our_private = our_public = b""
+    if args.pki_key_file:
+        with open(args.pki_key_file) as f:
+            our_private = decode_key(f.read())
+        our_public = pki_public_key(our_private)
+    pki_shared = b""
+    if args.dest_pubkey:
+        if not our_private:
+            raise SystemExit("--dest-pubkey needs --pki-key-file")
+        if to_node == BROADCAST:
+            raise SystemExit("--dest-pubkey needs --to !aabbccdd (public-key DMs are unicast)")
+        if KINDS[args.kind] in PKI_EXCLUDED_PORTS:
+            log_later = f"--kind {args.kind} is never PKI-encrypted by the firmware; using the channel key"
+        else:
+            pki_shared = pki_shared_key(our_private, decode_key(args.dest_pubkey))
+    if args.announce_dest and to_node == BROADCAST:
+        raise SystemExit("--announce-dest needs --to !aabbccdd")
+
     lo_freq = ppm_tune_hz(freq - args.if_offset, args.ppm)
     hackrf = shutil.which("hackrf_transfer")
     if not args.dry_run and not hackrf:
@@ -431,20 +593,21 @@ def main():
     slot_txt = f" (slot {slot} of {n_slots})" if slot is not None else ""
     log(f"[tx] freq={freq / 1e6:.6f} MHz{slot_txt}  HackRF LO={lo_freq / 1e6:.6f} MHz "
           f"rate={args.rate / 1e6:g} Msps if_offset={args.if_offset / 1e3:g} kHz")
+    if args.dest_pubkey and not pki_shared:
+        log("[tx] " + log_later)
     log(f"[tx] from=!{from_node:08x} to="
           f"{'broadcast' if to_node == BROADCAST else f'!{to_node:08x}'} "
-          f"encryption={'AES-%d' % (len(key) * 8) if key else 'none'} "
+          f"encryption={'PKI (X25519 + AES-256-CCM)' if pki_shared else ('AES-%d' % (len(key) * 8) if key else 'none')} "
           f"chan_hash=0x{xor_hash(channel_name.encode()) ^ xor_hash(key):02x}")
 
     workdir = args.keep or tempfile.mkdtemp(prefix="meshtx_")
     os.makedirs(workdir, exist_ok=True)
 
-    def send(inner: bytes, label: str, idx: int):
+    def send(inner: bytes, label: str, idx: int, dest: int, want_ack: bool,
+             shared: bytes = b""):
         packet_id = random.randint(1, 0xFFFFFFFF)
-        frame = build_frame(inner, key, channel_name, from_node, to_node
-                            if label == "text" else BROADCAST,
-                            packet_id, args.hop_limit,
-                            args.want_ack and label == "text")
+        frame = build_frame(inner, key, channel_name, from_node, dest,
+                            packet_id, args.hop_limit, want_ack, shared)
         cf32 = os.path.join(workdir, f"{label}_{idx}_{packet_id:08x}.cf32")
         s8 = cf32[:-5] + ".s8"
         iq = modulate_frame(frame, sf, cr, bw, args.rate, preamble, cf32)
@@ -458,6 +621,7 @@ def main():
                 "tx": label, "s8": os.path.abspath(s8), "freq": freq,
                 "lo_freq": lo_freq, "rate": args.rate, "id": packet_id,
                 "from": from_node, "airtime_ms": int(t_air * 1000),
+                "pki": bool(shared),
             }), flush=True)
         if args.dry_run:
             keyspec = ("default" if key == MESH_DEFAULT_PSK
@@ -475,15 +639,27 @@ def main():
             sys.stderr.write(r.stdout)
             raise SystemExit("hackrf_transfer failed (is another program using the HackRF?)")
 
+    # Our User record: announced before the main packet when --long-name is
+    # given, and the body of a nodeinfo request (which needs a name anyway).
+    long_name = args.long_name or f"Meshtastic {from_node & 0xFFFF:04x}"
+    short_name = args.short_name or (args.long_name[:4] if args.long_name
+                                     else f"{from_node & 0xFFFF:04x}")
+    user = user_protobuf(from_node, long_name, short_name, our_public)
+
     for i in range(args.repeat):
-        if args.long_name:
-            short = args.short_name or args.long_name[:4]
-            send(data_envelope(PORT_NODEINFO,
-                               user_protobuf(from_node, args.long_name, short)),
-                 "nodeinfo", i)
+        # One NodeInfo ahead of the main packet: to the destination when it
+        # needs our public key (--announce-dest), else broadcast for a name.
+        if (args.announce_dest or args.long_name) and args.kind != "nodeinfo":
+            send(data_envelope(PORT_NODEINFO, user), "nodeinfo", i,
+                 to_node if args.announce_dest else BROADCAST, False)
             if not args.dry_run:
                 time.sleep(1.0)
-        send(data_envelope(PORT_TEXT, args.text.encode("utf-8")), "text", i)
+        if args.kind == "text":
+            inner = data_envelope(PORT_TEXT, args.text.encode("utf-8"), reply_id=reply_id)
+        else:
+            inner = data_envelope(KINDS[args.kind], request_payload(args.kind, user),
+                                  want_response=True)
+        send(inner, args.kind, i, to_node, args.want_ack, pki_shared)
         if i + 1 < args.repeat:
             time.sleep(args.interval)
 

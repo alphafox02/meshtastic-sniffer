@@ -34,5 +34,35 @@ for line in sys.stdin:
         echo "FAIL $region $preset: sniffer decoded '${got:-nothing}'"; fails=$((fails + 1))
     fi
 done
+# Node requests and a text reply, through real modulation: the sniffer's
+# JSON must show the request (want_response, unicast) and the reply_id.
+for kind in position telemetry traceroute nodeinfo reply; do
+    if [ "$kind" = reply ]; then
+        args=(--text "re" --reply-id 0x1a2b3c4d); want='"reply_id": 439041101'
+    else
+        args=(--kind "$kind" --to '!aabbccdd'); want='"want_response": true'
+    fi
+    out="$(python3 "$R/tools/meshtastic_tx.py" --region US --preset MEDIUM_FAST "${args[@]}" \
+           --dry-run --keep "$W/req_$kind" 2>&1)"
+    read -r -a verify <<< "$(printf '%s\n' "$out" | sed -n 's/.*verify: meshtastic-sniffer //p' | head -1)"
+    got="$(timeout 180 "$BIN" "${verify[@]}" 2>/dev/null | python3 -c '
+import json, sys
+for line in sys.stdin:
+    try: d = json.loads(line)
+    except ValueError: continue
+    if d.get("payload_crc_ok") and "port_name" in d:
+        print(json.dumps({k: d.get(k) for k in ("port_name", "to", "want_response", "reply_id")})); break')"
+    port="$(printf '%s' "$got" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read() or "{}").get("port_name",""))')"
+    ok=1
+    [ "$kind" = position ] && [ "$port" != POSITION_APP ] && ok=0
+    [ "$kind" = telemetry ] && [ "$port" != TELEMETRY_APP ] && ok=0
+    [ "$kind" = traceroute ] && [ "$port" != TRACEROUTE_APP ] && ok=0
+    [ "$kind" = nodeinfo ] && [ "$port" != NODEINFO_APP ] && ok=0
+    [ "$kind" = reply ] && [ "$port" != TEXT_MESSAGE_APP ] && ok=0
+    [ "$kind" != reply ] && [[ "$got" != *'"to": "!aabbccdd"'* ]] && ok=0
+    [[ "$got" != *"$want"* ]] && ok=0
+    if [ $ok = 1 ]; then echo "ok   $kind -> $got"
+    else echo "FAIL $kind: sniffer decoded '${got:-nothing}'"; fails=$((fails + 1)); fi
+done
 echo "FAILS: $fails"
 exit $((fails > 0))

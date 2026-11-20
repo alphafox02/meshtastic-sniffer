@@ -61,20 +61,113 @@ When a worker can't keep up with the live sample rate, it disarms itself and cou
 - [meshtastic-recover](recover/) — offline PSK recovery from captured pcaps. OpenMP-parallel; a hashcat custom-mode plugin handles GPU.
 - [meshtastic-fusion](fusion/) — multi-station aggregator (Go). Subscribes to N sniffer ZMQ feeds, runs hyperbolic-TDOA when 3+ time-disciplined stations hear the same packet.
 - [meshtastic-wardrive](wardrive/) — mobile single-node capture (Go). SDR + GPS + SQLite + KML/KMZ/CSV/JSON exports.
-- [tools/meshtastic_tx.py](tools/meshtastic_tx.py) — transmit Meshtastic text (and optional NodeInfo) packets with a HackRF. Builds and encrypts the frame, modulates it with gr-lora_sdr (sync word 0x2B, preset SF/BW/CR, firmware channel-slot hashing) and plays it with `hackrf_transfer`. Use `--dry-run` to write a `.cf32` you can decode with `--file=` first. The HackRF is half-duplex, so stop the sniffer before transmitting, and only transmit on channels you operate.
+- [tools/meshtastic_tx.py](tools/meshtastic_tx.py) — transmit Meshtastic packets with a HackRF: text messages (optionally as a reply, `--reply-id`, and as public-key DMs, `--pki-key-file` + `--dest-pubkey`), the apps' node requests (`--kind position|nodeinfo|telemetry|traceroute --to !aabbccdd`), and an optional NodeInfo announcement. Builds and encrypts the frame, modulates it with gr-lora_sdr (sync word 0x2B, preset SF/BW/CR, firmware channel-slot hashing) and plays it with `hackrf_transfer`. Use `--dry-run` to write a `.cf32` you can decode with `--file=` first. The HackRF is half-duplex, so stop the sniffer before transmitting, and only transmit on channels you operate.
 
   ```bash
   ./tools/meshtastic_tx.py --region US --text "hello mesh" --dry-run
   ./tools/meshtastic_tx.py --region US --text "hello mesh" --tx-gain 20 \
       --long-name "Sniffer TX" --short-name STX
+  ./tools/meshtastic_tx.py --region US --kind traceroute --to '!aabbccdd' --tx-gain 20
   ```
 
-  **Dashboard send box.** Start the sniffer with `--tx` (plus `--api-token` if the dashboard is reachable by anyone else) and a Send box appears in the Messages pane. Channel, PSK, preset, destination, gain and NodeInfo name are set under Config → Transmit. With `--hackrf`, reception pauses for about a second per packet while the same HackRF transmits, then resumes. With any other backend, a second HackRF is driven through `hackrf_transfer`. The sniffer transmits as one fixed node ID per run (`--tx-node=!aabbccdd` to choose it). Sends are at least 3 s apart. `--tx-ppm=PPM` corrects the transmitting HackRF's clock (by default the sniffer's `--ppm` is used when the same HackRF also receives). A C2 controller can send too, with the `tx_send` command and the same form body as `POST /api/tx`. `make check_tx` runs the TX tests (no radio needed). They include a TX/RX parity check (the tool's presets, region band plans, every channel-slot frequency, channel hashes, key expansion and ppm tuning must equal the receiver's) and, when gr-lora_sdr is installed, a round trip that modulates every preset and decodes it with the sniffer's own demodulator.
+  The sniffer can also transmit from its web dashboard: see [Transmit mode](#transmit-mode-hackrf) below.
+
+---
+
+## Transmit mode (HackRF)
+
+With `--tx` the sniffer becomes a Meshtastic node you drive from the web dashboard: it sends channel messages and replies, direct messages (end-to-end encrypted with the firmware 2.5+ public-key scheme), and the node requests of the Meshtastic apps (position, node info, telemetry, traceroute), and it matches and decodes the answers. Frames are built and modulated by [tools/meshtastic_tx.py](tools/meshtastic_tx.py) (gr-lora_sdr) and played on a HackRF.
+
+Only transmit on channels you operate, within your region's power and duty-cycle limits (EU_868 869.4–869.65 MHz: 10% duty cycle, up to 500 mW ERP).
+
+### Requirements
+
+- A HackRF One. Either the sniffer's own receiver (`--hackrf`: reception pauses for about a second per packet while it transmits), or a second HackRF next to any other receiver, driven through `hackrf_transfer`.
+- `python3` with gnuradio + [gr-lora_sdr](https://github.com/tapparelj/gr-lora_sdr), `numpy` and `python3-cryptography` (X25519 / AES-CCM for public-key DMs), and the `hackrf` tools. DragonOS ships all of them.
+- If gr-lora_sdr was built into `~/.local`, the library path must be set for the sniffer (it runs the tool): `export LD_LIBRARY_PATH=$HOME/.local/lib/x86_64-linux-gnu` (or add that directory to `/etc/ld.so.conf.d/` and run `ldconfig`).
+
+Check the chain before going on air: `make check_tx` runs the transmit tests without a radio, including the firmware's own public-key test vectors and, when gr-lora_sdr is importable, a modulate→demodulate round trip of every preset.
+
+### Launch
+
+The full command, as tested on EU_868 MediumFast against a Meshtastic 2.x node (values for that HackRF; adjust region, preset, gains and ppm to yours):
+
+```bash
+export LD_LIBRARY_PATH=$HOME/.local/lib/x86_64-linux-gnu     # only if gr-lora_sdr is in ~/.local
+mkdir -p ~/.config/meshtastic-sniffer && chmod 700 ~/.config/meshtastic-sniffer
+openssl rand -hex 16 > ~/.config/meshtastic-sniffer/api_token  # once; paste it in Config -> Transmit
+
+./build/meshtastic-sniffer \
+  --hackrf --rate=2000000 --center=869000000 \
+  --region=EU_868 --presets=MediumFast \
+  --hackrf-lna=40 --hackrf-vga=30 --ppm=13 \
+  --keys=default \
+  --scan-and-decode --show-untrusted \
+  --web=8889 \
+  --tx --tx-node='!18bbc790' --tx-key=$HOME/.config/meshtastic-sniffer/tx_key \
+  --api-token="$(cat ~/.config/meshtastic-sniffer/api_token)"
+```
+
+Then open `http://localhost:8889`, go to **Config → Transmit**, paste the API token, set the channel to match the nodes you want to reach (name, PSK, preset) and a TX gain, and **Save**.
+
+| Parameter | What it does | Notes |
+|---|---|---|
+| `--hackrf` | Receive with the HackRF; with `--tx` the same HackRF also transmits | With another receiver (`--usrp`, `--rtlsdr`...), `--tx` drives a second HackRF via `hackrf_transfer` |
+| `--rate=2000000` | 2 Msps | TX always uses 2 Msps |
+| `--center=869000000` | RX centre frequency | Keep it off the channel: the HackRF's DC spike sits at the centre (869.0 MHz for the EU_868 channel at 869.525) |
+| `--region=EU_868` | Band plan (channel slot frequencies) | Also the TX band unless `--tx-region` is set |
+| `--presets=MediumFast` | Modem presets to decode | `all` scans every preset; the Send settings pick the TX preset |
+| `--hackrf-lna=40 --hackrf-vga=30` | RX gains | The default `--gain` mapping (LNA 24 / VGA 16) decoded nothing on this HackRF |
+| `--ppm=13` | Clock correction, RX and (on the same HackRF) TX | This HackRF runs +13 ppm fast; measure yours |
+| `--keys=default` | Channel keys for decoding (`default` = `AQ==`) | Add your channels: `--keys='MyChan=base64:...'` or `--keys-file` |
+| `--scan-and-decode --show-untrusted` | Decode the grid and show CRC-failed frames too | Optional; `--trusted-only` gives a clean feed |
+| `--web=8889` | Dashboard and `/api/*` | |
+| `--tx` | Enables transmit (Send box, node actions, `POST /api/tx`, C2 `tx_send`) | Off by default |
+| `--tx-node='!18bbc790'` | Node number we transmit as | Default: random per run. Keep it fixed so nodes recognise you |
+| `--tx-key=PATH` | Our X25519 private key (base64), created with mode 0600 if missing | **Needed for DMs.** Keep the same file with the same `--tx-node`: firmware refuses a known node whose key changed. Default: a new key per run |
+| `--tx-region=NAME` | Transmit band, if different from `--region` | e.g. receive `US`, transmit `EU_868` on a second HackRF. Sub-GHz only |
+| `--tx-ppm=PPM` | Clock correction of the transmitting HackRF | Default: `--ppm` when the same HackRF receives, else 0 |
+| `--tx-tool=PATH` | Path to `meshtastic_tx.py` | Default: found next to the binary or in `./tools` |
+| `--api-token=SECRET` | Requires `Authorization: Bearer SECRET` on every `POST /api/*` | **Strongly recommended with `--tx`**: anyone who can reach the dashboard could otherwise transmit |
+
+At startup the sniffer prints its TX identity: `[tx] transmitting as !18bbc790, PKI public key p5Eb...UTA= (...tx_key)`. The dashboard's Config → Transmit shows the same.
+
+### Using it
+
+- **Channel messages:** the Send box in the Messages pane. Each received text has a **↩** button: a channel message is answered in the channel (broadcast with `reply_id`), a direct message back to its sender.
+- **Node actions:** click a node in the Nodes table. Its drawer has an **Interact** section: a DM box, **Request position**, **Exchange node info**, **Request telemetry**, **Traceroute**, and "request ACK". Answers are matched on `request_id` and shown in the drawer and the Messages pane (green RX badge): the position, user info or telemetry, the traceroute path both ways with per-hop SNR, routing ACKs and NAKs with their reason, and a note when a neighbour rebroadcasts your packet.
+- **Direct messages (public key).** Firmware 2.5+ drops DMs encrypted with the channel key, so DMs use the firmware's PKI scheme (X25519 + SHA-256 + AES-256-CCM, channel hash 0). The sniffer needs the node's public key: it learns it from the node's NodeInfo (**Exchange node info** asks for it), or paste it from the Meshtastic app into the drawer. The drawer says whether the key is known. Before the first encrypted DM to a node, the sniffer sends it our NodeInfo with our public key, which the node needs to decrypt. Telemetry requests are encrypted the same way; traceroute, node info and position requests never are (as in the firmware). Answers the node encrypts to us are decrypted with our key and shown with a 🔒 (`pki_encrypted: true`, `channel_name: "PKI"` in the JSON).
+- **API:** the dashboard is a client of `POST /api/tx` (form body; header `X-Mesh-Tx: 1` and the bearer token). C2 `tx_send` takes the same body.
 
   ```bash
-  ./build/meshtastic-sniffer --hackrf --region US --keys=default --web=8888 \
-      --tx --api-token="$(openssl rand -hex 16)"
+  TOKEN=$(cat ~/.config/meshtastic-sniffer/api_token)
+  tx() { curl -s -X POST -H 'X-Mesh-Tx: 1' -H "Authorization: Bearer $TOKEN" --data "$1" localhost:8889/api/tx; echo; }
+  CH='preset=MEDIUM_FAST&channel=MediumFast&psk=AQ%3D%3D&gain=25'
+  tx "kind=nodeinfo&to=!433ba574&ack=1&long_name=Sniffer%20TX&short_name=STX&$CH"  # swap keys
+  tx "kind=text&text=hello&to=!433ba574&ack=1&$CH"                                   # PKI DM
+  tx "kind=telemetry&to=!433ba574&ack=1&$CH"
+  tx "kind=traceroute&to=!433ba574&$CH"
+  tx "kind=text&text=re&reply_id=1a2b3c4d&$CH"                                       # reply in channel
   ```
+
+  Fields: `kind` (`text` default, `position`, `nodeinfo`, `telemetry`, `traceroute`), `text`, `to` (`!aabbccdd` or `broadcast`), `reply_id` (hex packet id), `ack=1` (want_ack), `pubkey` (destination's public key, base64 or hex), `channel`, `psk`, `preset`, `slot`, `gain` (0–47), `amp=1`, `hop` (0–7), `long_name`, `short_name`. The reply has `id` (to match answers on `request_id`), `pki`, and a `warning` when a DM had to go out without a known key. Sends are at least 3 s apart.
+
+### What to expect from real nodes
+
+Tested on air (HackRF One, EU_868 MediumFast, Meshtastic 2.x node at about 27 dB SNR):
+
+| Action | Result |
+|---|---|
+| Public-key DM | Delivered (routing ACK). The same node refuses a channel-key DM with `NO_CHANNEL` |
+| DM from the node to us | Arrives PKI-encrypted and is decrypted by the sniffer (shown with 🔒) |
+| Exchange node info | The node answers with its NodeInfo, including its public key (firmware throttles repeats to one every few minutes) |
+| Request telemetry | Answered, PKI-encrypted to us and decrypted by the sniffer |
+| Traceroute | Answered; a direct link shows the SNR at which the node heard us |
+| Request position | `NO_RESPONSE` when the node doesn't share its position on that channel (position precision 0) |
+
+If DMs stop being ACKed after a restart, the node probably holds an older key for our node number (a new `--tx-key` with an old `--tx-node`): keep both fixed, or pick a new `--tx-node`. If it doesn't have our key yet, use **Exchange node info**.
+
+**What TX can't set:** SF/CR/BW outside the presets, sync word (0x2B), preamble (16), explicit header + CRC, LDRO (automatic). The 2 Msps TX rate, region and ppm are fixed at start-up. LORA_24 (2.4 GHz) is RX-only, and 500 kHz presets don't fit EU_868.
 
 ---
 

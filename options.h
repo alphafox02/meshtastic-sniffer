@@ -181,6 +181,8 @@ extern char *opt_tx_tool;                /* path to tools/meshtastic_tx.py; NULL
 extern char *opt_tx_node;                /* "!aabbccdd" to transmit as; NULL = random */
 extern double opt_tx_ppm;                /* --tx-ppm: TX HackRF clock correction */
 extern bool  opt_tx_ppm_set;             /* --tx-ppm given (else inherit --ppm inline) */
+extern char *opt_tx_key;                 /* --tx-key: PKI private key file; NULL = per-run key */
+extern char *opt_tx_region;              /* --tx-region: TX band; NULL = --region */
 extern char *opt_pcap_path;              /* path to pcap file; NULL = disabled */
 extern char *opt_pcap_fifo;              /* path to pcap fifo; NULL = disabled */
 extern char *opt_psk_wordlist;           /* path to wordlist; NULL = disabled */

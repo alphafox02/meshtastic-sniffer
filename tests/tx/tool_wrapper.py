@@ -63,9 +63,14 @@ ciph = types.ModuleType("cryptography.hazmat.primitives.ciphers")
 ciph.Cipher = _Cipher
 ciph.algorithms = types.SimpleNamespace(AES=_Alg)
 ciph.modes = types.SimpleNamespace(CTR=_CTR)
-for name in ["cryptography", "cryptography.hazmat", "cryptography.hazmat.primitives"]:
-    sys.modules[name] = types.ModuleType(name)
-sys.modules["cryptography.hazmat.primitives.ciphers"] = ciph
+try:  # use the real library when installed (needed for public-key DMs)
+    import cryptography.hazmat.primitives.ciphers.aead  # noqa: F401
+    HAVE_CRYPTO = True
+except ImportError:
+    HAVE_CRYPTO = False
+    for name in ["cryptography", "cryptography.hazmat", "cryptography.hazmat.primitives"]:
+        sys.modules[name] = types.ModuleType(name)
+    sys.modules["cryptography.hazmat.primitives.ciphers"] = ciph
 
 spec = importlib.util.spec_from_file_location("mtx", os.environ["REAL_TOOL"])
 m = importlib.util.module_from_spec(spec)

@@ -28,7 +28,7 @@ build() {
 echo "### 1. frames from meshtastic_tx.py decode in the sniffer's C decoder"
 if build gcc -std=gnu11 -O1 -I"$R" -o "$B/decode_harness" "$T/decode_harness.c" \
     "$R/mesh_packet.c" "$R/keyset.c" "$R/meshtastic.c" "$R/protobuf.c" "$R/recover/stubs.c" \
-    -lcrypto -lpthread -lm; then
+    "$R/pki.c" -lcrypto -lpthread -lm; then
     run python3 "$T/frame_test.py" "$R" "$B/decode_harness"
 fi
 
@@ -37,6 +37,13 @@ if build gcc -std=gnu11 -Wall -Wextra -O1 -I"$R" -o "$B/params_check" "$T/params
     "$R/keyset.c" "$R/meshtastic.c" "$R/mesh_packet.c" "$R/protobuf.c" "$R/recover/stubs.c" \
     -lcrypto -lpthread -lm; then
     run python3 "$T/params_check.py" "$R/tools/meshtastic_tx.py" "$B/params_check"
+fi
+
+echo "### 1c. public-key DMs: pki.c vs the firmware's crypto test vectors"
+if build gcc -std=gnu11 -Wall -Wextra -O1 -I"$R" -o "$B/test_pki" "$T/test_pki.c" "$R/pki.c" \
+    "$R/mesh_packet.c" "$R/keyset.c" "$R/meshtastic.c" "$R/protobuf.c" "$R/recover/stubs.c" \
+    -lcrypto -lpthread -lm; then
+    run "$B/test_pki"
 fi
 
 echo "### 2. POST /api/tx + C2 tx_send handler (tx.c), fallback + inline HackRF modes"
@@ -53,7 +60,7 @@ for variant in fallback inline; do
   defs=""; [ "$variant" = inline ] && defs="-DHAVE_HACKRF"
   echo "-- $variant"
   if build gcc -std=gnu11 -Wall -Wextra -O1 $defs -I"$R" -o "$B/test_tx_$variant" \
-      "$T/test_tx.c" "$R/c2.c" -lpthread; then
+      "$T/test_tx.c" "$R/c2.c" "$R/meshtastic.c" "$R/pki.c" -lcrypto -lpthread -lm; then
     run "$B/test_tx_$variant" "$T/tool_wrapper.py"
   fi
 done

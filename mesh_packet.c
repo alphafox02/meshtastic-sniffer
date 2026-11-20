@@ -39,6 +39,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+static mesh_pki_decrypt_fn g_pki_decrypt;
+
+void mesh_packet_set_pki_decrypt(mesh_pki_decrypt_fn fn)
+{
+    g_pki_decrypt = fn;
+}
+
 static uint32_t rd_le32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
@@ -231,7 +238,22 @@ int mesh_packet_decode_with_radio(const uint8_t *frame, size_t frame_len,
      * read lock for the lookup-and-decrypt sequence so a concurrent
      * /api/keys POST can't move bucket entries out from under us. */
     bool emitted = false;
-    if (keys) {
+    /* Public-key DM (firmware 2.5+): channel byte 0, unicast. */
+    mesh_pki_decrypt_fn pki = g_pki_decrypt;
+    if (pki && ev.header.channel == 0 && ev.header.to != 0xFFFFFFFFu && cipher_len > 12) {
+        uint8_t plain[512];
+        int n = pki(ev.header.from, ev.header.to, ev.header.packet_id,
+                    cipher, cipher_len, plain, sizeof(plain));
+        mesh_event_t cand = ev;
+        if (n > 0 && parse_data_envelope(plain, (size_t)n, &cand) && cand.portnum != 0) {
+            cand.decrypted = true;
+            cand.pki_encrypted = true;
+            strncpy(cand.channel_name, "PKI", sizeof(cand.channel_name) - 1);
+            if (cb) cb(&cand, user);
+            emitted = true;
+        }
+    }
+    if (keys && !emitted) {
         keyset_rdlock((keyset_t *)keys);
         const int8_t *bucket = keyset_lookup(keys, ev.header.channel);
         uint8_t nonce[16];

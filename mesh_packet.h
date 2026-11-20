@@ -32,6 +32,7 @@ typedef struct mesh_event {
     /* Decryption metadata */
     bool           decrypted;
     char           channel_name[32];   /* matched key entry; "" if none matched */
+    bool           pki_encrypted;      /* decrypted with a public-key (PKI) DM key */
 
     /* Reception quality (filled in by the LoRa demod via lora_frame_meta_t,
      * 0/0 when frame originates from a non-LoRa source like the selftest). */
@@ -142,5 +143,14 @@ int mesh_packet_decode_with_radio(const uint8_t *frame, size_t frame_len,
                                   int sf, int cr, int bw_hz,
                                   const keyset_t *keys,
                                   mesh_event_cb_t cb, void *user);
+
+/* Optional public-key (PKI) decrypt hook, tried for unicast frames whose
+ * channel-hash byte is 0 before the channel keys. Returns the plaintext
+ * length, or -1 if it can't decrypt (not ours / unknown sender key / bad
+ * tag). NULL (the default) disables it; the TX path installs pki.c's. */
+typedef int (*mesh_pki_decrypt_fn)(uint32_t from, uint32_t to, uint32_t packet_id,
+                                   const uint8_t *body, size_t n,
+                                   uint8_t *out, size_t cap);
+void mesh_packet_set_pki_decrypt(mesh_pki_decrypt_fn fn);
 
 #endif

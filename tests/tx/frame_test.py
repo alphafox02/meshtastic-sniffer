@@ -49,9 +49,14 @@ ciph = types.ModuleType("cryptography.hazmat.primitives.ciphers")
 ciph.Cipher = _Cipher
 ciph.algorithms = types.SimpleNamespace(AES=_Alg)
 ciph.modes = types.SimpleNamespace(CTR=_CTR)
-for name in ["cryptography", "cryptography.hazmat", "cryptography.hazmat.primitives"]:
-    sys.modules[name] = types.ModuleType(name)
-sys.modules["cryptography.hazmat.primitives.ciphers"] = ciph
+try:  # use the real library when installed (needed for public-key DMs)
+    import cryptography.hazmat.primitives.ciphers.aead  # noqa: F401
+    HAVE_CRYPTO = True
+except ImportError:
+    HAVE_CRYPTO = False
+    for name in ["cryptography", "cryptography.hazmat", "cryptography.hazmat.primitives"]:
+        sys.modules[name] = types.ModuleType(name)
+    sys.modules["cryptography.hazmat.primitives.ciphers"] = ciph
 
 spec = importlib.util.spec_from_file_location("mtx", REPO + "/tools/meshtastic_tx.py")
 m = importlib.util.module_from_spec(spec)
@@ -114,6 +119,55 @@ cases = [
           relay="cd", dec=1, chan="LongFast", port=4, payload=user.hex())),
 ]
 
+# node requests (want_response) and a text reply (reply_id)
+for kind, port in [("position", 3), ("nodeinfo", 4), ("telemetry", 67), ("traceroute", 70)]:
+    body = m.request_payload(kind, user)
+    cases.append(("LongFast=default",
+                  m.build_frame(m.data_envelope(m.KINDS[kind], body, want_response=True),
+                                m.MESH_DEFAULT_PSK, "LongFast", 0x1234ABCD, 0xAABBCCDD,
+                                0x100 + port, 3, True),
+                  dict(frm="1234abcd", to="aabbccdd", pid=f"{0x100 + port:08x}", hl=3, hs=3,
+                       ack=1, relay="cd", dec=1, chan="LongFast", port=port,
+                       payload=body.hex(), want_resp=1, req="00000000", reply="00000000")))
+check(m.request_payload("telemetry", user) == bytes([0x12, 0x00]),
+      "telemetry request = Telemetry{device_metrics={}}")
+check(m.request_payload("position", user) == b"" and m.request_payload("traceroute", user) == b"",
+      "position / traceroute requests have empty bodies")
+cases.append(("LongFast=default",
+              m.build_frame(m.data_envelope(1, b"ok", reply_id=0x1A2B3C4D, request_id=0x55),
+                            m.MESH_DEFAULT_PSK, "LongFast", 0x1234ABCD, m.BROADCAST, 0x99, 3, False),
+              dict(frm="1234abcd", to="ffffffff", pid="00000099", hl=3, hs=3, ack=0, relay="cd",
+                   dec=1, chan="LongFast", port=1, payload=b"ok".hex(), want_resp=0,
+                   req="00000055", reply="1a2b3c4d")))
+
+# public-key DMs (firmware 2.5+), only with the real cryptography library
+if HAVE_CRYPTO:
+    # the firmware's own test_PKC packet, re-encrypted by the tool with the
+    # packet's extra nonce, must be byte-identical
+    fw_priv = bytes.fromhex("a00330633e63522f8a4d81ec6d9d1e6617f6c8ffd3a4c698229537d44e522277")
+    fw_pub = bytes.fromhex("db18fc50eea47f00251cb784819a3cf5fc361882597f589f0d7ff820e8064457")
+    fw_radio = bytes.fromhex("8c646d7a2909000062d6b2136b00000040df24abfcc30a17a3d9046726099e796a1c036a792b")
+    shared = m.pki_shared_key(fw_priv, fw_pub)
+    check(shared[:8].hex() == "777b1545c9d6f9a2", "tool: firmware test_PKC shared key")
+    check(m.pki_encrypt(bytes.fromhex("08011204746573744800"), shared, 0x0929, 0x13b2d662,
+                        0x2b796a03) == fw_radio[16:],
+          "tool: encrypts the firmware's test_PKC packet byte for byte")
+    # tool -> C: a DM from A to B, decrypted by B's key in the C decoder
+    a_priv, b_priv = bytes(range(1, 33)), bytes(range(33, 65))
+    a_pub, b_pub = m.pki_public_key(a_priv), m.pki_public_key(b_priv)
+    dm = m.data_envelope(1, "secret dm".encode(), reply_id=0x42)
+    frame = m.build_frame(dm, m.MESH_DEFAULT_PSK, "LongFast", 0x1234ABCD, 0xAABBCCDD,
+                          0x5150, 3, True, m.pki_shared_key(a_priv, b_pub))
+    check(frame[13] == 0 and len(frame) == 16 + len(dm) + 12, "PKI frame: channel hash 0, +12 bytes")
+    cases.append((f"pki:{b_priv.hex()}:{a_pub.hex()}:aabbccdd:1234abcd", frame,
+                  dict(frm="1234abcd", to="aabbccdd", pid="00005150", hl=3, hs=3, ack=1,
+                       relay="cd", dec=1, chan="PKI", port=1, payload="secret dm".encode().hex(),
+                       want_resp=0, req="00000000", reply="00000042")))
+    u = m.user_protobuf(0x1234ABCD, "Sniffer TX", "STX", a_pub)
+    check(u.endswith(bytes([0x42, 32]) + a_pub), "NodeInfo carries public_key (User field 8)")
+else:
+    print("(python3-cryptography not installed: PKI checks skipped)")
+
 inp = "".join(f"{spec}\t{frame.hex()}\n" for spec, frame, _ in cases)
 out = subprocess.run([HARNESS], input=inp, capture_output=True, text=True,
                      check=True).stdout.splitlines()
@@ -130,6 +184,9 @@ for (spec, frame, e), line in zip(cases, out):
           tag + " decrypted with the right channel key")
     check(f.get("port") == str(e["port"]) and f.get("payload") == e["payload"],
           tag + " portnum + payload")
+    if "want_resp" in e:
+        check(f.get("want_resp") == str(e["want_resp"]) and f.get("req") == e["req"]
+              and f.get("reply") == e["reply"], tag + " want_response / request_id / reply_id")
 check(len(out) == len(cases), "decoder emitted one event per frame")
 print("FAILS:", fails)
 sys.exit(1 if fails else 0)

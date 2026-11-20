@@ -7,7 +7,9 @@
 
 #define _GNU_SOURCE
 #include "tx.h"
+#include "meshtastic.h"
 #include "options.h"
+#include "pki.h"
 
 #ifdef HAVE_HACKRF
 #include "hackrf.h"
@@ -100,6 +102,43 @@ static uint32_t from_node(void)
     return g_from_node;
 }
 
+/* Nodes we've already sent our NodeInfo (with our public key) to in this
+ * run. A PKI DM to a node not in here is preceded by one, because the
+ * firmware can only decrypt it once it has our key. */
+#define TX_ANNOUNCED_MAX 256
+static uint32_t g_announced[TX_ANNOUNCED_MAX];
+static int      g_nannounced, g_announce_next;
+
+static bool announced(uint32_t node)
+{
+    for (int i = 0; i < g_nannounced; ++i)
+        if (g_announced[i] == node) return true;
+    return false;
+}
+
+static void mark_announced(uint32_t node)
+{
+    if (announced(node)) return;
+    if (g_nannounced < TX_ANNOUNCED_MAX) g_announced[g_nannounced++] = node;
+    else { g_announced[g_announce_next] = node; g_announce_next = (g_announce_next + 1) % TX_ANNOUNCED_MAX; }
+}
+
+int tx_init(void)
+{
+    if (pki_init(opt_tx_key) != 0) return -1;
+    pki_set_own_node(from_node());
+    uint8_t pub[PKI_KEY_LEN];
+    char b64[45];
+    pki_public_key(pub);
+    pki_b64_encode(pub, b64);
+    fprintf(stderr, "[tx] transmitting as !%08x, PKI public key %s (%s)\n", from_node(), b64,
+            opt_tx_key ? opt_tx_key : "new key for this run; --tx-key=PATH keeps it");
+    if (opt_tx_node && !opt_tx_key)
+        fprintf(stderr, "[tx] WARNING: --tx-node without --tx-key: after a restart nodes that know "
+                        "!%08x will refuse its new key. Add --tx-key=PATH.\n", from_node());
+    return 0;
+}
+
 /* ---- tool discovery ---- */
 
 static const char *tool_path(void)
@@ -143,24 +182,52 @@ static double tx_ppm(void)
     return isfinite(p) ? p : 0.0;   /* strtod accepts "nan"/"inf" */
 }
 
+/* Band to transmit in: --tx-region, else the receiver's --region. Returned
+ * in the canonical spelling the tool knows ("eu868" -> "EU_868"); options.c
+ * has already rejected unknown and 2.4 GHz values for --tx-region. */
+static const char *tx_region(void)
+{
+    const char *name = opt_tx_region ? opt_tx_region : (opt_region ? opt_region : "US");
+    const mesh_region_t *r = mesh_lookup_region(name);
+    return r ? r->name : name;
+}
+
 void tx_status_json(char *out, size_t cap)
 {
     const char *tool = opt_tx_enable ? tool_path() : NULL;
+    const char *rx_region = opt_region ? opt_region : "US";
+    const mesh_region_t *rr = mesh_lookup_region(rx_region);
+    char pub_b64[45] = "";
+    if (opt_tx_enable && pki_enabled()) {
+        uint8_t pub[PKI_KEY_LEN];
+        pki_public_key(pub);
+        pki_b64_encode(pub, pub_b64);
+    }
     snprintf(out, cap,
         "{\"enabled\":%s,\"tool\":%s,\"mode\":\"%s\",\"region\":\"%s\","
-        "\"from\":\"!%08x\",\"ppm\":%g,\"auth\":%s}",
+        "\"rx_region\":\"%s\",\"from\":\"!%08x\",\"ppm\":%g,\"auth\":%s,"
+        "\"public_key\":\"%s\"}",
         opt_tx_enable ? "true" : "false",
         tool ? "true" : "false",
         inline_hackrf() ? "hackrf-inline" : "hackrf_transfer",
-        opt_region ? opt_region : "US",
+        tx_region(),
+        rr ? rr->name : rx_region,
         opt_tx_enable ? from_node() : 0,
         tx_ppm(),
-        opt_api_token ? "true" : "false");
+        opt_api_token ? "true" : "false",
+        pub_b64);
 }
 
 /* ---- form parsing ---- */
 
+/* What a send does. Everything but TX_TEXT is a request to one node with
+ * want_response set (the Meshtastic apps' node-detail actions). */
+static const char *const TX_KINDS[] = { "text", "position", "nodeinfo", "telemetry", "traceroute" };
+#define TX_KIND_TEXT 0
+#define TX_NKINDS    (int)(sizeof(TX_KINDS) / sizeof(TX_KINDS[0]))
+
 typedef struct {
+    int  kind;       /* index into TX_KINDS */
     char text[256];
     char to[16];
     char channel[16];
@@ -172,6 +239,10 @@ typedef struct {
     int  gain;
     int  amp;
     int  hop;
+    int  ack;        /* want_ack: ask the destination for a routing ACK */
+    uint32_t reply_id;  /* text replies: Data.reply_id, 0 = none */
+    bool has_pubkey;    /* operator supplied the destination's public key */
+    uint8_t pubkey[PKI_KEY_LEN];
 } tx_req_t;
 
 static int hexval(int c)
@@ -272,6 +343,23 @@ static const char *parse_form(const char *body, tx_req_t *r)
                 if (*val && parse_int(val, 0, 47, &r->gain)) return "gain: 0..47";
             } else if (!strcmp(key, "hop")) {
                 if (*val && parse_int(val, 0, 7, &r->hop)) return "hop: 0..7";
+            } else if (!strcmp(key, "kind")) {
+                int k = -1;
+                for (int i = 0; i < TX_NKINDS; ++i)
+                    if (!strcmp(val, TX_KINDS[i])) k = i;
+                if (k < 0) return "kind: text, position, nodeinfo, telemetry or traceroute";
+                r->kind = k;
+            } else if (!strcmp(key, "reply_id")) {
+                if (*val && (parse_node(val, &r->reply_id) != 0 || r->reply_id == 0))
+                    return "reply_id: packet id in hex (1..ffffffff)";
+            } else if (!strcmp(key, "pubkey")) {
+                if (*val) {
+                    if (pki_key_decode(val, r->pubkey) != 0)
+                        return "pubkey: the node's public key, base64 (as in the app) or 64 hex digits";
+                    r->has_pubkey = true;
+                }
+            } else if (!strcmp(key, "ack")) {
+                r->ack = (!strcmp(val, "1") || !strcasecmp(val, "on") || !strcasecmp(val, "true"));
             } else if (!strcmp(key, "amp")) {
                 r->amp = (!strcmp(val, "1") || !strcasecmp(val, "on") || !strcasecmp(val, "true"));
             } else if (!strcmp(key, "long_name")) {
@@ -284,7 +372,14 @@ static const char *parse_form(const char *body, tx_req_t *r)
         }
         p = amp ? amp + 1 : NULL;
     }
-    if (!r->text[0]) return "text is required";
+    if (r->kind == TX_KIND_TEXT) {
+        if (!r->text[0]) return "text is required";
+    } else {
+        if (r->text[0]) return "text only goes with kind=text";
+        if (r->reply_id) return "reply_id only goes with kind=text";
+        if (!strcmp(r->to, "broadcast")) return "requests need a destination node (to=!aabbccdd)";
+    }
+    if (r->has_pubkey && !strcmp(r->to, "broadcast")) return "pubkey needs a destination node";
     return NULL;
 }
 
@@ -490,23 +585,57 @@ void tx_send(const char *body, c2_response_t *out)
         return;
     }
 
+    /* Public-key DM: like the firmware, PKI for unicast packets except
+     * TRACEROUTE / NODEINFO / ROUTING / POSITION, when we know the
+     * destination's key. Our private key reaches the tool through a 0600
+     * file in the 0700 scratch dir, never on the command line. */
+    uint32_t to_num = 0;
+    bool unicast = strcmp(rq.to, "broadcast") != 0;
+    if (unicast) to_num = (uint32_t)strtoul(rq.to + 2, NULL, 16);
+    if (rq.has_pubkey) pki_note_peer(to_num, rq.pubkey);
+    bool pki_port = rq.kind == TX_KIND_TEXT || !strcmp(TX_KINDS[rq.kind], "telemetry");
+    uint8_t dest_key[PKI_KEY_LEN];
+    bool use_pki = unicast && pki_port && pki_enabled() && pki_peer_key(to_num, dest_key);
+    bool announce = use_pki && !announced(to_num);
+    char keyfile[PATH_MAX] = "";
+    if (pki_enabled()) {
+        uint8_t priv[PKI_KEY_LEN];
+        char b64[45];
+        pki_private_key(priv);
+        pki_b64_encode(priv, b64);
+        memset(priv, 0, sizeof(priv));
+        snprintf(keyfile, sizeof(keyfile), "%s/key", workdir);
+        int kfd = open(keyfile, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (kfd < 0 || dprintf(kfd, "%s\n", b64) < 0) {
+            if (kfd >= 0) close(kfd);
+            memset(b64, 0, sizeof(b64));
+            rm_tree_flat(workdir);
+            pthread_mutex_unlock(&g_tx_lock);
+            respond(out, 500, "{\"error\":\"cannot write the key file\"}");
+            return;
+        }
+        close(kfd);
+        memset(b64, 0, sizeof(b64));
+    }
+
     /* Every user string goes in as --flag=value: no shell, and a value
      * starting with '-' can't be taken for an option. */
     char a_keep[PATH_MAX + 8], a_rate[32], a_region[48], a_preset[40], a_psk[80],
          a_to[32], a_from[32], a_hop[24], a_gain[24], a_text[280], a_chan[32],
-         a_slot[24], a_long[64], a_short[24], a_ppm[40];
+         a_slot[24], a_long[64], a_short[24], a_ppm[40], a_kind[24], a_reply[32],
+         a_keyfile[PATH_MAX + 24], a_dest[80];
     snprintf(a_keep,   sizeof(a_keep),   "--keep=%s", workdir);
     snprintf(a_rate,   sizeof(a_rate),   "--rate=%d", TX_RATE_HZ);
-    snprintf(a_region, sizeof(a_region), "--region=%s", opt_region ? opt_region : "US");
+    snprintf(a_region, sizeof(a_region), "--region=%s", tx_region());
     snprintf(a_preset, sizeof(a_preset), "--preset=%s", rq.preset);
     snprintf(a_psk,    sizeof(a_psk),    "--psk=%s", rq.psk);
     snprintf(a_to,     sizeof(a_to),     "--to=%s", rq.to);
     snprintf(a_from,   sizeof(a_from),   "--from-node=0x%08x", from_node());
     snprintf(a_hop,    sizeof(a_hop),    "--hop-limit=%d", rq.hop);
     snprintf(a_gain,   sizeof(a_gain),   "--tx-gain=%d", rq.gain);
-    snprintf(a_text,   sizeof(a_text),   "--text=%s", rq.text);
+    snprintf(a_kind,   sizeof(a_kind),   "--kind=%s", TX_KINDS[rq.kind]);
 
-    char *argv[24];
+    char *argv[32];
     int ac = 0;
     argv[ac++] = "python3";
     argv[ac++] = (char *)tool;
@@ -521,7 +650,27 @@ void tx_send(const char *body, c2_response_t *out)
     argv[ac++] = a_from;
     argv[ac++] = a_hop;
     argv[ac++] = a_gain;
-    argv[ac++] = a_text;
+    argv[ac++] = a_kind;
+    if (rq.kind == TX_KIND_TEXT) {
+        snprintf(a_text, sizeof(a_text), "--text=%s", rq.text);
+        argv[ac++] = a_text;
+    }
+    if (rq.reply_id) {
+        snprintf(a_reply, sizeof(a_reply), "--reply-id=0x%08x", rq.reply_id);
+        argv[ac++] = a_reply;
+    }
+    if (rq.ack) argv[ac++] = "--want-ack";
+    if (keyfile[0]) {
+        snprintf(a_keyfile, sizeof(a_keyfile), "--pki-key-file=%s", keyfile);
+        argv[ac++] = a_keyfile;
+    }
+    if (use_pki) {
+        char b64[45];
+        pki_b64_encode(dest_key, b64);
+        snprintf(a_dest, sizeof(a_dest), "--dest-pubkey=%s", b64);
+        argv[ac++] = a_dest;
+        if (announce) argv[ac++] = "--announce-dest";
+    }
     if (rq.channel[0]) {
         snprintf(a_chan, sizeof(a_chan), "--channel=%s", rq.channel);
         argv[ac++] = a_chan;
@@ -585,15 +734,20 @@ void tx_send(const char *body, c2_response_t *out)
 
     char err[160] = "";
     int sent = 0;
-    uint64_t text_id = 0, airtime = 0;
+    uint64_t main_id = 0, airtime = 0;
     for (int i = 0; i < npk; ++i) {
-        if (i > 0) sleep(1);  /* NodeInfo first, then the text */
+        if (i > 0) sleep(1);  /* NodeInfo first, then the text / request */
         if (play_packet(&pk[i], &rq, err, sizeof(err)) != 0) break;
         ++sent;
         airtime += pk[i].airtime_ms;
-        if (!strcmp(pk[i].label, "text")) text_id = pk[i].id;
+        if (!strcmp(pk[i].label, TX_KINDS[rq.kind])) main_id = pk[i].id;
     }
     g_last_tx = now_s();
+    /* Our NodeInfo (with our public key) reached the node: by itself
+     * (kind=nodeinfo) or ahead of a PKI DM. */
+    if (sent == npk && unicast && pki_enabled() &&
+        (announce || !strcmp(TX_KINDS[rq.kind], "nodeinfo")))
+        mark_announced(to_num);
     rm_tree_flat(workdir);
     pthread_mutex_unlock(&g_tx_lock);
 
@@ -602,11 +756,23 @@ void tx_send(const char *body, c2_response_t *out)
         respond(out, 500, "{\"error\":\"%s\",\"sent\":%d}", err[0] ? err : "transmit failed", sent);
         return;
     }
-    fprintf(stderr, "[tx] sent %d packet(s) as !%08x on %.6f MHz (id 0x%08llx)\n",
-            sent, from_node(), pk[0].freq / 1e6, (unsigned long long)text_id);
+    fprintf(stderr, "[tx] sent %d packet(s) as !%08x on %.6f MHz (%s, id 0x%08llx)\n",
+            sent, from_node(), pk[0].freq / 1e6, TX_KINDS[rq.kind],
+            (unsigned long long)main_id);
+    const char *warning = "";
+    if (rq.kind == TX_KIND_TEXT && unicast && !use_pki)
+        warning = pki_enabled()
+            ? ",\"warning\":\"no public key known for this node, so the DM went out with the channel key; "
+              "firmware 2.5+ drops those. Wait for its NodeInfo or paste its public key.\""
+            : "";
+    char to_buf[16];
+    if (!strcmp(rq.to, "broadcast")) snprintf(to_buf, sizeof(to_buf), "broadcast");
+    else snprintf(to_buf, sizeof(to_buf), "!%.8s", rq.to + 2);  /* "0xaabbccdd" */
     respond(out, 200,
-        "{\"ok\":true,\"from\":\"!%08x\",\"freq_mhz\":%.6f,\"packets\":%d,"
-        "\"id\":\"%08llx\",\"airtime_ms\":%llu}",
-        from_node(), pk[0].freq / 1e6, sent,
-        (unsigned long long)text_id, (unsigned long long)airtime);
+        "{\"ok\":true,\"from\":\"!%08x\",\"to\":\"%s\",\"kind\":\"%s\","
+        "\"freq_mhz\":%.6f,\"packets\":%d,\"id\":\"%08llx\",\"airtime_ms\":%llu,"
+        "\"pki\":%s%s}",
+        from_node(), to_buf, TX_KINDS[rq.kind], pk[0].freq / 1e6, sent,
+        (unsigned long long)main_id, (unsigned long long)airtime,
+        use_pki ? "true" : "false", warning);
 }

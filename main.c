@@ -42,6 +42,8 @@
 #include "sigmf.h"
 #include "simd_kernels.h"
 #include "web.h"
+#include "tx.h"
+#include "pki.h"
 
 #include <complex.h>
 #include <errno.h>
@@ -3904,6 +3906,10 @@ static int run_live(void)
     if (opt_announce_to) {
         if (!announce_init(opt_announce_to))
             fprintf(stderr, "announce: failed to start (bad URL?); fusion will not auto-discover this sensor\n");
+    }
+    if (opt_tx_enable) {
+        if (tx_init() != 0) return 1;
+        mesh_packet_set_pki_decrypt(pki_mesh_hook);
     }
     if (opt_c2_dealer) {
         if (!c2_dealer_init(opt_c2_dealer))

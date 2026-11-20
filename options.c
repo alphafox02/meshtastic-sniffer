@@ -7,6 +7,7 @@
  */
 
 #include "options.h"
+#include "meshtastic.h"
 #include "sdr.h"
 
 #include <ctype.h>
@@ -133,6 +134,8 @@ char *opt_tx_tool                 = NULL;
 char *opt_tx_node                 = NULL;
 double opt_tx_ppm                 = 0.0;
 bool  opt_tx_ppm_set              = false;
+char *opt_tx_region               = NULL;
+char *opt_tx_key                  = NULL;
 char *opt_pcap_path               = NULL;
 char *opt_pcap_fifo               = NULL;
 char *opt_psk_wordlist            = NULL;
@@ -299,6 +302,14 @@ void options_print_help(const char *prog)
         "  --tx-ppm=PPM           clock correction for the transmitting HackRF\n"
         "                         (default: --ppm when --hackrf is also the\n"
         "                         receiver, else 0).\n"
+        "  --tx-region=NAME       band to transmit in (default: --region), e.g.\n"
+        "                         receive US but transmit EU_868. Sub-GHz only.\n"
+        "  --tx-key=PATH          TX node's public-key (PKI) identity: base64\n"
+        "                         X25519 private key, created (0600) if missing.\n"
+        "                         Needed for direct messages to firmware 2.5+.\n"
+        "                         Default: a new key per run. Keep the same\n"
+        "                         file with the same --tx-node: nodes refuse a\n"
+        "                         known node whose key changed.\n"
         "  --pcap=PATH            write received LoRa frames to PATH as a libpcap\n"
         "                         file (DLT_USER0=147). Use with tshark / Wireshark.\n"
         "  --pcap-fifo=PATH       like --pcap but creates PATH as a named pipe;\n"
@@ -421,7 +432,7 @@ int options_parse(int argc, char **argv)
         O_SELFTEST_REJECTION_TWOTONE, O_SELFTEST_REJECTION_OFFBIN,
         O_SELFTEST_REJECTION_PROCGAIN,
         O_LIST, O_SCHEMA,
-        O_TX, O_TX_TOOL, O_TX_NODE, O_TX_PPM,
+        O_TX, O_TX_TOOL, O_TX_NODE, O_TX_PPM, O_TX_REGION, O_TX_KEY,
     };
     static const struct option longopts[] = {
         { "hackrf",     optional_argument, NULL, O_HACKRF },
@@ -474,6 +485,8 @@ int options_parse(int argc, char **argv)
         { "tx-tool",    required_argument, NULL, O_TX_TOOL },
         { "tx-node",    required_argument, NULL, O_TX_NODE },
         { "tx-ppm",     required_argument, NULL, O_TX_PPM },
+        { "tx-region",  required_argument, NULL, O_TX_REGION },
+        { "tx-key",     required_argument, NULL, O_TX_KEY },
         { "pcap",       required_argument, NULL, O_PCAP },
         { "pcap-fifo",  required_argument, NULL, O_PCAP_FIFO },
         { "psk-wordlist", required_argument, NULL, O_PSK_WORDLIST },
@@ -670,6 +683,20 @@ int options_parse(int argc, char **argv)
         case O_TX_TOOL:    opt_tx_tool = strdup(optarg); break;
         case O_TX_NODE:    opt_tx_node = strdup(optarg); break;
         case O_TX_PPM:     opt_tx_ppm = strtod(optarg, NULL); opt_tx_ppm_set = true; break;
+        case O_TX_KEY:     opt_tx_key = strdup(optarg); break;
+        case O_TX_REGION: {
+            const mesh_region_t *r = mesh_lookup_region(optarg);
+            if (!r) {
+                fprintf(stderr, "--tx-region: unknown region '%s'\n", optarg);
+                return 2;
+            }
+            if (r->wide_lora) {
+                fprintf(stderr, "--tx-region: %s is 2.4 GHz; transmit is sub-GHz only\n", r->name);
+                return 2;
+            }
+            opt_tx_region = strdup(r->name);
+            break;
+        }
         case O_PCAP:       opt_pcap_path = strdup(optarg); break;
         case O_PCAP_FIFO:  opt_pcap_fifo = strdup(optarg); break;
         case O_PSK_WORDLIST: opt_psk_wordlist = strdup(optarg); break;
