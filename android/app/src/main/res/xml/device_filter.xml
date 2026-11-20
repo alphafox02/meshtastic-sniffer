@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- HackRF One, rad1o, HackRF Jawbreaker (as matched by hackrf_android) -->
+    <usb-device vendor-id="7504" product-id="24713" />
+    <usb-device vendor-id="7504" product-id="52245" />
+    <usb-device vendor-id="7504" product-id="24651" />
+</resources>

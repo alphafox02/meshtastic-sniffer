@@ -1,0 +1,52 @@
+plugins {
+    id 'com.android.application'
+}
+
+// FFTW3f + libcrypto for Android, built by deps/build_deps.sh.
+// Override with -PmeshDepsDir=/path (the directory holding <abi>/lib).
+def depsRoot = project.findProperty('meshDepsDir') ?: "${System.getProperty('user.home')}/Android/deps"
+
+android {
+    namespace 'org.meshsniffer.android'
+    compileSdk 35
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        applicationId 'org.meshsniffer.android'
+        minSdk 29          // Android 10
+        targetSdk 29
+        versionCode 1
+        versionName '0.1.0'
+        ndk { abiFilters 'arm64-v8a' }
+        externalNativeBuild {
+            cmake {
+                arguments "-DDEPS_DIR=${depsRoot}/arm64-v8a", '-DANDROID_STL=none'
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    lint {
+        // targetSdk 29 is deliberate (Android 10 device); the app is sideloaded
+        disable 'ExpiredTargetSdkVersion', 'OldTargetApi'
+        abortOnError false
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core:1.13.1'   // ContextCompat, used by hackrf_android
+}
