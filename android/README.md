@@ -98,6 +98,13 @@ duty-cycle limits.
 
 ## Third-party code
 
+- App icon: HackRF artwork generated for this app (AI image), with the
+  "Meshtastic Powered" (M-PWRD) logo from
+  [meshtastic/design](https://github.com/meshtastic/design), used unaltered
+  as Meshtastic's [trademark guidelines](https://meshtastic.org/docs/legal/licensing-and-trademark/)
+  allow for projects built on Meshtastic. This app is not affiliated with or
+  endorsed by Meshtastic LLC or Great Scott Gadgets.
+
 - `app/src/main/java/com/mantz_it/hackrf_android/`: hackrf_android by
   Dennis Mantz, GPL-2.0-or-later, with small changes listed in its README.
 - FFTW 3.3.10 (GPL-2.0-or-later) and OpenSSL 3.0.15 libcrypto (Apache-2.0),
