@@ -153,6 +153,13 @@ public class MainActivity extends Activity {
             }
         });
         web.setWebChromeClient(new WebChromeClient() {
+            /* The dashboard's console in logcat (adb logcat -s meshsniffer-web). */
+            @Override public boolean onConsoleMessage(android.webkit.ConsoleMessage m) {
+                android.util.Log.println(m.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR
+                        ? android.util.Log.ERROR : android.util.Log.INFO, "meshsniffer-web",
+                        m.message() + " (" + m.sourceId() + ":" + m.lineNumber() + ")");
+                return true;
+            }
             /* "Use my location" (home marker): Android permission first,
              * then let only our own page have the position. */
             @Override public void onGeolocationPermissionsShowPrompt(String origin, GeolocationPermissions.Callback cb) {

@@ -17,7 +17,7 @@ set(SNIFFER_SOURCES
     main.c dedup.c options.c meshtastic.c file_src.c vita49.c channelizer.c iq_ring.c
     iq_snapshot.c fftw_wisdom.c webhook.c focused.c pfb.c lora.c keyset.c protobuf.c
     mesh_packet.c mesh_decoders.c feed.c announce.c gpsd.c archive.c c2.c c2_dealer.c
-    geofence.c pcap_out.c psk_dict.c schema.c scanner.c web.c tx.c pki.c mesh_tx.c
+    geofence.c pcap_out.c psk_dict.c schema.c scanner.c web.c web_assets.c tx.c pki.c mesh_tx.c
     lora_tx.c ext_src.c share_url.c cot.c node_db.c kml_live.c sigmf.c simd_generic.c
     mqtt.c zmq_pub.c)
 if(ANDROID_ABI STREQUAL "arm64-v8a")

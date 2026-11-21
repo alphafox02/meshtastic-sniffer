@@ -22,6 +22,7 @@
 #include "gpsd.h"
 #include "keyset.h"
 #include "kml_live.h"
+#include "web_assets.h"
 #include "options.h"
 #include "share_url.h"
 #include "tx.h"
@@ -78,8 +79,8 @@ static const char DASHBOARD_HTML[] =
 "<html><head><meta charset=\"utf-8\">\n"
 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n"
 "<title>meshtastic-sniffer</title>\n"
-"<link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\">\n"
-"<script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>\n"
+"<link rel=\"stylesheet\" href=\"/vendor/leaflet/leaflet.css\">\n"
+"<script src=\"/vendor/leaflet/leaflet.js\"></script>\n"
 "<style>\n"
 /* Slate palette mirroring inmarsat-sniffer: same family of tools.    */
 "*{margin:0;padding:0;box-sizing:border-box}\n"
@@ -2232,7 +2233,8 @@ static const char DASHBOARD_HTML[] =
 "const ROUTING_ERRORS = {1:'NO_ROUTE',2:'GOT_NAK',3:'TIMEOUT',4:'NO_INTERFACE',5:'MAX_RETRANSMIT',6:'NO_CHANNEL',7:'TOO_LARGE',8:'NO_RESPONSE',9:'DUTY_CYCLE_LIMIT',32:'BAD_REQUEST',33:'NOT_AUTHORIZED',34:'PKI_FAILED',35:'PKI_UNKNOWN_PUBKEY',36:'ADMIN_BAD_SESSION_KEY',37:'ADMIN_PUBLIC_KEY_UNAUTHORIZED',38:'RATE_LIMIT_EXCEEDED'};\n"
 "async function txInit(){\n"
 "  let info;\n"
-"  try { const r = await fetch('/api/tx'); if (!r.ok) return; info = await r.json(); } catch(e) { return; }\n"
+"  try { const r = await fetch('/api/tx'); if (!r.ok) { console.warn('GET /api/tx: HTTP ' + r.status); return; } info = await r.json(); }\n"
+"  catch(e) { console.warn('GET /api/tx failed: ' + e); return; }\n"
 "  if (!info.enabled) return;\n"
 "  txEnabled = true; txFrom = info.from; txPubKey = info.public_key || '';\n"
 "  document.getElementById('tx-box').style.display = 'flex';\n"
@@ -2490,6 +2492,30 @@ static void serve_index(int fd) {
     send_all(fd, encoded, used);
     send_all(fd, suffix, strlen(suffix));
     close(fd);
+}
+
+/* Embedded static files (Leaflet), so the dashboard works offline. Returns
+ * false when the request isn't for one of them. */
+static bool serve_asset(int fd, const char *buf)
+{
+    if (strncmp(buf, "GET /vendor/", 12) != 0) return false;
+    const char *p = buf + 4;
+    size_t plen = strcspn(p, " ?\r\n");
+    for (const web_asset_t *a = WEB_ASSETS; a->path; ++a) {
+        if (strlen(a->path) != plen || strncmp(a->path, p, plen) != 0) continue;
+        char hdr[256];
+        int n = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Cache-Control: max-age=86400\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n\r\n", a->content_type, a->len);
+        send_all(fd, hdr, (size_t)n);
+        send_all(fd, (const char *)a->data, a->len);
+        close(fd);
+        return true;
+    }
+    return false;
 }
 
 static void serve_404(int fd) {
@@ -2768,6 +2794,7 @@ static void *http_client(void *arg)
         strncmp(buf, "GET /\r",       6) == 0 ||
         strncmp(buf, "GET /index",   10) == 0) serve_index(fd);
     else if (strncmp(buf, "GET /events", 11) == 0) promote_to_sse(fd);
+    else if (serve_asset(fd, buf)) { /* sent */ }
     else if (strncmp(buf, "GET /live.kml", 13) == 0) serve_kml(fd, buf, true);
     else if (strncmp(buf, "GET /live_feed.kml", 18) == 0) serve_kml(fd, buf, false);
     else if (strncmp(buf, "GET /api/tx", 11) == 0) {

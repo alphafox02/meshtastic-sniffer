@@ -141,6 +141,7 @@ set(SOURCES
     ${PROJECT_SOURCE_DIR}/schema.c
     ${PROJECT_SOURCE_DIR}/scanner.c
     ${PROJECT_SOURCE_DIR}/web.c
+    ${PROJECT_SOURCE_DIR}/web_assets.c
     ${PROJECT_SOURCE_DIR}/tx.c
     ${PROJECT_SOURCE_DIR}/pki.c
     ${PROJECT_SOURCE_DIR}/mesh_tx.c
