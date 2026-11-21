@@ -97,6 +97,14 @@ static int keyset_add_psk(keyset_t *k, const char *channel_name,
     }
     if (psk_len == 0 || psk_len == 16 || psk_len == 32)
         return keyset_add(k, channel_name, psk_len ? psk : NULL, (size_t)psk_len);
+    if (psk_len > 1 && psk_len < 32) {
+        /* Firmware (Channels::getKey) zero-pads a short key up to AES-128
+         * or AES-256; tools/meshtastic_tx.py does the same. */
+        uint8_t padded[32] = {0};
+        size_t  n = psk_len < 16 ? 16 : 32;
+        memcpy(padded, psk, (size_t)psk_len);
+        return keyset_add(k, channel_name, padded, n);
+    }
     return -1;
 }
 

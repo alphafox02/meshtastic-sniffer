@@ -10,11 +10,13 @@
 #include "archive.h"
 #include "feed.h"
 #include "geofence.h"
+#include "kml_live.h"
 #include "gpsd.h"
 #include "mesh_decoders.h"
 #include "meshtastic.h"
 #include "node_db.h"
 #include "options.h"
+#include "pki.h"
 
 /* Forward decls for optional output sinks (their .c files compile to
  * stubs when the underlying lib isn't available). */
@@ -40,6 +42,23 @@ void web_publish_line(const char *json, size_t len);
 #include "net_util.h"
 
 #define MAX_UDP_FEEDS  4
+
+/* Feed the live Google Earth KML cache. Same trust rule as the
+ * fields_trusted JSON flag: only CRC-verified (or, without a CRC,
+ * decrypted) frames, so bit-corrupted phantoms never land on the map. */
+static void kml_note_position(const mesh_event_t *ev, double lat, double lon,
+                              bool have_alt, double alt_m, const char *label)
+{
+    bool trusted = (ev->has_crc && ev->payload_crc_ok) || (!ev->has_crc && ev->decrypted);
+    if (!trusted) return;
+    kml_live_obs_t o = {
+        .id = ev->header.from, .lat = lat, .lon = lon,
+        .have_alt = have_alt, .alt_m = alt_m, .label = label,
+        .channel = ev->channel_name, .snr_db = ev->snr_db, .rssi_db = ev->rssi_db,
+        .freq_hz = ev->freq_hz, .when = time(NULL),
+    };
+    kml_live_note(&o);
+}
 
 typedef struct {
     int                  fd;
@@ -263,8 +282,15 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
 
     if (ev->decrypted) {
         if (ev->channel_name[0]) jw_field_str(j, "channel_name", ev->channel_name);
+        if (ev->pki_encrypted)   jw_field_bool(j, "pki_encrypted", true);
         jw_field_u32(j, "portnum",     ev->portnum);
         jw_field_str(j, "port_name",   mesh_port_name(ev->portnum));
+        /* Request/response linkage: a request carries want_response; the
+         * answer (and a routing ACK/NAK) carries request_id = the request's
+         * packet_id; a text reply carries reply_id = the message it answers. */
+        if (ev->want_response) jw_field_bool(j, "want_response", true);
+        if (ev->request_id)    jw_field_u32(j, "request_id", ev->request_id);
+        if (ev->reply_id)      jw_field_u32(j, "reply_id",   ev->reply_id);
 
         /* Per-port decoded fields */
         switch (ev->portnum) {
@@ -303,6 +329,12 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                 if (p.precision_bits)       jw_field_u32(j, "precision_bits", p.precision_bits);
                 /* CoT republish for any positioned node, named via node_db cache. */
                 cot_publish_position(ev, &p);
+                /* Live Google Earth KML (GET /live.kml). */
+                if (p.have_lat && p.have_lon)
+                    kml_note_position(ev, p.lat_deg, p.lon_deg,
+                                      p.have_alt || p.have_alt_hae,
+                                      p.have_alt ? (double)p.altitude_m : (double)p.altitude_hae_m,
+                                      NULL);
                 /* Geofence transitions: ENTRY / EXIT events when this
                  * node crosses any configured polygon boundary. */
                 if (p.have_lat && p.have_lon)
@@ -332,6 +364,11 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                     }
                     hex[2 * sizeof(u.public_key)] = '\0';
                     jw_field_str(j, "public_key", hex);
+                    /* TX: remember it, to PKI-encrypt our DMs to this node
+                     * and decrypt its PKI answers to us. CRC/decrypt-backed
+                     * frames only: a bit-flipped key would poison the cache. */
+                    if (ev->decrypted && (!ev->has_crc || ev->payload_crc_ok))
+                        pki_note_peer(ev->header.from, u.public_key);
                 }
                 node_db_remember(ev->header.from, u.long_name, u.short_name,
                                  u.hw_model, u.role);
@@ -531,6 +568,10 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                 }
                 /* CoT multicast republish on PLI / DETAIL. */
                 cot_publish_atak(ev, &a);
+                if (a.kind == MESH_ATAK_PLI && a.have_lat && a.have_lon)
+                    kml_note_position(ev, a.lat_deg, a.lon_deg,
+                                      a.altitude_hae_m != 0, (double)a.altitude_hae_m,
+                                      a.callsign);
             }
             break;
         }
@@ -575,6 +616,34 @@ static void serialize_event(jw_t *j, const mesh_event_t *ev)
                         jw_array_sep(j);
                         char nid[16]; snprintf(nid, sizeof(nid), "!%08x", tr.route[i]);
                         jw_str_escaped(j, nid);
+                    }
+                    jw_close_array(j);
+                }
+                if (tr.route_back_len) {
+                    jw_open_array(j, "route_back");
+                    for (int i = 0; i < tr.route_back_len; ++i) {
+                        jw_array_sep(j);
+                        char nid[16]; snprintf(nid, sizeof(nid), "!%08x", tr.route_back[i]);
+                        jw_str_escaped(j, nid);
+                    }
+                    jw_close_array(j);
+                }
+                /* Per-hop SNR, firmware units are dB*4; -128 = unknown. */
+                if (tr.snr_towards_len) {
+                    jw_open_array(j, "snr_towards_db");
+                    for (int i = 0; i < tr.snr_towards_len; ++i) {
+                        jw_array_sep(j);
+                        char v[16]; snprintf(v, sizeof(v), "%.2f", tr.snr_towards[i] / 4.0);
+                        jw_puts(j, tr.snr_towards[i] == -128 ? "null" : v);
+                    }
+                    jw_close_array(j);
+                }
+                if (tr.snr_back_len) {
+                    jw_open_array(j, "snr_back_db");
+                    for (int i = 0; i < tr.snr_back_len; ++i) {
+                        jw_array_sep(j);
+                        char v[16]; snprintf(v, sizeof(v), "%.2f", tr.snr_back[i] / 4.0);
+                        jw_puts(j, tr.snr_back[i] == -128 ? "null" : v);
                     }
                     jw_close_array(j);
                 }

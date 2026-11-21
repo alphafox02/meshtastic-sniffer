@@ -938,7 +938,10 @@ bool mesh_decode_traceroute(const uint8_t *buf, size_t len, mesh_traceroute_t *o
         }
         if (!ok) return false;
     }
-    return out->route_len > 0 || out->route_back_len > 0;
+    /* A direct (zero-hop) traceroute has no route entries, only the SNR
+     * of each leg, so any populated list counts as a decode. */
+    return out->route_len > 0 || out->route_back_len > 0 ||
+           out->snr_towards_len > 0 || out->snr_back_len > 0;
 }
 
 /* ---- REMOTE_HARDWARE_APP -- meshtastic.HardwareMessage ----

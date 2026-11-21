@@ -19,9 +19,13 @@
 #include "web.h"
 #include "c2.h"
 #include "cot.h"
+#include "gpsd.h"
 #include "keyset.h"
+#include "kml_live.h"
+#include "web_assets.h"
 #include "options.h"
 #include "share_url.h"
+#include "tx.h"
 
 extern keyset_t *app_get_keyset(void);
 extern int       app_add_runtime_extra_freq(uint64_t f_hz, int bw_hz, int sf, int cr);
@@ -75,8 +79,8 @@ static const char DASHBOARD_HTML[] =
 "<html><head><meta charset=\"utf-8\">\n"
 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n"
 "<title>meshtastic-sniffer</title>\n"
-"<link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\">\n"
-"<script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>\n"
+"<link rel=\"stylesheet\" href=\"/vendor/leaflet/leaflet.css\">\n"
+"<script src=\"/vendor/leaflet/leaflet.js\"></script>\n"
 "<style>\n"
 /* Slate palette mirroring inmarsat-sniffer: same family of tools.    */
 "*{margin:0;padding:0;box-sizing:border-box}\n"
@@ -101,6 +105,12 @@ static const char DASHBOARD_HTML[] =
 ".pane{padding:8px 10px;overflow:auto;background:#0f172a}\n"
 "#map{height:100%;width:100%}\n"
 ".leaflet-container{background:#0f172a}\n"
+"/* Basemap picker: collapsed toggle keeps Leaflet's light button so the\n"
+"   icon stays visible; the expanded list follows the theme. */\n"
+".leaflet-control-layers-expanded{background:#1e293b;color:#e2e8f0}\n"
+".leaflet-control-layers-separator{border-top-color:#334155}\n"
+"html.light .leaflet-control-layers-expanded{background:#ffffff;color:#1e293b}\n"
+"html.light .leaflet-control-layers-separator{border-top-color:#ddd}\n"
 "h2{margin:0 0 6px 0;font-size:12px;color:#38bdf8;text-transform:uppercase;letter-spacing:1px;font-weight:600;border-bottom:1px solid #334155;padding-bottom:5px;display:flex;align-items:center;gap:8px}\n"
 "h2 .muted{font-weight:400;text-transform:none;letter-spacing:0;color:#64748b;font-size:11px;flex:1}\n"
 "h2 button{background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:3px;padding:3px 9px;cursor:pointer;font-size:11px}\n"
@@ -200,6 +210,37 @@ static const char DASHBOARD_HTML[] =
 "#config button:hover{background:#075985;color:#e0f2fe}\n"
 "#config .hint{color:#64748b;font-size:12px;margin-top:4px;display:block}\n"
 "#config .row{margin-bottom:14px}\n"
+"#tx-box{display:flex;gap:6px;margin:2px 0 4px 0}\n"
+"#tx-box input{flex:1;min-width:0;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:3px;padding:6px 8px;font:inherit;font-size:13px}\n"
+"#tx-box input:focus{outline:none;border-color:#38bdf8}\n"
+"#tx-box button{background:#0c4a6e;color:#bae6fd;border:1px solid #0284c7;border-radius:3px;padding:6px 14px;cursor:pointer;font-size:13px}\n"
+"#tx-box button:disabled{opacity:.5;cursor:wait}\n"
+"#tx-status{font-size:11px;color:#64748b;min-height:0}\n"
+".tx-badge{background:#f59e0b;color:#1c1917;border-radius:3px;padding:0 4px;font-size:10px;font-weight:700;margin-right:4px}\n"
+".tx-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px 12px;margin:8px 0}\n"
+".tx-grid label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:#94a3b8}\n"
+".tx-grid label.tx-check{flex-direction:row;align-items:center;gap:6px;padding-top:16px}\n"
+"#config input[type=password],#config select{width:100%;box-sizing:border-box;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:3px;padding:8px 10px;font-family:'SF Mono',Consolas,monospace;font-size:13px}\n"
+"html.light #tx-box input,html.light #config input[type=password],html.light #config select{background:#ffffff;color:#1e293b;border-color:#cbd5e1}\n"
+"html.light #tx-box button{background:#e0f2fe;color:#0c4a6e;border-color:#0284c7}\n"
+"html.light .tx-grid label{color:#475569}\n"
+".reply-btn{background:none;border:none;color:#38bdf8;cursor:pointer;font-size:13px;padding:0 4px;margin-left:4px}\n"
+".reply-btn:hover{color:#e0f2fe}\n"
+".rx-badge{background:#22c55e;color:#052e16;border-radius:3px;padding:0 4px;font-size:10px;font-weight:700;margin-right:4px}\n"
+"#tx-reply{display:flex;align-items:center;gap:6px;font-size:11px;color:#38bdf8;margin:2px 0}\n"
+"#tx-reply button{background:none;border:none;color:#94a3b8;cursor:pointer;font-size:14px;padding:0 4px}\n"
+"#drawer-tx .dtx-row{display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap}\n"
+"#drawer-tx input[type=text]{flex:1;min-width:0;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:3px;padding:5px 8px;font:inherit;font-size:12px}\n"
+"#drawer-tx button{background:#0c4a6e;color:#bae6fd;border:1px solid #0284c7;border-radius:3px;padding:5px 10px;cursor:pointer;font-size:12px}\n"
+"#drawer-tx button:disabled{opacity:.5;cursor:wait}\n"
+"#drawer-tx label{font-size:11px;color:#94a3b8;display:flex;align-items:center;gap:4px}\n"
+"#dtx-log{font-size:12px;line-height:1.5;max-height:180px;overflow-y:auto}\n"
+"#drawer-tx .hint{font-size:12px;color:#94a3b8}\n"
+"#dtx-log .item{padding:3px 0;border-bottom:1px dotted #1e293b}\n"
+"html.light #drawer-tx input[type=text]{background:#ffffff;color:#1e293b;border-color:#cbd5e1}\n"
+"html.light #drawer-tx button{background:#e0f2fe;color:#0c4a6e;border-color:#0284c7}\n"
+"html.light #dtx-log .item{border-bottom-color:#e2e8f0}\n"
+".home-icon{background:none;border:none;filter:drop-shadow(0 1px 2px rgba(0,0,0,.6))}\n"
 ".status-ok{color:#4ade80}\n"
 ".status-err{color:#f87171}\n"
 /* Light theme overrides (dark stays default; toggled via html.light). */
@@ -273,6 +314,8 @@ static const char DASHBOARD_HTML[] =
 "#drawer-spark{display:block;width:100%;height:54px;background:#1e293b;border-radius:3px}\n"
 "#drawer-msgs,#drawer-pos{font-size:12px;line-height:1.5;max-height:160px;overflow-y:auto}\n"
 "#drawer-msgs .item{padding:4px 0;border-bottom:1px dotted #1e293b}\n"
+"#drawer-pos a{color:#38bdf8}\n"
+"html.light #drawer-pos a{color:#0284c7}\n"
 "#drawer-pos td{padding:3px 6px;border:none;font-size:11px;font-family:'SF Mono',Consolas,monospace}\n"
 "html.light #drawer{background:#ffffff;border-left-color:#cbd5e1;box-shadow:-4px 0 16px rgba(15,23,42,0.08)}\n"
 "html.light #drawer-head{border-bottom-color:#e2e8f0}\n"
@@ -300,9 +343,19 @@ static const char DASHBOARD_HTML[] =
 " #bar .stat{white-space:nowrap}\n"
 " #tabs{overflow-x:auto;overscroll-behavior-x:contain}\n"
 " #tabs button{flex:0 0 auto;min-height:44px;padding:10px 14px}\n"
-" #live{overflow-y:auto;overscroll-behavior-y:contain}\n"
+" #live{overflow-y:auto;overscroll-behavior-y:auto}\n"
+/* Phones: the page scrolls, like a desktop browser. Panels grow to their
+ * content instead of scrolling inside a 360 px box (a swipe on them used
+ * to scroll only the panel, so the panels below were unreachable); only
+ * the two long logs keep a capped list, and a swipe that reaches its end
+ * carries on to the page. Wide tables scroll sideways in their panel. */
+" .pane{overscroll-behavior:auto}\n"
+" .grid>.pane{max-height:none;overflow-x:auto}\n"
+" #msgs,#disc{max-height:45vh;max-height:45dvh;overflow-y:auto;overscroll-behavior:auto}\n"
+" .map-hint{background:rgba(15,23,42,0.75);color:#cbd5e1;font-size:11px;padding:3px 7px;border-radius:3px;pointer-events:none}\n"
+" html.light .map-hint{background:rgba(255,255,255,0.85);color:#334155}\n"
 " .grid{display:flex;flex-direction:column;height:auto;min-height:100%;gap:8px;background:transparent;padding:8px}\n"
-" .grid>.pane{flex:none;max-height:360px;border:1px solid #334155;border-radius:6px;padding:10px}\n"
+" .grid>.pane{flex:none;border:1px solid #334155;border-radius:6px;padding:10px}\n"
 " .grid>.map-pane{height:42vh;height:42dvh;min-height:220px;max-height:420px}\n"
 " .grid>.messages-pane{order:1}\n"
 " .grid>.map-pane{order:0}\n"
@@ -383,7 +436,11 @@ static const char DASHBOARD_HTML[] =
 "      </table>\n"
 "    </div>\n"
 "    <div class=\"pane channels-pane\"><h2>Channels <span class=muted>(by hash)</span></h2><table id=\"channels\"><thead><tr><th>Hash</th><th>Name</th><th>Preset</th><th>Frames</th><th>Decrypt</th><th>Slots</th><th>SNR (1h)</th><th>Last</th></tr></thead><tbody></tbody></table></div>\n"
-"    <div class=\"pane messages-pane\"><h2>Messages</h2><div id=\"msgs\"></div></div>\n"
+"    <div class=\"pane messages-pane\"><h2>Messages</h2>\n"
+"      <div id=\"tx-reply\" style=\"display:none\"><span id=\"tx-reply-label\"></span><button onclick=\"txClearReply()\" title=\"Cancel reply\">&times;</button></div>\n"
+"      <div id=\"tx-box\" style=\"display:none\"><input id=\"tx-text\" type=\"text\" maxlength=\"200\" placeholder=\"Send to mesh (HackRF TX)...\" autocomplete=\"off\"><button id=\"tx-send\" onclick=\"txSend()\">Send</button></div>\n"
+"      <div id=\"tx-status\" class=\"hint\"></div>\n"
+"      <div id=\"msgs\"></div></div>\n"
 "    <div class=\"pane discoveries-pane\"><h2>Discoveries &amp; ATAK</h2><div id=\"disc\"></div></div>\n"
 "  </div>\n"
 "</div>\n"
@@ -425,6 +482,47 @@ static const char DASHBOARD_HTML[] =
 "    <span id=\"cot-status\" class=\"hint\"></span>\n"
 "    <div class=\"hint\">Republish positioned nodes (POSITION + ATAK PLI) as CoT XML to a multicast group. ATAK-CIV / WinTAK / iTAK on the same LAN pick them up automatically.</div>\n"
 "  </div>\n"
+"  <h3>Home location</h3>\n"
+"  <div class=\"row\">\n"
+"    <input id=\"home-input\" type=\"text\" placeholder=\"39.0997, -94.5786\">\n"
+"    <input id=\"home-label\" type=\"text\" placeholder=\"Label (optional, e.g. Home)\" style=\"margin-top:6px\">\n"
+"    <button onclick=\"saveHome()\">Save</button>\n"
+"    <button onclick=\"pickHomeOnMap()\">Pick on map</button>\n"
+"    <button onclick=\"useMyLocation()\">Use my location</button>\n"
+"    <button onclick=\"clearHome()\">Clear</button>\n"
+"    <span id=\"home-status\" class=\"hint\"></span>\n"
+"    <div class=\"hint\">Decimal degrees as \"lat, lon\" (paste straight from Google Maps / OSM). Shows a house marker on the map; stored in this browser only. \"Use my location\" needs HTTPS or localhost.</div>\n"
+"  </div>\n"
+"  <h3>Google Earth live KML</h3>\n"
+"  <div class=\"row\">\n"
+"    <input id=\"kml-url\" type=\"text\" readonly onclick=\"this.select()\">\n"
+"    <button onclick=\"location.href='/live.kml'\">Open in Google Earth</button>\n"
+"    <button onclick=\"copyKmlUrl()\">Copy link</button>\n"
+"    <span id=\"kml-status\" class=\"hint\"></span>\n"
+"    <div class=\"hint\">Live node positions, tracks and (with --gpsd) this station, refreshed by Google Earth on its own. Open the downloaded file, or in Google Earth Pro use Add &gt; Network Link with the URL above. Refresh interval: --kml-refresh (default 10 s). For Google Maps, use the link in a node's map popup or drawer: it opens the node's latest position.</div>\n"
+"  </div>\n"
+"  <div id=\"tx-config\" style=\"display:none\">\n"
+"  <h3>Transmit (HackRF)</h3>\n"
+"  <div class=\"row\">\n"
+"    <div class=\"hint\" id=\"tx-info\"></div>\n"
+"    <div class=\"tx-grid\">\n"
+"      <label>Channel name<input id=\"tx-channel\" type=\"text\" maxlength=\"11\" placeholder=\"LongFast (preset default)\"></label>\n"
+"      <label>PSK (base64)<input id=\"tx-psk\" type=\"text\" placeholder=\"AQ== (default key)\"></label>\n"
+"      <label>Preset<select id=\"tx-preset\"><option>LONG_FAST</option><option>LONG_MODERATE</option><option>LONG_SLOW</option><option>LONG_TURBO</option><option>MEDIUM_FAST</option><option>MEDIUM_SLOW</option><option>SHORT_FAST</option><option>SHORT_SLOW</option><option>SHORT_TURBO</option></select></label>\n"
+"      <label>Frequency slot<input id=\"tx-slot\" type=\"text\" placeholder=\"auto (hash of channel name)\"></label>\n"
+"      <label>To<input id=\"tx-to\" type=\"text\" placeholder=\"broadcast or !aabbccdd\"></label>\n"
+"      <label>Hop limit<input id=\"tx-hop\" type=\"text\" placeholder=\"3\"></label>\n"
+"      <label>TX gain dB (0-47)<input id=\"tx-gain\" type=\"text\" placeholder=\"10\"></label>\n"
+"      <label class=\"tx-check\"><input id=\"tx-amp\" type=\"checkbox\"> +14 dB RF amp</label>\n"
+"      <label>Long name (sends NodeInfo)<input id=\"tx-long_name\" type=\"text\" maxlength=\"39\" placeholder=\"optional\"></label>\n"
+"      <label>Short name<input id=\"tx-short_name\" type=\"text\" maxlength=\"4\" placeholder=\"optional\"></label>\n"
+"      <label id=\"tx-token-row\">API token<input id=\"tx-token\" type=\"password\" placeholder=\"--api-token value\" autocomplete=\"off\"></label>\n"
+"    </div>\n"
+"    <button onclick=\"txSaveSettings()\">Save settings</button>\n"
+"    <span id=\"txcfg-status\" class=\"hint\"></span>\n"
+"    <div class=\"hint\">Used by the Send box in the Messages pane. The frame is built and LoRa-modulated by the sniffer itself (sync word 0x2B, firmware slot hashing; tools/meshtastic_tx.py with --tx-tool). On the sniffer's own HackRF, reception pauses for about a second per packet. Only transmit on channels you operate, within your region's power and duty-cycle limits.</div>\n"
+"  </div>\n"
+"  </div>\n"
 "  <h3>View options</h3>\n"
 "  <div class=\"row\">\n"
 "    <label><input type=\"checkbox\" id=\"showUntrusted\"> Show untrusted frames (CRC-fail or no-decrypt) in map / nodes / channels</label>\n"
@@ -459,6 +557,14 @@ static const char DASHBOARD_HTML[] =
 "    <section><h3>Recent messages</h3><div id=\"drawer-msgs\"></div></section>\n"
 "    <section><h3>Recent positions</h3><div id=\"drawer-pos\"></div></section>\n"
 "    <section><h3>Channels seen on</h3><div id=\"drawer-channels\"></div></section>\n"
+"    <section id=\"drawer-tx\" style=\"display:none\"><h3>Interact (HackRF TX)</h3>\n"
+"      <div class=\"dtx-row\"><input id=\"dtx-text\" type=\"text\" maxlength=\"200\" placeholder=\"Direct message...\" autocomplete=\"off\"><button id=\"dtx-dm\" onclick=\"txDirect()\">DM</button></div>\n"
+"      <div class=\"dtx-row\"><button class=\"dtx-req\" onclick=\"txRequest('position')\" title=\"POSITION_APP with want_response\">Request position</button><button class=\"dtx-req\" onclick=\"txRequest('nodeinfo')\" title=\"Send our NodeInfo with want_response\">Exchange node info</button><button class=\"dtx-req\" onclick=\"txRequest('telemetry')\" title=\"TELEMETRY_APP device metrics with want_response\">Request telemetry</button><button class=\"dtx-req\" onclick=\"txRequest('traceroute')\" title=\"TRACEROUTE_APP with want_response\">Traceroute</button></div>\n"
+"      <div class=\"dtx-row\"><label><input id=\"dtx-ack\" type=\"checkbox\" checked> request ACK</label> <span id=\"dtx-pki\" class=\"hint\"></span></div>\n"
+"      <div class=\"dtx-row\"><input id=\"dtx-pubkey\" type=\"text\" placeholder=\"Node public key (base64, from the app), if not learned yet\" autocomplete=\"off\" spellcheck=\"false\"></div>\n"
+"      <div id=\"dtx-status\" class=\"hint\"></div>\n"
+"      <div id=\"dtx-log\"></div>\n"
+"    </section>\n"
 "  </div>\n"
 "</aside>\n"
 "<script>\n"
@@ -476,15 +582,51 @@ static const char DASHBOARD_HTML[] =
 "  if (name==='topology') topoStart(); else topoStop();\n"
 "  if (name==='spectrum') spectrumStart(); else spectrumStop();\n"
 "}\n"
-"// Theme toggle: dark is default, light persists in localStorage. Map\n"
-"// tiles follow the theme, using Esri by default or CARTO with an API key.\n"
-"let tileLayer=null;\n"
-"function setTheme(name){const html=document.documentElement;if(name==='light')html.classList.add('light');else html.classList.remove('light');try{localStorage.setItem('theme',name);}catch(e){}if(tileLayer)map.removeLayer(tileLayer);const key='__CARTO_MAP_KEY__';let url,options;if(key){url=((name==='light')?'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png':'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png')+'?key='+key;options={maxZoom:19,attribution:'&copy; OpenStreetMap contributors &copy; CARTO'};}else{url='https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_'+((name==='light')?'Light':'Dark')+'_Gray_Base/MapServer/tile/{z}/{y}/{x}';options={maxZoom:19,maxNativeZoom:16,attribution:'Tiles &copy; Esri'};}tileLayer=L.tileLayer(url,options).addTo(map);const btn=document.getElementById('theme-toggle');if(btn)btn.textContent=(name==='light')?'light':'dark';}\n"
+"// Theme toggle: dark is default, light persists in localStorage.\n"
+"// Basemaps: the default 'Gray' layer follows the theme (Esri gray canvas,\n"
+"// or CARTO light/dark when an API key is configured). The other keyless\n"
+"// basemaps are picked from the Leaflet layers control on the map; the\n"
+"// choice persists in localStorage under 'basemap'.\n"
+"const grayBase=L.layerGroup();\n"
+"function grayTiles(name){const key='__CARTO_MAP_KEY__';if(key)return L.tileLayer(((name==='light')?'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png':'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png')+'?key='+key,{maxZoom:19,attribution:'&copy; OpenStreetMap contributors &copy; CARTO'});return L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_'+((name==='light')?'Light':'Dark')+'_Gray_Base/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,maxNativeZoom:16,attribution:'Tiles &copy; Esri'});}\n"
+"function esriTiles(svc,nativeZ,attr){return L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/'+svc+'/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,maxNativeZoom:nativeZ,attribution:attr});}\n"
+"const basemaps={\n"
+"  'Gray (follows theme)':grayBase,\n"
+"  'OpenStreetMap':L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors'}),\n"
+"  'Streets (Esri)':esriTiles('World_Street_Map',19,'Tiles &copy; Esri'),\n"
+"  'Topographic (Esri)':esriTiles('World_Topo_Map',19,'Tiles &copy; Esri'),\n"
+"  'OpenTopoMap':L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',{maxZoom:19,maxNativeZoom:17,attribution:'&copy; OpenStreetMap contributors, SRTM | &copy; <a href=\"https://opentopomap.org\">OpenTopoMap</a> (CC-BY-SA)'}),\n"
+"  'Satellite (Esri)':esriTiles('World_Imagery',19,'Tiles &copy; Esri, Maxar, Earthstar Geographics'),\n"
+"};\n"
+"const mapOverlays={\n"
+"  'Place labels':L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,pane:'labels',attribution:'Labels &copy; Esri'}),\n"
+"};\n"
+"function setTheme(name){const html=document.documentElement;if(name==='light')html.classList.add('light');else html.classList.remove('light');try{localStorage.setItem('theme',name);}catch(e){}grayBase.clearLayers();grayBase.addLayer(grayTiles(name));const btn=document.getElementById('theme-toggle');if(btn)btn.textContent=(name==='light')?'light':'dark';}\n"
 "function toggleTheme(){setTheme(document.documentElement.classList.contains('light')?'dark':'light');}\n"
 "const map = L.map('map').setView([39.5, -98.0], 4);\n"
+"// Phones: one finger scrolls the page, two fingers (pinch) move and zoom\n"
+"// the map. With one-finger dragging off, Leaflet's touch-action becomes\n"
+"// pan-x pan-y, so the browser scrolls; touch zoom follows the fingers.\n"
+"const mapTouchMq = window.matchMedia('(max-width:900px) and (pointer:coarse)');\n"
+"const mapHint = L.control({position:'bottomleft'});\n"
+"mapHint.onAdd = () => { const d = L.DomUtil.create('div', 'map-hint'); d.textContent = 'Two fingers to move the map'; return d; };\n"
+"function mapTouchMode(){\n"
+"  if (mapTouchMq.matches) { map.dragging.disable(); if (!mapHint._map) mapHint.addTo(map); }\n"
+"  else { map.dragging.enable(); if (mapHint._map) mapHint.remove(); }\n"
+"}\n"
+"if (mapTouchMq.addEventListener) mapTouchMq.addEventListener('change', mapTouchMode); else mapTouchMq.addListener(mapTouchMode);\n"
+"mapTouchMode();\n"
 "if (window.ResizeObserver) new ResizeObserver(()=>map.invalidateSize({pan:false})).observe(document.getElementById('map'));\n"
-"// Apply persisted theme (also adds the matching tile layer to the map).\n"
+"// Labels overlay gets its own pane above the tiles so it stays on top of\n"
+"// whichever basemap is picked later, and never swallows marker clicks.\n"
+"map.createPane('labels');map.getPane('labels').style.zIndex=350;map.getPane('labels').style.pointerEvents='none';\n"
+"// Apply persisted theme (fills the gray basemap with the matching tiles).\n"
 "setTheme((function(){try{return localStorage.getItem('theme')||'dark';}catch(e){return 'dark';}})());\n"
+"(function(){let b=null,o=[];try{b=localStorage.getItem('basemap');o=JSON.parse(localStorage.getItem('mapOverlays')||'[]');}catch(e){}(basemaps[b]||grayBase).addTo(map);for(const n of (Array.isArray(o)?o:[]))if(mapOverlays[n])mapOverlays[n].addTo(map);})();\n"
+"L.control.layers(basemaps,mapOverlays,{position:'topright'}).addTo(map);\n"
+"map.on('baselayerchange',e=>{try{localStorage.setItem('basemap',e.name);}catch(_){}});\n"
+"function saveOverlays(){try{localStorage.setItem('mapOverlays',JSON.stringify(Object.keys(mapOverlays).filter(n=>map.hasLayer(mapOverlays[n]))));}catch(_){}}\n"
+"map.on('overlayadd overlayremove',saveOverlays);\n"
 "const markers = {}, trails = {}, nodes = {}, edges = {}, channels = {};\n"
 "const msgsEl = document.getElementById('msgs'); const discEl = document.getElementById('disc'); const tbody = document.querySelector('#nodes tbody');\n"
 "// Delegated click handler: 'promote' button on an OFF_GRID_LORA row\n"
@@ -579,7 +721,7 @@ static const char DASHBOARD_HTML[] =
 "    // NODEINFO yet, 'enc' = at least one frame failed to decrypt.\n"
 "    let name;\n"
 "    if (n.name) {\n"
-"      name = n.name;\n"
+"      name = escHtml(n.name);\n"
 "    } else {\n"
 "      const tail = id.length >= 5 ? id.slice(-4) : id;\n"
 "      const state = n.has_encrypted ? 'enc' : 'await';\n"
@@ -685,6 +827,7 @@ static const char DASHBOARD_HTML[] =
 "    dSnr.textContent = avg.toFixed(1)+' dB';\n"
 "  } else dSnr.textContent = '--';\n"
 "  dLast.textContent = fmtAgo(n.ts);\n"
+"  txRenderDrawer(drawerNodeId);\n"
 "  // SNR sparkline.\n"
 "  const ctx = dSpark.getContext('2d'); const W = dSpark.width, H = dSpark.height;\n"
 "  ctx.clearRect(0,0,W,H);\n"
@@ -713,7 +856,7 @@ static const char DASHBOARD_HTML[] =
 "  } else dMsgs.innerHTML = '<div class=muted>no text frames captured</div>';\n"
 "  // Positions.\n"
 "  if (h && h.positions.length) {\n"
-"    dPos.innerHTML = '<table>'+h.positions.map(p=>`<tr><td class=muted>${fmtTime(p.t)}</td><td>${p.lat.toFixed(5)}</td><td>${p.lon.toFixed(5)}</td></tr>`).join('')+'</table>';\n"
+"    dPos.innerHTML = '<table>'+h.positions.map(p=>`<tr><td class=muted>${fmtTime(p.t)}</td><td>${p.lat.toFixed(5)}</td><td>${p.lon.toFixed(5)}</td><td>${gmapsLink(p.lat,p.lon)}</td></tr>`).join('')+'</table>';\n"
 "  } else dPos.innerHTML = '<div class=muted>no positions captured</div>';\n"
 "  // Channels.\n"
 "  if (h && Object.keys(h.channels).length) {\n"
@@ -1910,7 +2053,8 @@ static const char DASHBOARD_HTML[] =
 "  if (p.lat !== undefined && p.lon !== undefined) {\n"
 "    const ll = [p.lat, p.lon];\n"
 "    if (markers[id]) markers[id].setLatLng(ll);\n"
-"    else markers[id] = L.marker(ll).addTo(map).bindPopup(`<b>${id}</b><br>${n.name||''}`);\n"
+"    else markers[id] = L.marker(ll).addTo(map).bindPopup(m => { const q = m.getLatLng(), nn = nodes[id] || {};\n"
+"      return `<b>${id}</b><br>${escHtml(nn.name||'')}<br>${gmapsLink(q.lat, q.lng)}`; });\n"
 "    updateTrail(id, ll);\n"
 "    if (Object.keys(markers).length === 1) map.setView(ll, 10);\n"
 "  }\n"
@@ -1942,9 +2086,10 @@ static const char DASHBOARD_HTML[] =
 "  const focusedBadge = (typeof p.slot_id === 'number' && p.slot_id >= 1019)\n"
 "    ? '<span class=muted style=\"color:#38bdf8\">[focused]</span> ' : '';\n"
 "  const summary = msgSummary(p);\n"
-"  if (summary) pushTo(msgsEl, `${focusedBadge}<b>${n.name||id}</b> <span class=muted>${p.channel_name||''}</span> <span class=port>${p.port_name||''}</span>: ${summary}`, p.ts);\n"
+"  if (summary) pushTo(msgsEl, `${focusedBadge}<b>${escHtml(n.name||id)}</b> <span class=muted>${escHtml(p.channel_name||'')}</span> <span class=port>${escHtml(p.port_name||'')}</span>: ${summary}${txReplyButton(p)}`, p.ts);\n"
 "  if (p.atak_callsign) pushTo(discEl, `<span class=atak>ATAK ${p.atak_callsign} (${p.atak_team}/${p.atak_role})${p.atak_chat?' chat: '+p.atak_chat:''}</span>`, p.ts);\n"
 "  noteNodeFrame(id, p);\n"
+"  txOnEvent(p);\n"
 "  evictNodes();\n"
 "  refreshNodes();\n"
 "};\n"
@@ -1978,6 +2123,323 @@ static const char DASHBOARD_HTML[] =
 "  else if (r.enabled === false) setStatus('cot-status', 'disabled', true);\n"
 "  else setStatus('cot-status', r.host+':'+r.port, true);\n"
 "}\n"
+"// A position in Google Maps (new tab; on Android the app opens the Maps app).\n"
+"function gmapsLink(lat, lon){\n"
+"  const q = (+lat).toFixed(6) + ',' + (+lon).toFixed(6);\n"
+"  return `<a href=\"https://www.google.com/maps/search/?api=1&query=${q}\" target=_blank rel=noopener>Google Maps</a>`;\n"
+"}\n"
+"// Google Earth live KML: show the NetworkLink URL for this host.\n"
+"document.getElementById('kml-url').value = location.origin + '/live.kml';\n"
+"async function copyKmlUrl(){\n"
+"  const el = document.getElementById('kml-url');\n"
+"  try { await navigator.clipboard.writeText(el.value); setStatus('kml-status', 'copied', true); }\n"
+"  catch(e) { el.select(); setStatus('kml-status', 'press Ctrl+C to copy', true); }\n"
+"}\n"
+"// Home location: operator-entered reference point, drawn as an amber\n"
+"// house marker (distinct from node pins and the cyan gpsd RX ring).\n"
+"// Client-side only -- persisted in localStorage, never sent upstream.\n"
+"const HOME_ICON = L.divIcon({className:'home-icon', iconSize:[26,26], iconAnchor:[13,24], popupAnchor:[0,-22],\n"
+"  html:'<svg viewBox=\"0 0 24 24\" width=\"26\" height=\"26\"><path d=\"M12 2.5 1.5 11.5h3V21h6v-6h3v6h6v-9.5h3z\" fill=\"#f59e0b\" stroke=\"#78350f\" stroke-width=\"1.4\" stroke-linejoin=\"round\"/></svg>'});\n"
+"let homeMarker = null, homePicking = false;\n"
+"function parseLatLon(s){\n"
+"  const m = String(s).trim().match(/^(-?\\d+(?:\\.\\d+)?)\\s*[,;\\s]\\s*(-?\\d+(?:\\.\\d+)?)$/);\n"
+"  if (!m) return null;\n"
+"  const lat = parseFloat(m[1]), lon = parseFloat(m[2]);\n"
+"  if (!(lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180)) return null;\n"
+"  return {lat, lon};\n"
+"}\n"
+"function drawHome(h, center){\n"
+"  if (homeMarker) { map.removeLayer(homeMarker); homeMarker = null; }\n"
+"  if (!h) return;\n"
+"  const name = h.label ? escHtml(h.label) : 'Home';\n"
+"  homeMarker = L.marker([h.lat, h.lon], {icon: HOME_ICON, zIndexOffset: 1000, title: h.label || 'Home'})\n"
+"    .addTo(map).bindPopup(`<b>${name}</b><br>${h.lat.toFixed(5)}, ${h.lon.toFixed(5)}<br>${gmapsLink(h.lat, h.lon)}`);\n"
+"  if (center) map.setView([h.lat, h.lon], Math.max(map.getZoom(), 12));\n"
+"}\n"
+"function setHome(h, center){\n"
+"  try { localStorage.setItem('homeLocation', JSON.stringify(h)); } catch(e) {}\n"
+"  document.getElementById('home-input').value = h.lat.toFixed(6) + ', ' + h.lon.toFixed(6);\n"
+"  drawHome(h, center);\n"
+"  setStatus('home-status', 'saved: ' + h.lat.toFixed(5) + ', ' + h.lon.toFixed(5), true);\n"
+"}\n"
+"function saveHome(){\n"
+"  const ll = parseLatLon(document.getElementById('home-input').value);\n"
+"  if (!ll) { setStatus('home-status', 'enter \"lat, lon\" in decimal degrees', false); return; }\n"
+"  ll.label = document.getElementById('home-label').value.trim().slice(0, 64);\n"
+"  setHome(ll, true);\n"
+"}\n"
+"function pickHomeOnMap(){\n"
+"  homePicking = true;\n"
+"  setStatus('home-status', 'click the map to set home...', true);\n"
+"  showTab('live');\n"
+"  document.getElementById('map').style.cursor = 'crosshair';\n"
+"}\n"
+"map.on('click', e => {\n"
+"  if (!homePicking) return;\n"
+"  homePicking = false;\n"
+"  document.getElementById('map').style.cursor = '';\n"
+"  setHome({lat: e.latlng.lat, lon: L.Util.wrapNum(e.latlng.lng, [-180, 180], true),\n"
+"           label: document.getElementById('home-label').value.trim().slice(0, 64)}, false);\n"
+"  homeMarker.openPopup();\n"
+"});\n"
+"function useMyLocation(){\n"
+"  if (!navigator.geolocation) { setStatus('home-status', 'geolocation not available in this browser', false); return; }\n"
+"  setStatus('home-status', 'locating...', true);\n"
+"  navigator.geolocation.getCurrentPosition(\n"
+"    p => setHome({lat: p.coords.latitude, lon: p.coords.longitude,\n"
+"                  label: document.getElementById('home-label').value.trim().slice(0, 64)}, true),\n"
+"    err => setStatus('home-status',\n"
+"      err.code === 1 ? 'location permission denied' :\n"
+"      err.code === 3 ? 'no position fix in 15 s: is location turned on on this device?' :\n"
+"      (err.message || 'location unavailable (needs HTTPS or localhost)'), false),\n"
+"    {enableHighAccuracy: true, timeout: 15000});\n"
+"}\n"
+"function clearHome(){\n"
+"  try { localStorage.removeItem('homeLocation'); } catch(e) {}\n"
+"  drawHome(null);\n"
+"  document.getElementById('home-input').value = '';\n"
+"  document.getElementById('home-label').value = '';\n"
+"  setStatus('home-status', 'cleared', true);\n"
+"}\n"
+"// Restore the saved home on load and center on it (gpsd fixes and node\n"
+"// positions can still move the view afterwards).\n"
+"(function(){\n"
+"  let h = null;\n"
+"  try { h = JSON.parse(localStorage.getItem('homeLocation') || 'null'); } catch(e) {}\n"
+"  if (!h || typeof h.lat !== 'number' || typeof h.lon !== 'number') return;\n"
+"  document.getElementById('home-input').value = h.lat.toFixed(6) + ', ' + h.lon.toFixed(6);\n"
+"  document.getElementById('home-label').value = h.label || '';\n"
+"  drawHome(h, false);\n"
+"  map.setView([h.lat, h.lon], 11);\n"
+"})();\n"
+"// Transmit: Send box in the Messages pane, settings on the Config tab.\n"
+"// Only shown when the sniffer runs with --tx (GET /api/tx says enabled).\n"
+"const TX_FIELDS = ['channel','psk','preset','slot','to','hop','gain','long_name','short_name'];\n"
+"function txEl(f){ return document.getElementById('tx-'+f); }\n"
+"function txSaveSettings(){\n"
+"  const s = {amp: txEl('amp').checked};\n"
+"  for (const f of TX_FIELDS) s[f] = txEl(f).value;\n"
+"  try { localStorage.setItem('txSettings', JSON.stringify(s)); } catch(e) {}\n"
+"  try { sessionStorage.setItem('txToken', txEl('token').value); } catch(e) {}\n"
+"  setStatus('txcfg-status', 'saved', true);\n"
+"}\n"
+"let txEnabled = false, txFrom = null, txReply = null, txPubKey = '';\n"
+"// Nodes whose public key we know (from NodeInfo or a PKI send), for DMs.\n"
+"const txPeerKeys = {};\n"
+"// Requests we sent, by packet id (8 hex digits), so answers can be matched\n"
+"// on request_id. Entries expire after TX_PENDING_S.\n"
+"const txPending = {}, txNodeLog = {};\n"
+"const TX_PENDING_S = 600, TX_KIND_LABEL = {text:'message', position:'position request', nodeinfo:'node info exchange', telemetry:'telemetry request', traceroute:'traceroute'};\n"
+"const ROUTING_ERRORS = {1:'NO_ROUTE',2:'GOT_NAK',3:'TIMEOUT',4:'NO_INTERFACE',5:'MAX_RETRANSMIT',6:'NO_CHANNEL',7:'TOO_LARGE',8:'NO_RESPONSE',9:'DUTY_CYCLE_LIMIT',32:'BAD_REQUEST',33:'NOT_AUTHORIZED',34:'PKI_FAILED',35:'PKI_UNKNOWN_PUBKEY',36:'ADMIN_BAD_SESSION_KEY',37:'ADMIN_PUBLIC_KEY_UNAUTHORIZED',38:'RATE_LIMIT_EXCEEDED'};\n"
+"async function txInit(){\n"
+"  let info;\n"
+"  try { const r = await fetch('/api/tx'); if (!r.ok) { console.warn('GET /api/tx: HTTP ' + r.status); return; } info = await r.json(); }\n"
+"  catch(e) { console.warn('GET /api/tx failed: ' + e); return; }\n"
+"  if (!info.enabled) return;\n"
+"  txEnabled = true; txFrom = info.from; txPubKey = info.public_key || '';\n"
+"  document.getElementById('tx-box').style.display = 'flex';\n"
+"  document.getElementById('tx-config').style.display = 'block';\n"
+"  document.getElementById('drawer-tx').style.display = 'block';\n"
+"  if (!info.auth) document.getElementById('tx-token-row').style.display = 'none';\n"
+"  const band = (info.rx_region && info.rx_region !== info.region) ? 'TX region ' + info.region + ' (RX ' + info.rx_region + ')' : 'region ' + info.region;\n"
+"  document.getElementById('tx-info').textContent = 'Transmitting as ' + info.from + ', ' + band + ', ' +\n"
+"    (info.mode === 'hackrf-inline' ? 'on the sniffer\\'s HackRF (RX pauses during TX)' : 'on a separate HackRF via hackrf_transfer') +\n"
+"    (info.tool ? '' : '. WARNING: tools/meshtastic_tx.py not found, pass --tx-tool=PATH') +\n"
+"    (txPubKey ? '. Public key (for DMs): ' + txPubKey : '');\n"
+"  let s = null;\n"
+"  try { s = JSON.parse(localStorage.getItem('txSettings') || 'null'); } catch(e) {}\n"
+"  if (s) { for (const f of TX_FIELDS) if (typeof s[f] === 'string') txEl(f).value = s[f]; txEl('amp').checked = !!s.amp; }\n"
+"  try { txEl('token').value = sessionStorage.getItem('txToken') || ''; } catch(e) {}\n"
+"  txEl('text').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); txSend(); } });\n"
+"  document.getElementById('dtx-text').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); txDirect(); } });\n"
+"  msgsEl.addEventListener('click', e => {\n"
+"    const b = e.target.closest && e.target.closest('.reply-btn');\n"
+"    if (b) txSetReply(b.dataset.rid, b.dataset.from, b.dataset.dm === '1');\n"
+"  });\n"
+"}\n"
+"// POST one send. extra overrides the Config-tab settings (kind, to, text...).\n"
+"// Returns the parsed JSON, with .error set on failure.\n"
+"async function txPost(extra){\n"
+"  const body = new URLSearchParams();\n"
+"  for (const f of TX_FIELDS) { const v = txEl(f).value.trim(); if (v) body.set(f, v); }\n"
+"  if (txEl('amp').checked) body.set('amp', '1');\n"
+"  for (const [k, v] of Object.entries(extra)) { if (v === null || v === undefined || v === '') body.delete(k); else body.set(k, v); }\n"
+"  const headers = {'X-Mesh-Tx': '1', 'Content-Type': 'application/x-www-form-urlencoded'};\n"
+"  const tok = txEl('token').value.trim();\n"
+"  if (tok) headers['Authorization'] = 'Bearer ' + tok;\n"
+"  try {\n"
+"    const r = await fetch('/api/tx', {method: 'POST', headers, body: body.toString()});\n"
+"    const j = await r.json().catch(() => ({error: 'HTTP ' + r.status}));\n"
+"    if (!r.ok && !j.error) j.error = 'HTTP ' + r.status;\n"
+"    return j;\n"
+"  } catch(e) { return {error: 'network error'}; }\n"
+"}\n"
+"function txNodeName(id){ return (nodes[id] && nodes[id].name) || id; }\n"
+"function txSentLine(j){\n"
+"  return 'sent ' + j.packets + ' packet(s) on ' + j.freq_mhz.toFixed(3) + ' MHz, ~' + j.airtime_ms + ' ms on air';\n"
+"}\n"
+"// Remember a send so its answer (request_id) can be matched later.\n"
+"function txRemember(j, text){\n"
+"  const now = Date.now() / 1000;\n"
+"  for (const k of Object.keys(txPending)) if (now - txPending[k].t > TX_PENDING_S) delete txPending[k];\n"
+"  txPending[j.id] = {kind: j.kind || 'text', to: j.to, t: now, text: text || '', heard: false};\n"
+"}\n"
+"function txLogNode(node, html){\n"
+"  if (!node) return;\n"
+"  const l = txNodeLog[node] || (txNodeLog[node] = []);\n"
+"  l.unshift({t: Date.now() / 1000, html});\n"
+"  if (l.length > 30) l.length = 30;\n"
+"  if (drawerNodeId === node) txRenderDrawer(node);\n"
+"}\n"
+"async function txSend(){\n"
+"  const textEl = txEl('text'), btn = txEl('send');\n"
+"  const text = textEl.value.trim();\n"
+"  if (!text || btn.disabled) return;\n"
+"  const extra = {kind: 'text', text};\n"
+"  if (txReply) { extra.reply_id = txReply.rid; if (txReply.to) extra.to = txReply.to; else extra.to = 'broadcast'; }\n"
+"  btn.disabled = true;\n"
+"  setStatus('tx-status', 'building + transmitting...', true);\n"
+"  try {\n"
+"    const j = await txPost(extra);\n"
+"    if (j.error) { setStatus('tx-status', 'TX failed: ' + j.error, false); return; }\n"
+"    setStatus('tx-status', txSentLine(j), true);\n"
+"    txRemember(j, text);\n"
+"    const ch = txEl('channel').value.trim() || 'LongFast';\n"
+"    const dest = (j.to && j.to !== 'broadcast') ? ' &rarr; ' + escHtml(txNodeName(j.to)) : '';\n"
+"    const re = txReply ? ' <span class=muted>(reply)</span>' : '';\n"
+"    pushTo(msgsEl, `<span class=tx-badge>TX</span><b>${escHtml(j.from)}</b>${dest} <span class=muted>${escHtml(ch)}</span>${re}: ${escHtml(text)}`);\n"
+"    if (j.to && j.to !== 'broadcast') txLogNode(j.to, `<span class=tx-badge>TX</span>DM: ${escHtml(text)}`);\n"
+"    textEl.value = '';\n"
+"    txClearReply();\n"
+"  } finally { btn.disabled = false; }\n"
+"}\n"
+"// Reply button on received text messages: a channel message is answered in\n"
+"// the channel (broadcast + reply_id), a direct message back to its sender.\n"
+"function txReplyButton(p){\n"
+"  if (!txEnabled || p.port_name !== 'TEXT_MESSAGE_APP' || typeof p.packet_id !== 'number') return '';\n"
+"  const rid = (p.packet_id >>> 0).toString(16).padStart(8, '0');\n"
+"  const dm = p.to && p.to !== '!ffffffff' ? '1' : '0';\n"
+"  return `<button class=reply-btn data-rid=\"${rid}\" data-from=\"${escHtml(p.from)}\" data-dm=\"${dm}\" title=\"Reply\">&#8617;</button>`;\n"
+"}\n"
+"function txSetReply(rid, from, dm){\n"
+"  if (!/^[0-9a-f]{8}$/.test(rid || '')) return;\n"
+"  txReply = {rid, to: dm ? from : null};\n"
+"  document.getElementById('tx-reply-label').textContent = '\\u21a9 replying to ' + txNodeName(from) + (dm ? ' (direct message)' : ' (in channel)');\n"
+"  document.getElementById('tx-reply').style.display = 'flex';\n"
+"  txEl('text').focus && txEl('text').focus();\n"
+"}\n"
+"function txClearReply(){\n"
+"  txReply = null;\n"
+"  document.getElementById('tx-reply').style.display = 'none';\n"
+"}\n"
+"// Drawer actions on the selected node.\n"
+"function txDrawerBusy(b){\n"
+"  document.getElementById('dtx-dm').disabled = b;\n"
+"  for (const el of document.querySelectorAll('#drawer-tx .dtx-req')) el.disabled = b;\n"
+"}\n"
+"async function txDrawerSend(extra, label){\n"
+"  const node = drawerNodeId;\n"
+"  if (!node) return;\n"
+"  txDrawerBusy(true);\n"
+"  setStatus('dtx-status', 'building + transmitting ' + label + '...', true);\n"
+"  try {\n"
+"    const pk = document.getElementById('dtx-pubkey').value.trim();\n"
+"    const j = await txPost(Object.assign({to: node, reply_id: '', pubkey: pk, ack: document.getElementById('dtx-ack').checked ? '1' : ''}, extra));\n"
+"    if (j.error) { setStatus('dtx-status', 'TX failed: ' + j.error, false); return null; }\n"
+"    if (j.pki) { txPeerKeys[node] = true; document.getElementById('dtx-pubkey').value = ''; }\n"
+"    if (j.warning) setStatus('dtx-status', txSentLine(j) + '. ' + j.warning, false);\n"
+"    else setStatus('dtx-status', txSentLine(j) + (j.pki ? ' (public-key encrypted)' : '') + '; waiting for an answer', true);\n"
+"    txRenderDrawer(node);\n"
+"    txRemember(j, extra.text);\n"
+"    return j;\n"
+"  } finally { txDrawerBusy(false); }\n"
+"}\n"
+"async function txDirect(){\n"
+"  const el = document.getElementById('dtx-text');\n"
+"  const text = el.value.trim();\n"
+"  if (!text || !drawerNodeId) return;\n"
+"  const node = drawerNodeId;\n"
+"  const j = await txDrawerSend({kind: 'text', text}, 'message');\n"
+"  if (!j) return;\n"
+"  el.value = '';\n"
+"  const lock = j.pki ? ' <span title=\"public-key encrypted\">&#128274;</span>' : '';\n"
+"  pushTo(msgsEl, `<span class=tx-badge>TX</span><b>${escHtml(j.from)}</b> &rarr; ${escHtml(txNodeName(node))}${lock}: ${escHtml(text)}`);\n"
+"  txLogNode(node, `<span class=tx-badge>TX</span>DM${lock}: ${escHtml(text)}`);\n"
+"}\n"
+"async function txRequest(kind){\n"
+"  const node = drawerNodeId;\n"
+"  const j = await txDrawerSend({kind, text: ''}, TX_KIND_LABEL[kind]);\n"
+"  if (j) txLogNode(node, `<span class=tx-badge>TX</span>${TX_KIND_LABEL[kind]} sent (id ${j.id})`);\n"
+"}\n"
+"function txRenderDrawer(node){\n"
+"  const log = document.getElementById('dtx-log');\n"
+"  if (!log) return;\n"
+"  const pkiEl = document.getElementById('dtx-pki');\n"
+"  if (pkiEl) pkiEl.textContent = txPeerKeys[node] ? '\\u{1F512} public key known: DMs are end-to-end encrypted'\n"
+"    : 'public key not seen yet: DMs to firmware 2.5+ need it (NodeInfo, or paste below)';\n"
+"  const l = txNodeLog[node] || [];\n"
+"  log.innerHTML = l.map(x => `<div class=item><span class=ts>${fmtTime(x.t)}</span> ${x.html}</div>`).join('');\n"
+"}\n"
+"function txRoute(a, hops, b, snrs){\n"
+"  const ids = [a].concat(hops || [], [b]);\n"
+"  return ids.map((id, i) => escHtml(txNodeName(id)) + (i > 0 && snrs && typeof snrs[i-1] === 'number' ? ` <span class=muted>(${snrs[i-1].toFixed(1)} dB)</span>` : '')).join(' &rarr; ');\n"
+"}\n"
+"// Describe an answer to one of our requests.\n"
+"function txDescribe(p, req){\n"
+"  switch (p.port_name) {\n"
+"    case 'ROUTING_APP': {\n"
+"      const reason = p.error_reason || 0;\n"
+"      if (!reason) return 'ACK: ' + TX_KIND_LABEL[req.kind] + ' delivered';\n"
+"      if (reason === 6 && req.kind === 'text') return 'NAK: NO_CHANNEL (the node only accepts PKI-encrypted direct messages; channel messages and requests still work)';\n"
+"      return 'NAK: ' + (ROUTING_ERRORS[reason] || ('error ' + reason));\n"
+"    }\n"
+"    case 'TRACEROUTE_APP': {\n"
+"      let s = 'route: ' + txRoute(txFrom, p.route, p.from, p.snr_towards_db);\n"
+"      if (p.route_back || p.snr_back_db) s += '<br>back: ' + txRoute(p.from, p.route_back, txFrom, p.snr_back_db);\n"
+"      return s;\n"
+"    }\n"
+"    case 'TEXT_MESSAGE_APP':\n"
+"      return 'reply' + (p.pki_encrypted ? ' &#128274;' : '') + ': ' + escHtml(p.text || '');\n"
+"    default: {\n"
+"      const s = msgSummary(p);\n"
+"      return escHtml(p.port_name || 'answer') + (s ? ': ' + s : ' (no fields)');\n"
+"    }\n"
+"  }\n"
+"}\n"
+"// Called for every received event: match answers to our requests.\n"
+"function txOnEvent(p){\n"
+"  if (!txEnabled) return;\n"
+"  if (p.public_key && p.from) { txPeerKeys[p.from] = true; if (drawerNodeId === p.from) txRenderDrawer(p.from); }\n"
+"  const hex = v => (v >>> 0).toString(16).padStart(8, '0');\n"
+"  // Our own packet rebroadcast by a neighbour = it got onto the mesh.\n"
+"  if (p.from === txFrom && typeof p.packet_id === 'number') {\n"
+"    if (!(p.hop_limit < p.hop_start)) return;  // our own transmission heard directly\n"
+"    const req = txPending[hex(p.packet_id)];\n"
+"    if (req && !req.heard) {\n"
+"      req.heard = true;\n"
+"      const msg = TX_KIND_LABEL[req.kind] + ' heard on the mesh (rebroadcast, hop ' + (p.hop_limit ?? '?') + '/' + (p.hop_start ?? '?') + ')';\n"
+"      if (req.to && req.to !== 'broadcast') txLogNode(req.to, `<span class=muted>${escHtml(msg)}</span>`);\n"
+"      setStatus('tx-status', msg, true);\n"
+"    }\n"
+"    return;\n"
+"  }\n"
+"  const rid = typeof p.request_id === 'number' ? hex(p.request_id) : (typeof p.reply_id === 'number' ? hex(p.reply_id) : null);\n"
+"  const req = rid && txPending[rid];\n"
+"  if (!req) {\n"
+"    // A direct message to us that doesn't answer anything: still log it.\n"
+"    if (p.to === txFrom && p.port_name === 'TEXT_MESSAGE_APP')\n"
+"      txLogNode(p.from, `<span class=rx-badge>RX</span>DM${p.pki_encrypted ? ' &#128274;' : ''}: ${escHtml(p.text || '')}`);\n"
+"    return;\n"
+"  }\n"
+"  const html = txDescribe(p, req);\n"
+"  const who = escHtml(txNodeName(p.from));\n"
+"  pushTo(msgsEl, `<span class=rx-badge>RX</span><b>${who}</b> answered our ${escHtml(TX_KIND_LABEL[req.kind])}: ${html}`, p.ts);\n"
+"  txLogNode(p.from, `<span class=rx-badge>RX</span>${html}`);\n"
+"  if (req.to && req.to !== p.from && req.to !== 'broadcast') txLogNode(req.to, `<span class=rx-badge>RX</span>via ${who}: ${html}`);\n"
+"  if (drawerNodeId === p.from || drawerNodeId === req.to) setStatus('dtx-status', 'answer received from ' + txNodeName(p.from), true);\n"
+"}\n"
+"\n"
+"txInit();\n"
 "</script></body></html>\n";
 
 static int set_nonblock(int fd) {
@@ -2032,6 +2494,30 @@ static void serve_index(int fd) {
     close(fd);
 }
 
+/* Embedded static files (Leaflet), so the dashboard works offline. Returns
+ * false when the request isn't for one of them. */
+static bool serve_asset(int fd, const char *buf)
+{
+    if (strncmp(buf, "GET /vendor/", 12) != 0) return false;
+    const char *p = buf + 4;
+    size_t plen = strcspn(p, " ?\r\n");
+    for (const web_asset_t *a = WEB_ASSETS; a->path; ++a) {
+        if (strlen(a->path) != plen || strncmp(a->path, p, plen) != 0) continue;
+        char hdr[256];
+        int n = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Cache-Control: max-age=86400\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n\r\n", a->content_type, a->len);
+        send_all(fd, hdr, (size_t)n);
+        send_all(fd, (const char *)a->data, a->len);
+        close(fd);
+        return true;
+    }
+    return false;
+}
+
 static void serve_404(int fd) {
     const char *r =
         "HTTP/1.1 404 Not Found\r\n"
@@ -2050,7 +2536,14 @@ static void send_response(int fd, int code, const char *body)
         "Content-Length: %zu\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n\r\n",
-        code, code == 200 ? "OK" : (code == 400 ? "Bad Request" : "Server Error"),
+        code,
+        code == 200 ? "OK" :
+        code == 400 ? "Bad Request" :
+        code == 401 ? "Unauthorized" :
+        code == 403 ? "Forbidden" :
+        code == 404 ? "Not Found" :
+        code == 409 ? "Conflict" :
+        code == 429 ? "Too Many Requests" : "Server Error",
         blen);
     send_all(fd, hdr, (size_t)n);
     if (body) send_all(fd, body, blen);
@@ -2218,6 +2711,74 @@ static size_t recv_full_request(int fd, char *buf, size_t cap)
 
 /* A browser may preconnect without sending a request. Never let that
  * socket monopolize the accept loop. Bound workers and socket waits. */
+/* Copy the request's Host header into out if it looks like a plain
+ * host[:port] (letters, digits, '.', '-', ':', '[', ']'). Anything else
+ * -- missing, oversized, or carrying markup -- falls back to
+ * 127.0.0.1:<web port>, so a hostile Host can't inject into the KML. */
+static void request_host(const char *buf, char *out, size_t cap)
+{
+    snprintf(out, cap, "127.0.0.1:%d", opt_web_port);
+    const char *end = strstr(buf, "\r\n\r\n");
+    if (!end) return;
+    for (const char *p = buf; p < end; ) {
+        const char *eol = strstr(p, "\r\n");
+        if (!eol || eol > end) break;
+        if ((size_t)(eol - p) > 5 && !strncasecmp(p, "host:", 5)) {
+            const char *v = p + 5;
+            while (v < eol && (*v == ' ' || *v == '\t')) ++v;
+            size_t n = (size_t)(eol - v);
+            if (n == 0 || n >= cap) return;
+            for (size_t i = 0; i < n; ++i) {
+                unsigned char c = (unsigned char)v[i];
+                if (!isalnum(c) && c != '.' && c != '-' && c != ':' && c != '[' && c != ']') return;
+            }
+            memcpy(out, v, n);
+            out[n] = 0;
+            return;
+        }
+        p = eol + 2;
+    }
+}
+
+/* Google Earth live KML (see kml_live.h). /live.kml is the NetworkLink
+ * the user opens once; Google Earth then polls /live_feed.kml. */
+static void serve_kml(int fd, const char *buf, bool network_link)
+{
+    char *doc = NULL;
+    size_t len = 0;
+    if (network_link) {
+        char host[256], url[300];
+        request_host(buf, host, sizeof(host));
+        snprintf(url, sizeof(url), "http://%s/live_feed.kml", host);
+        doc = kml_live_network_link(url, opt_kml_refresh_s, &len);
+    } else {
+        /* Station marker + line-of-sight lines only with a fresh gpsd fix. */
+        double lat, lon, alt, age;
+        kml_live_station_t st;
+        bool have_st = gpsd_get_fix(&lat, &lon, &alt, &age) && age <= 300.0;
+        if (have_st) {
+            st.name = opt_station_id;
+            st.lat = lat; st.lon = lon; st.alt_m = alt;
+        }
+        doc = kml_live_feed(have_st ? &st : NULL, time(NULL), &len);
+    }
+    if (!doc) { send_response(fd, 500, "{\"error\":\"out of memory\"}"); return; }
+    char hdr[384];
+    int n = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/vnd.google-earth.kml+xml; charset=utf-8\r\n"
+        "Cache-Control: no-store\r\n"
+        "%s"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        network_link ? "Content-Disposition: attachment; filename=\"meshtastic-live.kml\"\r\n" : "",
+        len);
+    send_all(fd, hdr, (size_t)n);
+    send_all(fd, doc, len);
+    free(doc);
+    close(fd);
+}
+
 static void *http_client(void *arg)
 {
     int fd = (int)(intptr_t)arg;
@@ -2233,6 +2794,33 @@ static void *http_client(void *arg)
         strncmp(buf, "GET /\r",       6) == 0 ||
         strncmp(buf, "GET /index",   10) == 0) serve_index(fd);
     else if (strncmp(buf, "GET /events", 11) == 0) promote_to_sse(fd);
+    else if (serve_asset(fd, buf)) { /* sent */ }
+    else if (strncmp(buf, "GET /live.kml", 13) == 0) serve_kml(fd, buf, true);
+    else if (strncmp(buf, "GET /live_feed.kml", 18) == 0) serve_kml(fd, buf, false);
+    else if (strncmp(buf, "GET /api/tx", 11) == 0) {
+        char js[256];
+        tx_status_json(js, sizeof(js));
+        send_response(fd, 200, js);
+    }
+    else if (strncmp(buf, "POST /api/tx", 12) == 0) {
+        if (!opt_tx_enable) {
+            send_response(fd, 403, "{\"error\":\"TX disabled; start the sniffer with --tx\"}");
+            goto done;
+        }
+        if (!api_auth_ok(buf, fd)) goto done;
+        /* CSRF guard: a custom header forces a CORS preflight, which this
+         * server never approves, so a third-party page in the operator's
+         * browser can't make the radio transmit. */
+        const char *hdr_end = strstr(buf, "\r\n\r\n");
+        const char *xh = strcasestr(buf, "\r\nX-Mesh-Tx:");
+        if (!xh || (hdr_end && xh > hdr_end)) {
+            send_response(fd, 403, "{\"error\":\"missing X-Mesh-Tx header\"}");
+            goto done;
+        }
+        c2_response_t r;
+        tx_send(find_body(buf), &r);
+        send_response(fd, r.status, r.body);
+    }
     else if (strncmp(buf, "POST /api/keys", 14) == 0) {
         if (!api_auth_ok(buf, fd)) { close(fd); goto done; }
         c2_response_t r;
@@ -2327,6 +2915,10 @@ void web_init(int port)
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
+    if (opt_web_bind && inet_pton(AF_INET, opt_web_bind, &addr.sin_addr) != 1) {
+        fprintf(stderr, "web: --web-bind=%s is not an IPv4 address\n", opt_web_bind);
+        close(g_listen_fd); g_listen_fd = -1; return;
+    }
     addr.sin_port = htons((uint16_t)port);
     if (bind(g_listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("web: bind"); close(g_listen_fd); g_listen_fd = -1; return;

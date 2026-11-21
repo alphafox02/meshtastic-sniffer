@@ -42,6 +42,9 @@
 #include "sigmf.h"
 #include "simd_kernels.h"
 #include "web.h"
+#include "tx.h"
+#include "ext_src.h"
+#include "pki.h"
 
 #include <complex.h>
 #include <errno.h>
@@ -1938,6 +1941,7 @@ static uint32_t backend_default_rate(sdr_backend_t b)
     case SDR_BACKEND_SOAPYSDR: return  2000000;   /* assume RTL-class via Soapy; safe default for 250 kHz alignment */
     case SDR_BACKEND_VITA49:   return        0;   /* set from VRT context packets */
     case SDR_BACKEND_FILE:     return        0;   /* set from SigMF or user --rate */
+    case SDR_BACKEND_EXTERNAL: return  2000000;   /* host app (Android HackRF over USB) */
     default:                   return 10000000;
     }
 }
@@ -2022,6 +2026,9 @@ static int start_input(pthread_t *tid)
     }
     case SDR_BACKEND_VITA49:
         fn = vita49_thread; name = "vita49";
+        break;
+    case SDR_BACKEND_EXTERNAL:   /* the host app pushes samples (ext_src.c) */
+        fn = ext_src_thread; name = "external";
         break;
 #ifdef HAVE_HACKRF
     case SDR_BACKEND_HACKRF:
@@ -3905,6 +3912,10 @@ static int run_live(void)
         if (!announce_init(opt_announce_to))
             fprintf(stderr, "announce: failed to start (bad URL?); fusion will not auto-discover this sensor\n");
     }
+    if (opt_tx_enable) {
+        if (tx_init() != 0) return 1;
+        mesh_packet_set_pki_decrypt(pki_mesh_hook);
+    }
     if (opt_c2_dealer) {
         if (!c2_dealer_init(opt_c2_dealer))
             fprintf(stderr, "c2-dealer: failed to start; HTTP /api/* still available\n");
@@ -4094,7 +4105,9 @@ static int run_live(void)
 
 /* ---- Entry point ---- */
 
-int main(int argc, char **argv)
+/* The program, callable as a library: the Android app runs it on its own
+ * thread with --external-source and stops it with sniffer_request_stop(). */
+int sniffer_main(int argc, char **argv)
 {
     self_pid = getpid();
 
@@ -4248,3 +4261,10 @@ int main(int argc, char **argv)
 
     return run_live();
 }
+
+#ifndef SNIFFER_LIBRARY
+int main(int argc, char **argv)
+{
+    return sniffer_main(argc, argv);
+}
+#endif

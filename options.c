@@ -7,6 +7,7 @@
  */
 
 #include "options.h"
+#include "meshtastic.h"
 #include "sdr.h"
 
 #include <ctype.h>
@@ -122,11 +123,20 @@ char *opt_zmq_curve_keygen        = NULL;
 uint32_t opt_station_t_acc_ns     = 1000000;  /* 1 ms = NTP-class default; mlat solver weights by this */
 char *opt_cot_multicast           = NULL;
 int   opt_web_port                = 0;
+char *opt_web_bind                = NULL;
 char *opt_map_api_key             = NULL;
+int   opt_kml_refresh_s           = 10;
 int   opt_web_waterfall           = 0;
 char *opt_station_id              = NULL;
 char *opt_gpsd_endpoint           = NULL;
 char *opt_api_token               = NULL;
+bool  opt_tx_enable               = false;
+char *opt_tx_tool                 = NULL;
+char *opt_tx_node                 = NULL;
+double opt_tx_ppm                 = 0.0;
+bool  opt_tx_ppm_set              = false;
+char *opt_tx_region               = NULL;
+char *opt_tx_key                  = NULL;
 char *opt_pcap_path               = NULL;
 char *opt_pcap_fifo               = NULL;
 char *opt_psk_wordlist            = NULL;
@@ -192,6 +202,7 @@ void options_print_help(const char *prog)
         "                         CLI values, so a sender that emits context can run with\n"
         "                         bare --vita49=PORT.\n"
         "  --file=PATH            replay IQ file\n"
+        "  --external-source      samples are pushed in by a host app (Android build)\n"
         "  --iq-format=FMT        cs8 (default) | cs16 | cf32. Used for raw file replay\n"
         "                         AND for the VITA-49 payload format. For VITA-49 this is\n"
         "                         only needed when the sender's context omits the payload\n"
@@ -212,7 +223,8 @@ void options_print_help(const char *prog)
         "  --hackrf-amp           HackRF: enable the 14 dB front-end amp.\n"
         "  --hackrf-amp-off       HackRF: disable the front-end amp (default).\n"
         "  --bias-tee             enable antenna bias tee where supported\n"
-        "  --ppm=PPM              SDR oscillator correction\n"
+        "  --ppm=PPM              SDR oscillator correction (RTL-SDR, HackRF RX,\n"
+        "                         and HackRF TX when it is also the receiver)\n"
         "  --clock=internal|external|gpsdo\n"
         "                         clock + time source. USRP only for now\n"
         "                         (UHD set_clock_source / set_time_source); other\n"
@@ -263,7 +275,11 @@ void options_print_help(const char *prog)
         "                         republish ATAK port-72 PLIs as CoT XML to a\n"
         "                         multicast group (default port 6969). LAN-scope.\n"
         "  --web[=PORT]           built-in dashboard (default 8888)\n"
+        "  --web-bind=ADDR        dashboard listen address (default 0.0.0.0, all\n"
+        "                         interfaces; 127.0.0.1 keeps it on this machine)\n"
         "  --map-api-key=KEY      map tile API key (overrides MAP_API_KEY env var)\n"
+        "  --kml-refresh=S        Google Earth refresh interval for /live.kml\n"
+        "                         (seconds, 1..3600, default 10)\n"
         "  --web-waterfall=on|off live wideband spectrum + decoded-packet overlay\n"
         "                         on a Spectrum tab. Off by default; when on,\n"
         "                         enables the scanner if it is not already running\n"
@@ -277,6 +293,28 @@ void options_print_help(const char *prog)
         "  --api-token=SECRET     require 'Authorization: Bearer SECRET' on every\n"
         "                         POST /api/* request. GET endpoints (dashboard,\n"
         "                         /events SSE) stay open. Unset = no auth.\n"
+        "  --tx                   enable the dashboard's Send box (POST /api/tx).\n"
+        "                         With --hackrf, RX pauses while the frame is\n"
+        "                         transmitted and then resumes. With any other\n"
+        "                         backend a second HackRF is driven through\n"
+        "                         hackrf_transfer. Packets are built and LoRa-\n"
+        "                         modulated in C (no python needed).\n"
+        "                         Strongly recommended together with --api-token.\n"
+        "  --tx-tool=PATH         build packets with tools/meshtastic_tx.py +\n"
+        "                         gr-lora_sdr instead of the built-in C engine.\n"
+        "  --tx-node=!AABBCCDD    node number to transmit as (default: random,\n"
+        "                         fixed for the lifetime of the process).\n"
+        "  --tx-ppm=PPM           clock correction for the transmitting HackRF\n"
+        "                         (default: --ppm when --hackrf is also the\n"
+        "                         receiver, else 0).\n"
+        "  --tx-region=NAME       band to transmit in (default: --region), e.g.\n"
+        "                         receive US but transmit EU_868. Sub-GHz only.\n"
+        "  --tx-key=PATH          TX node's public-key (PKI) identity: base64\n"
+        "                         X25519 private key, created (0600) if missing.\n"
+        "                         Needed for direct messages to firmware 2.5+.\n"
+        "                         Default: a new key per run. Keep the same\n"
+        "                         file with the same --tx-node: nodes refuse a\n"
+        "                         known node whose key changed.\n"
         "  --pcap=PATH            write received LoRa frames to PATH as a libpcap\n"
         "                         file (DLT_USER0=147). Use with tshark / Wireshark.\n"
         "  --pcap-fifo=PATH       like --pcap but creates PATH as a named pipe;\n"
@@ -379,12 +417,12 @@ int options_parse(int argc, char **argv)
 {
     enum {
         O_HACKRF = 200, O_BLADERF, O_RTLSDR, O_SOAPY, O_SDRPLAY, O_AIRSPY,
-        O_USRP, O_VITA49, O_FILE, O_IQ_FORMAT,
+        O_USRP, O_VITA49, O_FILE, O_EXTERNAL, O_IQ_FORMAT,
         O_CENTER, O_RATE, O_GAIN, O_BIAS, O_PPM, O_CLOCK,
         O_REGION, O_PRESETS, O_KEYS, O_KEYS_FILE, O_SHARE_URL, O_EXTRA_FREQ,
         O_IQ_RECORD, O_STATS_JSON, O_FFTW_WISDOM,
         O_WEBHOOK_URL, O_WEBHOOK_ON, O_WEBHOOK_FORMAT, O_WEBHOOK_TIMEOUT_MS,
-        O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_MAP_API_KEY, O_WEB_WATERFALL,
+        O_FEED, O_MQTT, O_MQTT_TOPIC, O_ZMQ, O_COT, O_WEB, O_WEB_BIND, O_MAP_API_KEY, O_KML_REFRESH, O_WEB_WATERFALL,
         O_STATION, O_GPSD, O_API_TOKEN,
         O_PCAP, O_PCAP_FIFO, O_PSK_WORDLIST, O_ARCHIVE, O_GEOFENCE, O_ANNOUNCE_TO, O_C2_DEALER,
         O_ZMQ_CURVE_SECRET, O_ZMQ_CURVE_KEYGEN, O_STATION_T_ACC_NS,
@@ -399,6 +437,7 @@ int options_parse(int argc, char **argv)
         O_SELFTEST_REJECTION_TWOTONE, O_SELFTEST_REJECTION_OFFBIN,
         O_SELFTEST_REJECTION_PROCGAIN,
         O_LIST, O_SCHEMA,
+        O_TX, O_TX_TOOL, O_TX_NODE, O_TX_PPM, O_TX_REGION, O_TX_KEY,
     };
     static const struct option longopts[] = {
         { "hackrf",     optional_argument, NULL, O_HACKRF },
@@ -415,6 +454,7 @@ int options_parse(int argc, char **argv)
         { "usrp-otw",   required_argument, NULL, O_USRP_OTW },
         { "vita49",     required_argument, NULL, O_VITA49 },
         { "file",       required_argument, NULL, O_FILE },
+        { "external-source", no_argument,  NULL, O_EXTERNAL },
         { "iq-format",  required_argument, NULL, O_IQ_FORMAT },
         { "center",     required_argument, NULL, O_CENTER },
         { "rate",       required_argument, NULL, O_RATE },
@@ -441,11 +481,19 @@ int options_parse(int argc, char **argv)
         { "zmq",        optional_argument, NULL, O_ZMQ },
         { "cot-multicast", required_argument, NULL, O_COT },
         { "web",        optional_argument, NULL, O_WEB },
+        { "web-bind",   required_argument, NULL, O_WEB_BIND },
         { "map-api-key", required_argument, NULL, O_MAP_API_KEY },
+        { "kml-refresh", required_argument, NULL, O_KML_REFRESH },
         { "web-waterfall", required_argument, NULL, O_WEB_WATERFALL },
         { "station-id", required_argument, NULL, O_STATION },
         { "gpsd",       optional_argument, NULL, O_GPSD },
         { "api-token",  required_argument, NULL, O_API_TOKEN },
+        { "tx",         no_argument,       NULL, O_TX },
+        { "tx-tool",    required_argument, NULL, O_TX_TOOL },
+        { "tx-node",    required_argument, NULL, O_TX_NODE },
+        { "tx-ppm",     required_argument, NULL, O_TX_PPM },
+        { "tx-region",  required_argument, NULL, O_TX_REGION },
+        { "tx-key",     required_argument, NULL, O_TX_KEY },
         { "pcap",       required_argument, NULL, O_PCAP },
         { "pcap-fifo",  required_argument, NULL, O_PCAP_FIFO },
         { "psk-wordlist", required_argument, NULL, O_PSK_WORDLIST },
@@ -523,6 +571,7 @@ int options_parse(int argc, char **argv)
                         vita49_endpoint = strdup(optarg);
                         vita49_enabled = 1;
                         break;
+        case O_EXTERNAL: if (set_backend(SDR_BACKEND_EXTERNAL, NULL) < 0) return 2; break;
         case O_FILE:    if (set_backend(SDR_BACKEND_FILE, NULL) < 0) return 2;
                         opt_input_file = strdup(optarg); break;
 
@@ -616,6 +665,12 @@ int options_parse(int argc, char **argv)
         case O_ZMQ:        opt_zmq_endpoint = optarg ? strdup(optarg) : strdup("tcp://*:7008"); break;
         case O_COT:        opt_cot_multicast = strdup(optarg); break;
         case O_WEB:        opt_web_port = optarg ? atoi(optarg) : 8888; break;
+        case O_WEB_BIND:   opt_web_bind = strdup(optarg); break;
+        case O_KML_REFRESH: {
+            int v = atoi(optarg);
+            opt_kml_refresh_s = v < 1 ? 1 : (v > 3600 ? 3600 : v);
+            break;
+        }
         case O_MAP_API_KEY:
             free(opt_map_api_key);
             opt_map_api_key = strdup(optarg);
@@ -633,6 +688,24 @@ int options_parse(int argc, char **argv)
         case O_STATION:    opt_station_id = strdup(optarg); break;
         case O_GPSD:       opt_gpsd_endpoint = strdup(optarg ? optarg : "localhost:2947"); break;
         case O_API_TOKEN:  opt_api_token = strdup(optarg); break;
+        case O_TX:         opt_tx_enable = true; break;
+        case O_TX_TOOL:    opt_tx_tool = strdup(optarg); break;
+        case O_TX_NODE:    opt_tx_node = strdup(optarg); break;
+        case O_TX_PPM:     opt_tx_ppm = strtod(optarg, NULL); opt_tx_ppm_set = true; break;
+        case O_TX_KEY:     opt_tx_key = strdup(optarg); break;
+        case O_TX_REGION: {
+            const mesh_region_t *r = mesh_lookup_region(optarg);
+            if (!r) {
+                fprintf(stderr, "--tx-region: unknown region '%s'\n", optarg);
+                return 2;
+            }
+            if (r->wide_lora) {
+                fprintf(stderr, "--tx-region: %s is 2.4 GHz; transmit is sub-GHz only\n", r->name);
+                return 2;
+            }
+            opt_tx_region = strdup(r->name);
+            break;
+        }
         case O_PCAP:       opt_pcap_path = strdup(optarg); break;
         case O_PCAP_FIFO:  opt_pcap_fifo = strdup(optarg); break;
         case O_PSK_WORDLIST: opt_psk_wordlist = strdup(optarg); break;

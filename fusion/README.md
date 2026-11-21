@@ -18,11 +18,11 @@ A separate Go binary so it can be deployed on a different host than the SDR-atta
 - **Bearer-token auth** via `--api-token=SECRET`. When set, every `/api/*` and `/events` request requires `Authorization: Bearer <T>` (or `?token=<T>` on the EventSource URL, since EventSource can't set custom headers). The dashboard JS pulls the token from a one-shot `?token=` query param on first load and caches it in sessionStorage. When `--api-token` is empty (default), no auth is enforced; treat that mode as VPN-gated only.
 - **Persistent SSE replay ring** at `--state-db=PATH` (bbolt single-file). The 1024-event in-memory ring is mirrored to disk and rehydrated on startup, so a browser refresh — or a fusion restart — reconstructs recent dashboard state without waiting for new traffic.
 - **Live dashboard** at `--listen=:9000` with five tabs:
-  - **Live**: Leaflet map with per-station markers (distinct color per sensor) and per-node markers, plus side tables showing stations and recently-seen nodes with "heard by" attribution.
+  - **Live**: Leaflet map with per-station markers (distinct color per sensor) and per-node markers, plus side tables showing stations and recently-seen nodes with "heard by" attribution. A layers button (top-right, also on the Evidence map) switches between keyless basemaps (Esri dark/light gray, OpenStreetMap, Esri Streets/Topographic/Satellite, OpenTopoMap) and toggles a place-labels overlay; the choice is remembered per browser.
   - **Activity**: per-preset cards aggregated across all sensors, with each card showing per-sensor breakdown (frame counts, decrypt%).
   - **Topology**: force-directed graph; each station is a pinned colored node, each transmitting node has dashed pseudo-edges to every station that's heard it (SNR-colored).
   - **Sensors**: registry table with live health (green/yellow/red), frames seen, decrypt%, msps, last event, C2-transport badge with hover-tooltip showing per-session DEALER telemetry (heartbeat count, last-seen age, command success/timeout counts, p50/p95 latency).
-  - **Config**: command fan-out (Add key, Channel-share URL, Add extra freq, CoT multicast) — each form POSTs to every sensor's `/api/*` and reports per-sensor status.
+  - **Config**: command fan-out (Add key, Channel-share URL, Add extra freq, CoT multicast) — each form POSTs to every sensor's `/api/*` and reports per-sensor status. Also a **Google Earth live KML** link (see `/live.kml` below).
 - **C2 fan-out** via HTTP `POST /api/fanout/<endpoint>` — fans to every registered sensor's matching `/api/<endpoint>` in parallel, with optional bearer token from the sensor's registry entry. Prefers DEALER (ZMQ) for any sensor with an active inbound DEALER session; falls back to HTTP otherwise.
 - **DEALER telemetry** at `GET /api/dealer-stats` — per-identity heartbeat count, last-seen age, command counts (sent / replied / timed-out), and a sliding histogram of recent command latencies with p50/p95.
 - **STATS heartbeats over ZMQ** — sniffer-side `[stats]` heartbeats are now published over the same ZMQ PUB feed alongside frame events, so fusion's Sensors tab shows live msps + cumulative frames + decrypt% per sensor without any extra channel.
@@ -93,6 +93,8 @@ All require the bearer token when `--api-token` is set.
 |---|---|---|
 | GET    | `/`                       | Embedded dashboard HTML (always open) |
 | GET    | `/events`                 | SSE firehose: every event from every subscribed sniffer + TX/GEOLOCATED consolidations |
+| GET    | `/live.kml`               | Google Earth NetworkLink (re-polls the feed every `--kml-refresh` s, default 10). With `--api-token` set, the token is embedded in the feed URL, because Google Earth can't send headers |
+| GET    | `/live_feed.kml`          | Live KML with three folders. Sensors: gpsd position, or the registry position as fallback. Nodes: self-reported position + track, plus heard-by lines from stations that heard them in the last 10 min. Multilateration fixes: latest fix + 1-sigma circle + fix trail. Trusted frames only |
 | GET    | `/api/sensors`            | List registered sensors (with live `dealer:bool` for current C2 transport) |
 | POST   | `/api/sensors`            | Add or update a sensor `{name, zmq, api?, api_token?, lat?, lon?, alt_m?}` |
 | DELETE | `/api/sensors/<name>`     | Remove a sensor |

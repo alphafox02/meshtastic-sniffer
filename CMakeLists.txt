@@ -141,9 +141,16 @@ set(SOURCES
     ${PROJECT_SOURCE_DIR}/schema.c
     ${PROJECT_SOURCE_DIR}/scanner.c
     ${PROJECT_SOURCE_DIR}/web.c
+    ${PROJECT_SOURCE_DIR}/web_assets.c
+    ${PROJECT_SOURCE_DIR}/tx.c
+    ${PROJECT_SOURCE_DIR}/pki.c
+    ${PROJECT_SOURCE_DIR}/mesh_tx.c
+    ${PROJECT_SOURCE_DIR}/lora_tx.c
+    ${PROJECT_SOURCE_DIR}/ext_src.c
     ${PROJECT_SOURCE_DIR}/share_url.c
     ${PROJECT_SOURCE_DIR}/cot.c
     ${PROJECT_SOURCE_DIR}/node_db.c
+    ${PROJECT_SOURCE_DIR}/kml_live.c
     ${PROJECT_SOURCE_DIR}/sigmf.c
     ${PROJECT_SOURCE_DIR}/simd_generic.c
 )
@@ -258,9 +265,14 @@ endif()
 # Webhook sink (--webhook-url=...). Uses libcurl for HTTP/HTTPS POST.
 # libcurl is standard on every distro we target and the existing
 # package landscape (apt install libcurl4-gnutls-dev or -openssl-dev).
-find_package(CURL REQUIRED)
-target_link_libraries(meshtastic-sniffer PRIVATE CURL::libcurl)
-message(STATUS "CURL: enabled for webhooks (${CURL_VERSION_STRING})")
+find_package(CURL)
+if(CURL_FOUND)
+    target_link_libraries(meshtastic-sniffer PRIVATE CURL::libcurl)
+    target_compile_definitions(meshtastic-sniffer PRIVATE HAVE_CURL)
+    message(STATUS "CURL: enabled for webhooks (${CURL_VERSION_STRING})")
+else()
+    message(STATUS "CURL: not found (webhook.c stubs out; --webhook-url is a no-op)")
+endif()
 
 set_property(TARGET meshtastic-sniffer PROPERTY C_STANDARD 99)
 set_property(TARGET meshtastic-sniffer PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
@@ -380,6 +392,17 @@ add_executable(test_share_url
 target_link_libraries(test_share_url PRIVATE Threads::Threads m)
 set_property(TARGET test_share_url PROPERTY C_STANDARD 99)
 
+# test_kml_live: live Google Earth KML cache + renderer -- NetworkLink
+# shape, (0,0)/out-of-range rejection, track de-dup and ring order,
+# node_db / ATAK label resolution, XML escaping of remote strings,
+# stale styling, station + line-of-sight, and LRU eviction.
+add_executable(test_kml_live
+    ${PROJECT_SOURCE_DIR}/tests/test_kml_live.c
+    ${PROJECT_SOURCE_DIR}/kml_live.c
+    ${PROJECT_SOURCE_DIR}/node_db.c)
+target_link_libraries(test_kml_live PRIVATE Threads::Threads m)
+set_property(TARGET test_kml_live PROPERTY C_STANDARD 99)
+
 # focused_demo: scan-then-focus Phase 2 prototype. One shared file reader
 # streams cs8 IQ into N independent focused-decode workers, each with its
 # own DDC chain (mixer + LPF + decim) and lora_decoder_t. Bypasses the
@@ -392,6 +415,24 @@ target_link_libraries(focused_demo PRIVATE
     ${FFTW3F_LIB}
     m)
 set_property(TARGET focused_demo PROPERTY C_STANDARD 99)
+
+# Transmit-path tests (tests/tx): no radio needed. The TX/RX round trip
+# through gr-lora_sdr runs when it is importable and is skipped otherwise.
+# Run with `make check_tx`, or `ctest -R tx_offline`.
+find_program(BASH_EXECUTABLE bash)
+if(BASH_EXECUTABLE)
+    add_custom_target(check_tx
+        COMMAND ${CMAKE_COMMAND} -E env SNIFFER_BIN=$<TARGET_FILE:meshtastic-sniffer>
+                EXT_SRC_TEST=$<TARGET_FILE:test_ext_src>
+                ${BASH_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/tx/run_tests.sh ${PROJECT_SOURCE_DIR}
+        DEPENDS meshtastic-sniffer test_ext_src
+        USES_TERMINAL
+        COMMENT "Running offline TX tests (tests/tx)")
+    enable_testing()
+    add_test(NAME tx_offline
+        COMMAND ${CMAKE_COMMAND} -E env SNIFFER_BIN=$<TARGET_FILE:meshtastic-sniffer>
+                ${BASH_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/tx/run_tests.sh ${PROJECT_SOURCE_DIR})
+endif()
 
 # CPack
 set(CPACK_PACKAGE_NAME "meshtastic-sniffer")
@@ -406,3 +447,17 @@ set(CPACK_DEBIAN_PACKAGE_SECTION "hamradio")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
 include(CPack)
+
+# test_ext_src: the Android data path on the desktop. The whole sniffer
+# built as a library (SNIFFER_LIBRARY: no main()), samples pushed through
+# --external-source, packet built by the C TX engine. Run: ./test_ext_src
+get_target_property(_sniffer_srcs meshtastic-sniffer SOURCES)
+add_executable(test_ext_src EXCLUDE_FROM_ALL ${_sniffer_srcs} ${PROJECT_SOURCE_DIR}/tests/test_ext_src.c)
+target_compile_definitions(test_ext_src PRIVATE SNIFFER_LIBRARY)
+get_target_property(_sniffer_defs meshtastic-sniffer COMPILE_DEFINITIONS)
+if(_sniffer_defs)
+    target_compile_definitions(test_ext_src PRIVATE ${_sniffer_defs})
+endif()
+get_target_property(_sniffer_libs meshtastic-sniffer LINK_LIBRARIES)
+target_link_libraries(test_ext_src PRIVATE ${_sniffer_libs})
+set_property(TARGET test_ext_src PROPERTY C_STANDARD 99)

@@ -1,0 +1,73 @@
+plugins {
+    id 'com.android.application'
+}
+
+// FFTW3f + libcrypto for Android, built by deps/build_deps.sh.
+// Override with -PmeshDepsDir=/path (the directory holding <abi>/lib).
+def depsRoot = project.findProperty('meshDepsDir') ?: "${System.getProperty('user.home')}/Android/deps"
+
+android {
+    namespace 'org.meshsniffer.android'
+    compileSdk 35
+    ndkVersion '27.2.12479018'
+
+    defaultConfig {
+        applicationId 'org.meshsniffer.android'
+        minSdk 29          // Android 10
+        targetSdk 29
+        versionCode 2
+        versionName '0.1.1'
+        ndk { abiFilters 'arm64-v8a' }
+        externalNativeBuild {
+            cmake {
+                arguments "-DDEPS_DIR=${depsRoot}/arm64-v8a", '-DANDROID_STL=none'
+            }
+        }
+    }
+
+    // Release signing: a keystore.properties file kept outside the repo
+    // (storeFile, storePassword, keyAlias, keyPassword). Its path comes from
+    // -PmeshKeystoreProps=..., $MESH_KEYSTORE_PROPS, or the default below.
+    // Without it, assembleRelease builds an unsigned APK.
+    def ksProps = new Properties()
+    def ksFile = file(project.findProperty('meshKeystoreProps') ?: System.getenv('MESH_KEYSTORE_PROPS') ?:
+            "${System.getProperty('user.home')}/.config/meshtastic-sniffer/android-release/keystore.properties")
+    if (ksFile.exists()) ksFile.withInputStream { ksProps.load(it) }
+
+    signingConfigs {
+        release {
+            if (ksProps.storeFile) {
+                storeFile file(ksProps.storeFile)
+                storePassword ksProps.storePassword
+                keyAlias ksProps.keyAlias
+                keyPassword ksProps.keyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (ksProps.storeFile) signingConfig signingConfigs.release
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    lint {
+        // targetSdk 29 is deliberate (Android 10 device); the app is sideloaded
+        disable 'ExpiredTargetSdkVersion', 'OldTargetApi'
+        abortOnError false
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core:1.13.1'   // ContextCompat, used by hackrf_android
+}

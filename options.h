@@ -28,6 +28,7 @@ typedef enum {
     SDR_BACKEND_USRP,
     SDR_BACKEND_VITA49,
     SDR_BACKEND_FILE,
+    SDR_BACKEND_EXTERNAL,      /* samples pushed by a host app (Android) */
 } sdr_backend_t;
 
 typedef enum {
@@ -166,7 +167,9 @@ extern char *opt_mqtt_topic;
 extern char *opt_zmq_endpoint;
 extern char *opt_cot_multicast;          /* "239.2.3.1:6969" or NULL */
 extern int   opt_web_port;
+extern char *opt_web_bind;               /* --web-bind: listen address; NULL = 0.0.0.0 */
 extern char *opt_map_api_key;            /* NULL = use MAP_API_KEY environment variable */
+extern int   opt_kml_refresh_s;          /* /live.kml NetworkLink refreshInterval, seconds */
 /* Live wideband spectrum waterfall on the dashboard. Default off so a
  * stock --web run pays no CPU or bandwidth for it; when set, the
  * sensor enables (or reuses) the scanner and publishes WATERFALL SSE
@@ -175,6 +178,13 @@ extern int   opt_web_waterfall;
 extern char *opt_station_id;
 extern char *opt_gpsd_endpoint;          /* "host:port"; NULL = disabled */
 extern char *opt_api_token;              /* bearer token for POST /api endpoints; NULL = unauthenticated */
+extern bool  opt_tx_enable;              /* --tx: dashboard send box + POST /api/tx */
+extern char *opt_tx_tool;                /* path to tools/meshtastic_tx.py; NULL = auto */
+extern char *opt_tx_node;                /* "!aabbccdd" to transmit as; NULL = random */
+extern double opt_tx_ppm;                /* --tx-ppm: TX HackRF clock correction */
+extern bool  opt_tx_ppm_set;             /* --tx-ppm given (else inherit --ppm inline) */
+extern char *opt_tx_key;                 /* --tx-key: PKI private key file; NULL = per-run key */
+extern char *opt_tx_region;              /* --tx-region: TX band; NULL = --region */
 extern char *opt_pcap_path;              /* path to pcap file; NULL = disabled */
 extern char *opt_pcap_fifo;              /* path to pcap fifo; NULL = disabled */
 extern char *opt_psk_wordlist;           /* path to wordlist; NULL = disabled */

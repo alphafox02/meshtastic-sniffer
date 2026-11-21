@@ -46,6 +46,8 @@ void c2_cot_multicast   (const char *body, c2_response_t *out);
  *   "share_url" -> c2_share_url
  *   "extra_freq" -> c2_extra_freq
  *   "cot_multicast" -> c2_cot_multicast
+ *   "tx_send" -> tx_send (tx.h; same form body as POST /api/tx, and
+ *                like it refused with 403 unless the sniffer runs with --tx)
  * Unknown command names produce a 404 response. */
 void c2_dispatch(const char *cmd, const char *body, c2_response_t *out);
 

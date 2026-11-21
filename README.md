@@ -9,6 +9,8 @@ Both paths feed the same dedup, JSON, MQTT, ZMQ, CoT, pcap, and web dashboard ou
 
 Backends: HackRF, BladeRF, USRP (UHD), SDRplay, Airspy, RTL-SDR, any SoapySDR device, VITA-49/VRT over UDP, and IQ file replay.
 
+**Android:** the whole sniffer, transmit included, also runs on an Android 10+ phone with a HackRF One on USB OTG. Download the signed APK from the [latest Android release](https://github.com/rapbando/meshtastic-sniffer/releases/tag/android-v0.1.1) (see [android/README.md](android/README.md)).
+
 Sister project to [iridium-sniffer](https://github.com/alphafox02/iridium-sniffer) and [inmarsat-sniffer](https://github.com/alphafox02/inmarsat-sniffer).
 
 ---
@@ -61,10 +63,122 @@ When a worker can't keep up with the live sample rate, it disarms itself and cou
 - [meshtastic-recover](recover/) — offline PSK recovery from captured pcaps. OpenMP-parallel; a hashcat custom-mode plugin handles GPU.
 - [meshtastic-fusion](fusion/) — multi-station aggregator (Go). Subscribes to N sniffer ZMQ feeds, runs hyperbolic-TDOA when 3+ time-disciplined stations hear the same packet.
 - [meshtastic-wardrive](wardrive/) — mobile single-node capture (Go). SDR + GPS + SQLite + KML/KMZ/CSV/JSON exports.
+- [tools/meshtastic_tx.py](tools/meshtastic_tx.py) — transmit Meshtastic packets with a HackRF: text messages (optionally as a reply, `--reply-id`, and as public-key DMs, `--pki-key-file` + `--dest-pubkey`), the apps' node requests (`--kind position|nodeinfo|telemetry|traceroute --to !aabbccdd`), and an optional NodeInfo announcement. Builds and encrypts the frame, modulates it with gr-lora_sdr (sync word 0x2B, preset SF/BW/CR, firmware channel-slot hashing) and plays it with `hackrf_transfer`. Use `--dry-run` to write a `.cf32` you can decode with `--file=` first. The HackRF is half-duplex, so stop the sniffer before transmitting, and only transmit on channels you operate.
+
+  ```bash
+  ./tools/meshtastic_tx.py --region US --text "hello mesh" --dry-run
+  ./tools/meshtastic_tx.py --region US --text "hello mesh" --tx-gain 20 \
+      --long-name "Sniffer TX" --short-name STX
+  ./tools/meshtastic_tx.py --region US --kind traceroute --to '!aabbccdd' --tx-gain 20
+  ```
+
+  The sniffer can also transmit from its web dashboard: see [Transmit mode](#transmit-mode-hackrf) below.
+
+---
+
+## Transmit mode (HackRF)
+
+With `--tx` the sniffer becomes a Meshtastic node you drive from the web dashboard: it sends channel messages and replies, direct messages (end-to-end encrypted with the firmware 2.5+ public-key scheme), and the node requests of the Meshtastic apps (position, node info, telemetry, traceroute), and it matches and decodes the answers. Frames are built and LoRa-modulated in C (`mesh_tx.c`, `lora_tx.c`: a port of gr-lora_sdr's transmit chain, symbol-for-symbol identical) and played on a HackRF. It also runs on an Android phone with the HackRF on USB OTG: see [android/](android/README.md).
+
+Only transmit on channels you operate, within your region's power and duty-cycle limits (EU_868 869.4–869.65 MHz: 10% duty cycle, up to 500 mW ERP).
+
+### Requirements
+
+- A HackRF One. Either the sniffer's own receiver (`--hackrf`: reception pauses for about a second per packet while it transmits), or a second HackRF next to any other receiver, driven through `hackrf_transfer`.
+- Nothing else: packet building, encryption (AES-CTR, X25519 + AES-CCM) and LoRa modulation are built in. With a separate TX HackRF, the `hackrf` tools (`hackrf_transfer`).
+- Optional: `--tx-tool=tools/meshtastic_tx.py` uses the python tool instead (needs `python3` with gnuradio + [gr-lora_sdr](https://github.com/tapparelj/gr-lora_sdr), `numpy`, `python3-cryptography`; if gr-lora_sdr is in `~/.local`, also `export LD_LIBRARY_PATH=$HOME/.local/lib/x86_64-linux-gnu`).
+
+Check the chain before going on air: `make check_tx` runs the transmit tests without a radio: the firmware's own public-key test vectors, the C engine against the python tool (identical frames and IQ) and against gr-lora_sdr's blocks (identical symbols, when importable), a modulate→demodulate round trip of every preset, and the Android data path (the sniffer as a library fed with pushed samples).
+
+### Launch
+
+The full command, as tested on EU_868 MediumFast against a Meshtastic 2.x node (values for that HackRF; adjust region, preset, gains and ppm to yours):
+
+```bash
+mkdir -p ~/.config/meshtastic-sniffer && chmod 700 ~/.config/meshtastic-sniffer
+openssl rand -hex 16 > ~/.config/meshtastic-sniffer/api_token  # once; paste it in Config -> Transmit
+
+./build/meshtastic-sniffer \
+  --hackrf --rate=2000000 --center=869000000 \
+  --region=EU_868 --presets=MediumFast \
+  --hackrf-lna=40 --hackrf-vga=30 --ppm=13 \
+  --keys=default \
+  --scan-and-decode --show-untrusted \
+  --web=8889 \
+  --tx --tx-node='!18bbc790' --tx-key=$HOME/.config/meshtastic-sniffer/tx_key \
+  --api-token="$(cat ~/.config/meshtastic-sniffer/api_token)"
+```
+
+Then open `http://localhost:8889`, go to **Config → Transmit**, paste the API token, set the channel to match the nodes you want to reach (name, PSK, preset) and a TX gain, and **Save**.
+
+| Parameter | What it does | Notes |
+|---|---|---|
+| `--hackrf` | Receive with the HackRF; with `--tx` the same HackRF also transmits | With another receiver (`--usrp`, `--rtlsdr`...), `--tx` drives a second HackRF via `hackrf_transfer` |
+| `--rate=2000000` | 2 Msps | TX always uses 2 Msps |
+| `--center=869000000` | RX centre frequency | Keep it off the channel: the HackRF's DC spike sits at the centre (869.0 MHz for the EU_868 channel at 869.525) |
+| `--region=EU_868` | Band plan (channel slot frequencies) | Also the TX band unless `--tx-region` is set |
+| `--presets=MediumFast` | Modem presets to decode | `all` scans every preset; the Send settings pick the TX preset |
+| `--hackrf-lna=40 --hackrf-vga=30` | RX gains | The default `--gain` mapping (LNA 24 / VGA 16) decoded nothing on this HackRF |
+| `--ppm=13` | Clock correction, RX and (on the same HackRF) TX | This HackRF runs +13 ppm fast; measure yours |
+| `--keys=default` | Channel keys for decoding (`default` = `AQ==`) | Add your channels: `--keys='MyChan=base64:...'` or `--keys-file` |
+| `--scan-and-decode --show-untrusted` | Decode the grid and show CRC-failed frames too | Optional; `--trusted-only` gives a clean feed |
+| `--web=8889` | Dashboard and `/api/*` | `--web-bind=127.0.0.1` keeps it on this machine |
+| `--tx` | Enables transmit (Send box, node actions, `POST /api/tx`, C2 `tx_send`) | Off by default |
+| `--tx-node='!18bbc790'` | Node number we transmit as | Default: random per run. Keep it fixed so nodes recognise you |
+| `--tx-key=PATH` | Our X25519 private key (base64), created with mode 0600 if missing | **Needed for DMs.** Keep the same file with the same `--tx-node`: firmware refuses a known node whose key changed. Default: a new key per run |
+| `--tx-region=NAME` | Transmit band, if different from `--region` | e.g. receive `US`, transmit `EU_868` on a second HackRF. Sub-GHz only |
+| `--tx-ppm=PPM` | Clock correction of the transmitting HackRF | Default: `--ppm` when the same HackRF receives, else 0 |
+| `--tx-tool=PATH` | Build packets with `tools/meshtastic_tx.py` + gr-lora_sdr instead of the built-in C engine | Optional; for comparison |
+| `--api-token=SECRET` | Requires `Authorization: Bearer SECRET` on every `POST /api/*` | **Strongly recommended with `--tx`**: anyone who can reach the dashboard could otherwise transmit |
+
+At startup the sniffer prints its TX identity: `[tx] transmitting as !18bbc790, PKI public key p5Eb...UTA= (...tx_key)`. The dashboard's Config → Transmit shows the same.
+
+### Using it
+
+- **Channel messages:** the Send box in the Messages pane. Each received text has a **↩** button: a channel message is answered in the channel (broadcast with `reply_id`), a direct message back to its sender.
+- **Node actions:** click a node in the Nodes table. Its drawer has an **Interact** section: a DM box, **Request position**, **Exchange node info**, **Request telemetry**, **Traceroute**, and "request ACK". Answers are matched on `request_id` and shown in the drawer and the Messages pane (green RX badge): the position, user info or telemetry, the traceroute path both ways with per-hop SNR, routing ACKs and NAKs with their reason, and a note when a neighbour rebroadcasts your packet.
+- **Direct messages (public key).** Firmware 2.5+ drops DMs encrypted with the channel key, so DMs use the firmware's PKI scheme (X25519 + SHA-256 + AES-256-CCM, channel hash 0). The sniffer needs the node's public key: it learns it from the node's NodeInfo (**Exchange node info** asks for it), or paste it from the Meshtastic app into the drawer. The drawer says whether the key is known. Before the first encrypted DM to a node, the sniffer sends it our NodeInfo with our public key, which the node needs to decrypt. Telemetry requests are encrypted the same way; traceroute, node info and position requests never are (as in the firmware). Answers the node encrypts to us are decrypted with our key and shown with a 🔒 (`pki_encrypted: true`, `channel_name: "PKI"` in the JSON).
+- **API:** the dashboard is a client of `POST /api/tx` (form body; header `X-Mesh-Tx: 1` and the bearer token). C2 `tx_send` takes the same body.
+
+  ```bash
+  TOKEN=$(cat ~/.config/meshtastic-sniffer/api_token)
+  tx() { curl -s -X POST -H 'X-Mesh-Tx: 1' -H "Authorization: Bearer $TOKEN" --data "$1" localhost:8889/api/tx; echo; }
+  CH='preset=MEDIUM_FAST&channel=MediumFast&psk=AQ%3D%3D&gain=25'
+  tx "kind=nodeinfo&to=!433ba574&ack=1&long_name=Sniffer%20TX&short_name=STX&$CH"  # swap keys
+  tx "kind=text&text=hello&to=!433ba574&ack=1&$CH"                                   # PKI DM
+  tx "kind=telemetry&to=!433ba574&ack=1&$CH"
+  tx "kind=traceroute&to=!433ba574&$CH"
+  tx "kind=text&text=re&reply_id=1a2b3c4d&$CH"                                       # reply in channel
+  ```
+
+  Fields: `kind` (`text` default, `position`, `nodeinfo`, `telemetry`, `traceroute`), `text`, `to` (`!aabbccdd` or `broadcast`), `reply_id` (hex packet id), `ack=1` (want_ack), `pubkey` (destination's public key, base64 or hex), `channel`, `psk`, `preset`, `slot`, `gain` (0–47), `amp=1`, `hop` (0–7), `long_name`, `short_name`. The reply has `id` (to match answers on `request_id`), `pki`, and a `warning` when a DM had to go out without a known key. Sends are at least 3 s apart.
+
+### What to expect from real nodes
+
+Tested on air (HackRF One, EU_868 MediumFast, Meshtastic 2.x node at about 27 dB SNR):
+
+| Action | Result |
+|---|---|
+| Public-key DM | Delivered (routing ACK). The same node refuses a channel-key DM with `NO_CHANNEL` |
+| DM from the node to us | Arrives PKI-encrypted and is decrypted by the sniffer (shown with 🔒) |
+| Exchange node info | The node answers with its NodeInfo, including its public key (firmware throttles repeats to one every few minutes) |
+| Request telemetry | Answered, PKI-encrypted to us and decrypted by the sniffer |
+| Traceroute | Answered; a direct link shows the SNR at which the node heard us |
+| Request position | `NO_RESPONSE` (or nothing) when the node doesn't share its position on that channel (position precision 0) |
+
+A node with the **TRACKER** role (or power saving on) sleeps its radio between its own broadcasts, so it only answers right after sending: the first request may get through and the next ones not. Set it to CLIENT, or turn power saving off, while testing. The same tests ran from the Android app (Galaxy S9+, Android 10): traceroute, public-key DM (ACKed), telemetry answered PKI-encrypted and decrypted on the phone.
+
+If DMs stop being ACKed after a restart, the node probably holds an older key for our node number (a new `--tx-key` with an old `--tx-node`): keep both fixed, or pick a new `--tx-node`. If it doesn't have our key yet, use **Exchange node info**.
+
+**What TX can't set:** SF/CR/BW outside the presets, sync word (0x2B), preamble (16), explicit header + CRC, LDRO (automatic). The 2 Msps TX rate, region and ppm are fixed at start-up. LORA_24 (2.4 GHz) is RX-only, and 500 kHz presets don't fit EU_868.
 
 ---
 
 ## Install
+
+### Android
+
+Download `mesh-sniffer-android-0.1.1.apk` from the [android-v0.1.1 release](https://github.com/rapbando/meshtastic-sniffer/releases/tag/android-v0.1.1) and open it on the phone (Android 10+, arm64). Then plug in the HackRF One with an OTG cable. Setup, settings and building from source are in [android/README.md](android/README.md).
 
 ### DragonOS Noble
 
@@ -131,6 +245,35 @@ CMake prints which backends it found. Run `./meshtastic-sniffer --list` to confi
 The dashboard's **Config** tab adds keys and channel-share URLs at runtime, no restart needed.
 
 The dashboard uses Esri gray canvas tiles by default; no API key is required.
+A layers button in the map's top-right corner switches between other keyless
+basemaps (OpenStreetMap, Esri Streets, Esri Topographic, OpenTopoMap, Esri
+Satellite) and toggles a place-labels overlay that is useful on satellite
+imagery. The choice is remembered per browser. Only the default gray basemap
+follows the light/dark theme.
+
+**Config → Home location** puts an amber house marker on the map. You can type
+`lat, lon` in decimal degrees, click a spot on the map, or use the browser's
+geolocation (which needs HTTPS or localhost). The location is stored only in
+your browser and the map centers on it at load.
+
+### Google Earth live KML
+
+With `--web`, the sniffer also serves a live KML feed for Google Earth.
+
+- `http://HOST:PORT/live.kml` is a small NetworkLink file. Open it once, or in
+  Google Earth Pro use **Add > Network Link** with this URL. **Config → Google
+  Earth live KML** in the dashboard has the link and a copy button.
+- Google Earth then re-polls `/live_feed.kml` every `--kml-refresh` seconds
+  (default 10, range 1-3600).
+
+The feed shows every node heard with a trusted POSITION or ATAK PLI. Each node
+gets its latest point, a track of up to its last 64 positions, and a
+description with channel, frequency, SNR/RSSI and last-heard time. Nodes not
+heard for an hour turn grey. Names come from the ATAK callsign or NODEINFO,
+falling back to `!nodeid`. With `--gpsd`, the feed adds this station and a
+line-of-sight line from it to each node. Frames that fail CRC or decryption are
+never plotted. Like the `/events` stream, the KML routes don't need the API
+token, so keep the web port on a trusted network.
 To use CARTO tiles instead, set an optional API key with `--map-api-key=KEY` or
 the `MAP_API_KEY` environment variable. The command-line value takes precedence,
 including an empty value (`--map-api-key=`) to clear the environment-provided key
@@ -325,3 +468,4 @@ This project is independent of and not affiliated with Meshtastic. "Meshtastic" 
 - **gr-lora_sdr** by Joachim Tapparel @ EPFL TCL Lab (<https://github.com/tapparelj/gr-lora_sdr>, GPL-3.0-or-later). Significant portions of `lora.c`'s bit-level decode path (hard-decode Hamming, deinterleave, gray, dewhiten, preamble-mode-vote) are ported from gr-lora_sdr and verified bit-exact against its stage outputs. Per-stage citations are inline at the relevant call sites.
 - **Meshtastic firmware** (<https://github.com/meshtastic/firmware>, GPL-3.0-or-later). Wire format, default PSK, simpleN PSK derivation, channel-hash function, AES-CTR nonce layout, region/preset tables, and port number assignments come from the upstream firmware. Implementation is original; only the on-the-air constants are derived.
 - **Felipe Kersting** — `blocking_queue.h` and `fair_lock.h` are vendored MIT-licensed primitives (Copyright (c) 2020).
+- **Leaflet** 1.9.4 (<https://leafletjs.com>, BSD-2-Clause, Copyright (c) 2010-2023 Volodymyr Agafonkin, 2010-2011 CloudMade): the dashboard's map library, vendored unmodified in `vendor/leaflet-1.9.4/` and embedded in the binary (`web_assets.c`, generated by `tools/gen_web_assets.py`), so the dashboard works without internet. Map tiles still need a connection.

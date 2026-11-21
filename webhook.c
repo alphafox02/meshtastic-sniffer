@@ -7,6 +7,36 @@
 
 #include "webhook.h"
 
+#ifndef HAVE_CURL
+/* Built without libcurl (e.g. the Android library): --webhook-url is
+ * accepted but reports that webhooks are unavailable. */
+#include <stdio.h>
+#include <strings.h>
+
+webhook_format_t webhook_format_parse(const char *s)
+{
+    if (s && !strcasecmp(s, "slack"))   return WEBHOOK_FORMAT_SLACK;
+    if (s && !strcasecmp(s, "discord")) return WEBHOOK_FORMAT_DISCORD;
+    return WEBHOOK_FORMAT_RAW;
+}
+int webhook_init(const char *url, const char *event_csv, int timeout_ms, webhook_format_t format)
+{
+    (void)url; (void)event_csv; (void)timeout_ms; (void)format;
+    fprintf(stderr, "webhook: built without libcurl; --webhook-url ignored\n");
+    return -1;
+}
+void webhook_stop(void) {}
+void webhook_publish(const char *event_name, const char *json, size_t len, const char *summary)
+{
+    (void)event_name; (void)json; (void)len; (void)summary;
+}
+uint64_t webhook_queued_total(void)  { return 0; }
+uint64_t webhook_sent_total(void)    { return 0; }
+uint64_t webhook_dropped_total(void) { return 0; }
+uint64_t webhook_failed_total(void)  { return 0; }
+
+#else /* HAVE_CURL */
+
 #include <curl/curl.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -357,3 +387,5 @@ uint64_t webhook_queued_total(void)  { return atomic_load(&g_queued_total); }
 uint64_t webhook_sent_total(void)    { return atomic_load(&g_sent_total); }
 uint64_t webhook_dropped_total(void) { return atomic_load(&g_dropped_total); }
 uint64_t webhook_failed_total(void)  { return atomic_load(&g_failed_total); }
+
+#endif /* HAVE_CURL */
