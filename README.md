@@ -258,8 +258,7 @@ your browser and the map centers on it at load.
 
 ### Google Earth live KML
 
-With `--web`, the sniffer also serves a live KML feed for Google Earth. The
-layout follows radiosonde_auto_rx:
+With `--web`, the sniffer also serves a live KML feed for Google Earth.
 
 - `http://HOST:PORT/live.kml` is a small NetworkLink file. Open it once, or in
   Google Earth Pro use **Add > Network Link** with this URL. **Config → Google
